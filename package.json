@@ -1,0 +1,22 @@
+{
+  "name": "tripwith",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@9.12.0",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "scripts": {
+    "check:enums": "node scripts/check-enum-parity.mjs",
+    "db:up": "docker compose -f infra/docker-compose.yml up -d",
+    "db:down": "docker compose -f infra/docker-compose.yml down",
+    "db:migrate": "pnpm --filter @tripwith/api migration:run",
+    "db:revert": "pnpm --filter @tripwith/api migration:revert",
+    "db:verify": "pnpm --filter @tripwith/api db:verify",
+    "verify": "pnpm run check:enums && pnpm run db:verify"
+  },
+  "devDependencies": {
+    "turbo": "^2.1.3",
+    "typescript": "^5.6.3"
+  }
+}

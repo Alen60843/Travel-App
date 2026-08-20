@@ -1,0 +1,28 @@
+{
+  "name": "@tripwith/api",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json && pnpm run copy:sql",
+    "copy:sql": "mkdir -p dist/database/migrations/sql && cp src/database/migrations/sql/*.sql dist/database/migrations/sql/",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "migration:run": "typeorm-ts-node-commonjs migration:run -d src/database/data-source.ts",
+    "migration:revert": "typeorm-ts-node-commonjs migration:revert -d src/database/data-source.ts",
+    "migration:show": "typeorm-ts-node-commonjs migration:show -d src/database/data-source.ts",
+    "db:verify": "psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f src/database/scripts/verify-invariants.sql && bash src/database/scripts/verify-concurrency.sh",
+    "db:seed:bench": "psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f src/database/scripts/seed-benchmark-data.sql",
+    "db:benchmark": "psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f src/database/scripts/benchmark-indexes.sql"
+  },
+  "dependencies": {
+    "@tripwith/shared": "workspace:*",
+    "dotenv": "^16.4.5",
+    "pg": "^8.13.0",
+    "typeorm": "^0.3.20"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.5",
+    "@types/pg": "^8.11.10",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.3"
+  }
+}
