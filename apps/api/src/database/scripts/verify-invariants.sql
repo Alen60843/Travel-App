@@ -604,8 +604,14 @@ END $int$;
 DO $overlap$
 DECLARE hit BOOLEAN;
 BEGIN
+  -- Scoped to this suite's own fixture row rather than `LIMIT 1`. An earlier
+  -- version read whichever segment the planner happened to return first, which
+  -- passed only on a pristine database and failed the moment anything else had
+  -- inserted a trip segment. An invariant suite must assert on data it owns.
   PERFORM tw_assert(
-    (SELECT date_range FROM trip_segments LIMIT 1) = daterange('2026-09-01','2026-09-20','[]'),
+    (SELECT date_range FROM trip_segments
+      WHERE trip_id = tw_id('trip_alice') AND destination_name = 'Bangkok')
+      = daterange('2026-09-01', '2026-09-20', '[]'),
     'trips: date_range generated inclusive of both endpoints');
 
   SELECT EXISTS (

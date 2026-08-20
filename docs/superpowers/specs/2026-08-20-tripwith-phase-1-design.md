@@ -146,7 +146,7 @@ sequenceDiagram
     API->>PG: UPDATE join_request -> APPROVED
     Note right of PG: trigger refuses approval unless<br/>payment is AUTHORIZED or CAPTURED
     API->>PG: INSERT event_participants (trigger increments; CHECK guards capacity)
-    API->>PG: INSERT job_outbox ('payment.capture:<id>')
+    API->>PG: INSERT job_outbox ('payment.capture.<id>')
     API->>PG: COMMIT
 ```
 
@@ -254,14 +254,25 @@ So even if the queue lost a capture job *and* the outbox relay were down, a peri
 
 ### 6.6 Idempotency and deterministic keys
 
+> **`dedupe_key` must not contain a colon.** BullMQ rejects a custom job id
+> containing `:` unless it contains *exactly* two (`job.js`: `jobId.includes(':')
+> && jobId.split(':').length !== 3` → `Error: Custom Id cannot contain :`), and
+> that two-colon carve-out is marked legacy in BullMQ's own source. Since
+> `dedupe_key` is used verbatim as the job id, an earlier revision of this table
+> used `topic:<id>` — which would have been **rejected at enqueue for every
+> producer except `event.lifecycle`, which had two colons and would have worked
+> by accident.** Verified empirically against bullmq 5.81.3. The separator is a
+> dot; `assertBullMqCompatibleJobId` in `src/queue/job-id.ts` rejects any colon
+> at enqueue *and* at publish so this cannot regress silently.
+
 | Queue | Deterministic key | Consumer idempotency |
 |---|---|---|
-| `payment.capture` | `payment.capture:<payment_id>` | `payments.idempotency_key` sent to provider; provider dedupes |
-| `payment.cancel` | `payment.cancel:<payment_id>` | same |
-| `joinRequest.expire` | `joinRequest.expire:<request_id>` | status transition guarded — only `PENDING` expires |
-| `event.lifecycle` | `event.lifecycle:<event_id>:<target_status>` | FSM trigger rejects illegal/repeat transitions |
-| `review.window.close` | `review.window.close:<event_id>` | idempotent state check |
-| `provider.refresh` | `provider.refresh:<source>:<external_id>` | upsert |
+| `payment.capture` | `payment.capture.<payment_id>` | `payments.idempotency_key` sent to provider; provider dedupes |
+| `payment.cancel` | `payment.cancel.<payment_id>` | same |
+| `joinRequest.expire` | `joinRequest.expire.<request_id>` | status transition guarded — only `PENDING` expires |
+| `event.lifecycle` | `event.lifecycle.<event_id>.<target_status>` | FSM trigger rejects illegal/repeat transitions |
+| `review.window.close` | `review.window.close.<event_id>` | idempotent state check |
+| `provider.refresh` | `provider.refresh.<source>.<external_id>` | upsert |
 | `trust.apply` | domain-derived | `trust_score_events.idempotency_key` UNIQUE |
 
 Every consumer is idempotent, so at-least-once delivery is safe. No delayed business operation uses `setTimeout` or a long-running request.

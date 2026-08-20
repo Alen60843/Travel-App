@@ -1705,7 +1705,9 @@ CREATE TABLE job_outbox (
   topic             TEXT NOT NULL,
   payload           JSONB NOT NULL,
 
-  -- Deterministic, caller-derived key (e.g. 'payment.capture:<payment_id>').
+  -- Deterministic, caller-derived key (e.g. 'payment.capture.<payment_id>').
+  -- Must not contain a colon: BullMQ rejects such job ids. See
+  -- src/queue/job-id.ts, which enforces this at enqueue and at publish.
   -- Used verbatim as the BullMQ jobId, so a re-publish after uncertain
   -- delivery collapses onto the existing job instead of duplicating work.
   -- UNIQUE means the producing transaction also cannot enqueue the same

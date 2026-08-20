@@ -4,5 +4,7 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts"],
+  "//": "Tests are excluded from the published build: they are run directly by node --test (which strips types in place) and import with explicit .ts extensions, which tsc rejects unless allowImportingTsExtensions is on.",
+  "exclude": ["src/**/*.test.ts"]
 }
