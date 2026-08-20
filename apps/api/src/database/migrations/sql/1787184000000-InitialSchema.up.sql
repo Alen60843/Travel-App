@@ -902,6 +902,19 @@ CREATE TABLE payments (
   -- PSD2/SCA: an authorization may pause for a 3DS challenge.
   requires_action             BOOLEAN NOT NULL DEFAULT FALSE,
 
+  -- Distinguishes "authorized, host has not decided yet" from "capture asked
+  -- for, outcome unknown". Without it, a crash mid-capture is indistinguishable
+  -- from an untouched authorization and nothing knows to reconcile.
+  capture_requested_at        TIMESTAMPTZ,
+
+  -- Deterministic and written BEFORE the provider is ever called.
+  --
+  -- The row is INSERTed with status INITIATED and this key, and only then is
+  -- authorize() invoked with the same key. So a crash between the provider
+  -- call and the status update leaves an INITIATED row that the reconciler
+  -- finds and resolves via getPaymentStatus(idempotency_key) — either
+  -- adopting the authorization or cancelling it. There is no ordering in
+  -- which money moves without a PostgreSQL row describing the intent.
   idempotency_key             TEXT NOT NULL,
 
   created_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -920,6 +933,9 @@ CREATE TABLE payments (
     (kind = 'EVENT_DEPOSIT'         AND event_id IS NOT NULL AND provider_subscription_id IS NULL) OR
     (kind = 'PROVIDER_SUBSCRIPTION' AND provider_subscription_id IS NOT NULL AND event_id IS NULL)
   ),
+  -- Capture cannot be requested against something never authorized.
+  CONSTRAINT payments_capture_after_auth_chk
+    CHECK (capture_requested_at IS NULL OR authorized_at IS NOT NULL),
   CONSTRAINT payments_idempotency_uk UNIQUE (idempotency_key)
 );
 
@@ -933,6 +949,20 @@ CREATE INDEX payments_event_idx ON payments (event_id) WHERE event_id IS NOT NUL
 CREATE INDEX payments_expiring_auth_idx
   ON payments (authorization_expires_at)
   WHERE status IN ('AUTHORIZED', 'REQUIRES_ACTION') AND authorization_expires_at IS NOT NULL;
+
+-- Reconciliation queue 1: intents whose provider outcome is unknown.
+-- An INITIATED row older than the reconcile threshold means the process died
+-- somewhere around the authorize() call. The reconciler asks the provider what
+-- actually happened, keyed by idempotency_key, and either adopts or cancels.
+-- This is what prevents a permanently orphaned external authorization.
+CREATE INDEX payments_unconfirmed_intent_idx
+  ON payments (created_at) WHERE status = 'INITIATED';
+
+-- Reconciliation queue 2: captures asked for but not confirmed.
+CREATE INDEX payments_unconfirmed_capture_idx
+  ON payments (capture_requested_at)
+  WHERE capture_requested_at IS NOT NULL
+    AND status IN ('AUTHORIZED', 'REQUIRES_ACTION');
 
 CREATE TRIGGER payments_set_updated_at
   BEFORE UPDATE ON payments
@@ -1013,6 +1043,56 @@ CREATE INDEX event_join_requests_expiry_idx
 CREATE TRIGGER event_join_requests_set_updated_at
   BEFORE UPDATE ON event_join_requests
   FOR EACH ROW EXECUTE FUNCTION tw_set_updated_at();
+
+-- Money-safety gate on approval.
+--
+-- Approving a request consumes a seat (the participant insert increments
+-- capacity). For a paid event that seat must not be given away before funds
+-- are actually secured. A CHECK cannot express this because it spans three
+-- tables, so it is a trigger — and it lives in the database rather than the
+-- service because "seat granted without an authorization" is the kind of bug
+-- that only shows up under a partial failure, which is exactly when service
+-- code is least trustworthy.
+--
+-- Free events (deposit_minor = 0) are unaffected.
+CREATE OR REPLACE FUNCTION tw_guard_join_approval() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+  required_deposit INT;
+  pay_status       payment_status;
+BEGIN
+  IF NEW.status <> 'APPROVED' OR OLD.status = 'APPROVED' THEN
+    RETURN NEW;
+  END IF;
+
+  SELECT e.deposit_minor INTO required_deposit
+    FROM events e WHERE e.id = NEW.event_id;
+
+  IF COALESCE(required_deposit, 0) = 0 THEN
+    RETURN NEW;
+  END IF;
+
+  IF NEW.payment_id IS NULL THEN
+    RAISE EXCEPTION
+      'join request % for a paid event cannot be approved without a payment',
+      NEW.id USING ERRCODE = 'check_violation';
+  END IF;
+
+  SELECT p.status INTO pay_status FROM payments p WHERE p.id = NEW.payment_id;
+
+  IF pay_status IS NULL OR pay_status NOT IN ('AUTHORIZED', 'CAPTURED') THEN
+    RAISE EXCEPTION
+      'join request % cannot be approved: payment is %, expected AUTHORIZED or CAPTURED',
+      NEW.id, COALESCE(pay_status::TEXT, 'missing')
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER event_join_requests_guard_approval
+  BEFORE UPDATE OF status ON event_join_requests
+  FOR EACH ROW EXECUTE FUNCTION tw_guard_join_approval();
 
 
 CREATE TABLE event_participants (
@@ -1310,6 +1390,50 @@ CREATE TRIGGER reviews_set_updated_at
   BEFORE UPDATE ON reviews
   FOR EACH ROW EXECUTE FUNCTION tw_set_updated_at();
 
+-- Marketplace rating projection.
+--
+-- providers.rating_avg / rating_count are TripWith-native: computed only from
+-- TripWith reviews that are APPROVED and not deleted. Google's rating is never
+-- an input — it has no column in this schema and is not persisted at all — so
+-- Marketplace filtering and ranking run entirely on first-party data.
+--
+-- Maintained by trigger rather than by application code so the projection
+-- cannot drift when moderation approves, rejects or removes a review.
+CREATE OR REPLACE FUNCTION tw_sync_provider_rating() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+  target UUID := COALESCE(NEW.target_provider_id, OLD.target_provider_id);
+BEGIN
+  IF target IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  UPDATE providers p
+     SET rating_avg = sub.avg_rating,
+         rating_count = sub.n
+    FROM (
+      SELECT round(avg(r.rating)::NUMERIC, 2) AS avg_rating,
+             count(*)                          AS n
+        FROM reviews r
+       WHERE r.target_provider_id = target
+         AND r.target_type = 'PROVIDER'
+         AND r.moderation_state = 'APPROVED'
+         AND r.deleted_at IS NULL
+    ) sub
+   WHERE p.id = target;
+
+  RETURN NULL;
+END $$;
+
+-- Fires on every transition that can change which reviews count toward the
+-- projection: creation, removal, rating edits, moderation decisions, and
+-- soft deletion.
+CREATE TRIGGER reviews_sync_provider_rating
+  AFTER INSERT OR DELETE
+      OR UPDATE OF rating, moderation_state, deleted_at, target_provider_id
+  ON reviews
+  FOR EACH ROW EXECUTE FUNCTION tw_sync_provider_rating();
+
 
 -- The trust ledger. Append-only and the sole source of truth for trust.
 CREATE TABLE trust_score_events (
@@ -1542,25 +1666,78 @@ CREATE INDEX sos_access_log_session_idx ON sos_access_log (session_id, accessed_
 -- Enqueuing a BullMQ job is a network call to Redis and cannot join a
 -- PostgreSQL transaction. Writing the intent here instead means "approve the
 -- join request" and "schedule the capture job" commit or roll back together;
--- a relay publishes committed rows to BullMQ. Without this, a crash between
--- COMMIT and enqueue silently loses the job.
+-- a relay publishes committed rows to BullMQ.
+--
+-- DELIVERY MODEL: PostgreSQL outbox -> at-least-once relay -> BullMQ ->
+-- idempotent consumer -> consumer acknowledges back HERE.
+--
+-- The acknowledgement is the point. `published_at` only records that the row
+-- was handed to Redis; it is NOT evidence the work happened. If Redis loses
+-- its dataset, published-but-unacknowledged rows are still sitting here and
+-- are re-published. That is what makes a committed business action
+-- reconstructible from PostgreSQL alone after total Redis loss.
+--
+-- A row is therefore only retired when `completed_at` (consumer succeeded, set
+-- in the consumer's own transaction) or `failed_at` (permanently dead, needs a
+-- human) is set. Everything else is re-drivable.
 -- ============================================================================
 CREATE TABLE job_outbox (
-  id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  topic         TEXT NOT NULL,
-  payload       JSONB NOT NULL,
-  available_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-  published_at  TIMESTAMPTZ,
-  attempts      INT NOT NULL DEFAULT 0,
-  last_error    TEXT,
-  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  id                BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  topic             TEXT NOT NULL,
+  payload           JSONB NOT NULL,
 
+  -- Deterministic, caller-derived key (e.g. 'payment.capture:<payment_id>').
+  -- Used verbatim as the BullMQ jobId, so a re-publish after uncertain
+  -- delivery collapses onto the existing job instead of duplicating work.
+  -- UNIQUE means the producing transaction also cannot enqueue the same
+  -- logical action twice.
+  dedupe_key        TEXT NOT NULL,
+
+  available_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  -- Handed to BullMQ. Not proof of execution.
+  published_at      TIMESTAMPTZ,
+  publish_attempts  INT NOT NULL DEFAULT 0,
+
+  -- Consumer acknowledgement. THIS is proof of execution.
+  completed_at      TIMESTAMPTZ,
+
+  -- Permanently dead after max_attempts; surfaced to operators, never silently
+  -- dropped.
+  failed_at         TIMESTAMPTZ,
+  attempts          INT NOT NULL DEFAULT 0,
+  max_attempts      INT NOT NULL DEFAULT 10,
+  last_attempt_at   TIMESTAMPTZ,
+  last_error        TEXT,
+
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  CONSTRAINT job_outbox_dedupe_uk UNIQUE (dedupe_key),
   CONSTRAINT job_outbox_topic_chk CHECK (char_length(btrim(topic)) BETWEEN 3 AND 100),
-  CONSTRAINT job_outbox_attempts_chk CHECK (attempts >= 0)
+  CONSTRAINT job_outbox_attempts_chk
+    CHECK (attempts >= 0 AND publish_attempts >= 0 AND max_attempts > 0),
+  -- Work cannot be acknowledged before it was dispatched.
+  CONSTRAINT job_outbox_ack_requires_publish_chk
+    CHECK (completed_at IS NULL OR published_at IS NOT NULL),
+  -- A row is not simultaneously successful and dead.
+  CONSTRAINT job_outbox_terminal_exclusive_chk
+    CHECK (completed_at IS NULL OR failed_at IS NULL)
 );
 
-CREATE INDEX job_outbox_pending_idx
-  ON job_outbox (available_at) WHERE published_at IS NULL;
+-- The re-drive index. Deliberately covers BOTH never-published rows and
+-- published-but-unacknowledged rows, because after a Redis data loss the
+-- second category is exactly what must be recovered. The relay selects
+-- unacknowledged rows whose lease has lapsed:
+--
+--   WHERE completed_at IS NULL AND failed_at IS NULL
+--     AND available_at <= now()
+--     AND (published_at IS NULL OR published_at < now() - lease_interval)
+CREATE INDEX job_outbox_undelivered_idx
+  ON job_outbox (available_at)
+  WHERE completed_at IS NULL AND failed_at IS NULL;
+
+-- Operator queue: jobs that exhausted retries and need a decision.
+CREATE INDEX job_outbox_dead_idx ON job_outbox (failed_at) WHERE failed_at IS NOT NULL;
 
 
 -- ============================================================================

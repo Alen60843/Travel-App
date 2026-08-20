@@ -13,7 +13,8 @@
     "db:migrate": "pnpm --filter @tripwith/api migration:run",
     "db:revert": "pnpm --filter @tripwith/api migration:revert",
     "db:verify": "pnpm --filter @tripwith/api db:verify",
-    "verify": "pnpm run check:enums && pnpm run db:verify"
+    "verify": "pnpm run check:enums && pnpm run test && pnpm run db:verify",
+    "test": "pnpm --filter @tripwith/shared test"
   },
   "devDependencies": {
     "turbo": "^2.1.3",

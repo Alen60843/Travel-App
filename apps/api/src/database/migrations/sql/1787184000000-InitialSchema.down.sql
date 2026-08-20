@@ -47,6 +47,8 @@ DROP TABLE IF EXISTS user_profiles           CASCADE;
 DROP TABLE IF EXISTS users                   CASCADE;
 
 -- Trigger functions
+DROP FUNCTION IF EXISTS tw_guard_join_approval()      CASCADE;
+DROP FUNCTION IF EXISTS tw_sync_provider_rating()     CASCADE;
 DROP FUNCTION IF EXISTS tw_apply_trust_delta()        CASCADE;
 DROP FUNCTION IF EXISTS tw_assign_message_seq()       CASCADE;
 DROP FUNCTION IF EXISTS tw_sync_participant_count()   CASCADE;
