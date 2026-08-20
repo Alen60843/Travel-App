@@ -75,7 +75,11 @@ export const JoinRequestStatus = {
   Approved: 'APPROVED',
   Rejected: 'REJECTED',
   Expired: 'EXPIRED',
+  /** The traveller withdrew. */
   Cancelled: 'CANCELLED',
+  /** Compensation after a permanently failed capture. Distinct from Cancelled
+   *  so support and trust handling can tell the two apart. */
+  PaymentFailed: 'PAYMENT_FAILED',
 } as const;
 export type JoinRequestStatus =
   (typeof JoinRequestStatus)[keyof typeof JoinRequestStatus];

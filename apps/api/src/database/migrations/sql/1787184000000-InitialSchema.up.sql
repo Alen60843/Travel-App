@@ -48,8 +48,12 @@ CREATE TYPE event_visibility AS ENUM ('PUBLIC', 'UNLISTED', 'PRIVATE');
 
 CREATE TYPE event_host_type AS ENUM ('USER', 'PROVIDER');
 
+-- PAYMENT_FAILED is distinct from CANCELLED on purpose: "the platform could not
+-- take payment" and "the traveller changed their mind" drive different
+-- notifications, different support handling, and potentially different trust
+-- treatment. Conflating them would corrupt the audit trail.
 CREATE TYPE join_request_status AS ENUM (
-  'PENDING', 'APPROVED', 'REJECTED', 'EXPIRED', 'CANCELLED'
+  'PENDING', 'APPROVED', 'REJECTED', 'EXPIRED', 'CANCELLED', 'PAYMENT_FAILED'
 );
 
 CREATE TYPE attendance_status AS ENUM ('UNKNOWN', 'ATTENDED', 'NO_SHOW', 'CANCELLED');
@@ -1111,12 +1115,27 @@ CREATE TABLE event_participants (
   created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
 
-  -- §4.2: duplicate participation is structurally impossible.
-  CONSTRAINT event_participants_event_user_uk UNIQUE (event_id, user_id),
   CONSTRAINT event_participants_join_request_uk UNIQUE (join_request_id),
   CONSTRAINT event_participants_cancel_consistency_chk
     CHECK ((attendance_status = 'CANCELLED') = (cancelled_at IS NOT NULL))
 );
+
+-- §4.2: at most one ACTIVE participation per (event, user).
+--
+-- Partial rather than a plain UNIQUE constraint (which cannot carry a WHERE
+-- clause, hence an index) so that a cancelled participation stays on the table
+-- as audit history without permanently barring the user from the event.
+--
+-- This matters for the compensation path: when a capture fails permanently the
+-- participant is cancelled and the seat returns to inventory. Under an
+-- unconditional UNIQUE the user could never rejoin an event that still had
+-- room, purely because their card failed once.
+--
+-- Duplicate seat counting remains impossible because tw_sync_participant_count
+-- only counts rows with cancelled_at IS NULL, and concurrency safety is
+-- unchanged: uniqueness is still enforced by the index.
+CREATE UNIQUE INDEX event_participants_active_uk
+  ON event_participants (event_id, user_id) WHERE cancelled_at IS NULL;
 
 CREATE INDEX event_participants_user_idx  ON event_participants (user_id, joined_at DESC);
 CREATE INDEX event_participants_event_idx ON event_participants (event_id)

@@ -208,10 +208,18 @@ The acknowledgement closing that loop is the whole design. `published_at` record
 
 BullMQ's durability is Redis's durability, so it must be configured for it:
 
-- **AOF enabled**, `appendfsync everysec`. RDB-only snapshots can lose minutes of queue state.
-- **`maxmemory-policy noeviction`** on the queue instance. An `allkeys-lru` policy will silently evict queue keys under pressure and corrupt BullMQ's internal structures.
-- **Separate Redis instance (or at minimum a separate logical DB) for queues vs cache.** The cache instance *should* run `allkeys-lru`; the queue instance must not. Sharing one instance forces one policy on both.
-- Replication with automatic failover for availability. Note that Redis replication is asynchronous, so failover can still lose recent writes — which is precisely why the outbox, not Redis, is the record of intent.
+**Production requires two separate Redis instances.** This is not a preference:
+
+| Instance | `maxmemory-policy` | Persistence | Why |
+|---|---|---|---|
+| **Queue** (BullMQ + outbox delivery) | `noeviction` | AOF, `appendfsync everysec` | Evicting a BullMQ key corrupts queue structures and can lose a committed business action. RDB-only snapshots can lose minutes of queue state |
+| **Cache** (feeds, viewports, rate limits, pub/sub) | `allkeys-lru` | none needed | Evicting under memory pressure is the entire point; a cache miss is harmless |
+
+**Separate logical databases on one instance do NOT satisfy this.** `maxmemory-policy` is a *server-level* setting; `SELECT 0` and `SELECT 1` share it. One instance forces one policy on both, and both outcomes are unacceptable: `noeviction` makes the cache return OOM errors instead of evicting, while `allkeys-lru` lets Redis silently delete queue keys. An earlier draft of this document offered logical DBs as a "minimum separation" — that was wrong and is withdrawn.
+
+Development may run a simplified single-instance setup, but only if documented as such. `infra/docker-compose.yml` deliberately runs the two-instance topology locally so development matches production; `apps/api` takes two independent connection URLs (`REDIS_QUEUE_URL`, `REDIS_CACHE_URL`) and never assumes they point at the same server.
+
+Also: replication with automatic failover for availability. Redis replication is asynchronous, so failover can still lose recent writes — which is precisely why the outbox, not Redis, is the record of intent.
 
 **Even with all of this, Redis durability is treated as best-effort.** Correctness does not depend on it.
 

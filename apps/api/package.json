@@ -3,9 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "build": "tsc -p tsconfig.json && pnpm run copy:sql",
+    "build": "nest build && pnpm run copy:sql",
     "copy:sql": "mkdir -p dist/database/migrations/sql && cp src/database/migrations/sql/*.sql dist/database/migrations/sql/",
+    "start": "node dist/main.js",
+    "start:dev": "nest start --watch",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "jest --config jest.config.js",
+    "test:unit": "jest --config jest.config.js --testPathPatterns=\\.spec\\.ts$",
+    "test:integration": "jest --config jest.config.js --testPathPatterns=\\.int-spec\\.ts$ --runInBand",
     "migration:run": "typeorm-ts-node-commonjs migration:run -d src/database/data-source.ts",
     "migration:revert": "typeorm-ts-node-commonjs migration:revert -d src/database/data-source.ts",
     "migration:show": "typeorm-ts-node-commonjs migration:show -d src/database/data-source.ts",
@@ -14,15 +19,40 @@
     "db:benchmark": "psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f src/database/scripts/benchmark-indexes.sql"
   },
   "dependencies": {
+    "@nestjs/common": "^11.0.12",
+    "@nestjs/core": "^11.0.12",
+    "@nestjs/platform-express": "^11.0.12",
+    "@nestjs/platform-socket.io": "^11.0.12",
+    "@nestjs/terminus": "^11.0.0",
+    "@nestjs/typeorm": "^11.0.0",
+    "@nestjs/websockets": "^11.0.12",
+    "@socket.io/redis-adapter": "^8.3.0",
     "@tripwith/shared": "workspace:*",
-    "dotenv": "^16.4.5",
-    "pg": "^8.13.0",
-    "typeorm": "^0.3.20"
+    "bullmq": "^5.34.0",
+    "dotenv": "^16.4.7",
+    "helmet": "^8.0.0",
+    "ioredis": "^5.4.2",
+    "pg": "^8.13.1",
+    "pino": "^9.6.0",
+    "pino-http": "^10.4.0",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.1",
+    "socket.io": "^4.8.1",
+    "typeorm": "^0.3.20",
+    "zod": "^3.24.1"
   },
   "devDependencies": {
-    "@types/node": "^22.7.5",
+    "@nestjs/cli": "^11.0.5",
+    "@nestjs/schematics": "^11.0.2",
+    "@nestjs/testing": "^11.0.12",
+    "@types/jest": "^29.5.14",
+    "@types/node": "^22.10.5",
     "@types/pg": "^8.11.10",
+    "@types/supertest": "^6.0.2",
+    "jest": "^29.7.0",
+    "supertest": "^7.0.0",
+    "ts-jest": "^29.2.5",
     "ts-node": "^10.9.2",
-    "typescript": "^5.6.3"
+    "typescript": "^5.7.3"
   }
 }

@@ -1,7 +1,25 @@
 # Local development dependencies.
+#
 # PostGIS version is pinned: spatial index behaviour and function signatures
-# differ across PostGIS majors, and the Phase 1 index benchmarks were taken
-# on PostgreSQL 17 / PostGIS 3.6.
+# differ across PostGIS majors, and the Phase 1 index benchmarks were taken on
+# PostgreSQL 17 / PostGIS 3.6.
+#
+# REDIS TOPOLOGY — two instances, not two logical databases.
+#
+# `maxmemory-policy` is a SERVER-level setting. Logical databases (SELECT 0/1)
+# on one instance share it, so they cannot express the two policies this system
+# requires:
+#
+#   queue cache  ->  noeviction   : evicting a BullMQ key corrupts queue state
+#                                   and can lose a committed business action
+#   app cache    ->  allkeys-lru  : evicting under memory pressure is the whole
+#                                   point; a cache miss is harmless
+#
+# Running both on one instance forces one policy on both: `noeviction` makes
+# the cache return OOM errors instead of evicting, and `allkeys-lru` lets Redis
+# silently delete queue keys. Neither is acceptable, so production MUST use
+# separate instances. This compose file mirrors that split so development runs
+# the same topology.
 services:
   postgres:
     image: postgis/postgis:17-3.6
@@ -19,13 +37,44 @@ services:
       timeout: 5s
       retries: 10
 
-  redis:
+  # BullMQ queues + transactional outbox delivery.
+  # Durability matters here: this is the only place in-flight jobs live between
+  # the outbox relay and a worker acknowledgement.
+  redis-queue:
     image: redis:7-alpine
-    command: ['redis-server', '--appendonly', 'yes']
+    command:
+      - redis-server
+      - --appendonly
+      - 'yes'
+      - --appendfsync
+      - everysec
+      - --maxmemory-policy
+      - noeviction
     ports:
       - '6379:6379'
     volumes:
-      - tripwith_redisdata:/data
+      - tripwith_redis_queue:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Disposable application cache: feed pages, viewport results, rate limits,
+  # Socket.IO pub/sub. Nothing here is required for correctness, so it evicts
+  # freely and does not need an append-only file.
+  redis-cache:
+    image: redis:7-alpine
+    command:
+      - redis-server
+      - --appendonly
+      - 'no'
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+    ports:
+      - '6380:6379'
     healthcheck:
       test: ['CMD', 'redis-cli', 'ping']
       interval: 5s
@@ -34,4 +83,4 @@ services:
 
 volumes:
   tripwith_pgdata:
-  tripwith_redisdata:
+  tripwith_redis_queue:

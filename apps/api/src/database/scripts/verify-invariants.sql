@@ -990,6 +990,113 @@ END $freeok$;
 
 
 -- ---------------------------------------------------------------------------
+-- 21. Retry after a permanently failed capture
+--
+-- Full path: approve -> participant created -> capture fails permanently ->
+-- compensation -> the traveller may legitimately try again.
+-- ---------------------------------------------------------------------------
+DO $retry$
+DECLARE
+  ev UUID; usr UUID; pay1 UUID; pay2 UUID; jr1 UUID; jr2 UUID; part1 UUID; part2 UUID;
+  seats INT; active_parts INT; history INT;
+BEGIN
+  INSERT INTO users (firebase_uid, email, date_of_birth, account_status)
+  VALUES ('fb_retry', 'retry@example.com', CURRENT_DATE - INTERVAL '29 years', 'ACTIVE')
+  RETURNING id INTO usr;
+
+  INSERT INTO events (host_type, host_user_id, category_id, title, capacity_max,
+                      price_minor, deposit_minor, starts_at, ends_at, meeting_point, status)
+  VALUES ('USER', tw_id('host'), (SELECT id FROM event_categories WHERE code='trek'),
+          'Retry Flow', 5, 10000, 1500,
+          now() + INTERVAL '30 days', now() + INTERVAL '30 days 5 hours',
+          ST_MakePoint(100.5, 13.75)::GEOGRAPHY, 'ACTIVE')
+  RETURNING id INTO ev;
+
+  -- ---- first attempt -------------------------------------------------
+  INSERT INTO payments (user_id, kind, event_id, provider, amount_minor,
+                        idempotency_key, status, authorized_at)
+  VALUES (usr, 'EVENT_DEPOSIT', ev, 'stripe', 1500, 'retry_pay_1', 'AUTHORIZED', now())
+  RETURNING id INTO pay1;
+
+  INSERT INTO event_join_requests (event_id, user_id, expires_at, payment_id)
+  VALUES (ev, usr, now() + INTERVAL '24 hours', pay1) RETURNING id INTO jr1;
+
+  UPDATE event_join_requests SET status = 'APPROVED', approved_at = now() WHERE id = jr1;
+
+  INSERT INTO event_participants (event_id, user_id, join_request_id, payment_id)
+  VALUES (ev, usr, jr1, pay1) RETURNING id INTO part1;
+
+  SELECT participant_count INTO seats FROM events WHERE id = ev;
+  PERFORM tw_assert(seats = 1, 'retry: seat consumed on approval', format('count=%s', seats));
+
+  -- ---- capture fails permanently; compensation runs -------------------
+  UPDATE payments SET status = 'FAILED', capture_requested_at = now() WHERE id = pay1;
+  UPDATE event_participants
+     SET cancelled_at = now(), attendance_status = 'CANCELLED' WHERE id = part1;
+  UPDATE event_join_requests SET status = 'PAYMENT_FAILED' WHERE id = jr1;
+
+  SELECT participant_count INTO seats FROM events WHERE id = ev;
+  PERFORM tw_assert(seats = 0, 'retry: compensation returns the seat to inventory',
+    format('count=%s', seats));
+
+  -- ---- retry ----------------------------------------------------------
+  INSERT INTO payments (user_id, kind, event_id, provider, amount_minor,
+                        idempotency_key, status, authorized_at)
+  VALUES (usr, 'EVENT_DEPOSIT', ev, 'stripe', 1500, 'retry_pay_2', 'AUTHORIZED', now())
+  RETURNING id INTO pay2;
+
+  INSERT INTO event_join_requests (event_id, user_id, expires_at, payment_id)
+  VALUES (ev, usr, now() + INTERVAL '24 hours', pay2) RETURNING id INTO jr2;
+  PERFORM tw_assert(TRUE, 'retry: a new join request is permitted after PAYMENT_FAILED');
+
+  UPDATE event_join_requests SET status = 'APPROVED', approved_at = now() WHERE id = jr2;
+
+  INSERT INTO event_participants (event_id, user_id, join_request_id, payment_id)
+  VALUES (ev, usr, jr2, pay2) RETURNING id INTO part2;
+  PERFORM tw_assert(TRUE, 'retry: a new participation is permitted after cancellation');
+
+  -- ---- invariants still hold -----------------------------------------
+  SELECT participant_count INTO seats FROM events WHERE id = ev;
+  PERFORM tw_assert(seats = 1, 'retry: seat counted exactly once after retry (no double count)',
+    format('count=%s', seats));
+
+  SELECT count(*) INTO active_parts
+    FROM event_participants WHERE event_id = ev AND user_id = usr AND cancelled_at IS NULL;
+  PERFORM tw_assert(active_parts = 1, 'retry: exactly one ACTIVE participation exists',
+    format('active=%s', active_parts));
+
+  SELECT count(*) INTO history
+    FROM event_participants WHERE event_id = ev AND user_id = usr;
+  PERFORM tw_assert(history = 2, 'retry: cancelled participation preserved as audit history',
+    format('rows=%s', history));
+
+  SELECT count(*) INTO history FROM event_join_requests WHERE event_id = ev AND user_id = usr;
+  PERFORM tw_assert(history = 2, 'retry: both join requests preserved as audit history',
+    format('rows=%s', history));
+
+  PERFORM tw_assert(
+    EXISTS (SELECT 1 FROM event_join_requests
+             WHERE id = jr1 AND status = 'PAYMENT_FAILED' AND approved_at IS NOT NULL),
+    'retry: failed attempt records BOTH that it was approved and why it ended');
+
+  INSERT INTO tw_ids VALUES ('retry_event', ev), ('retry_user', usr);
+END $retry$;
+
+-- A second ACTIVE participation must still be impossible.
+SELECT tw_expect_error(format($$
+  INSERT INTO event_participants (event_id, user_id) VALUES (%L, %L)
+$$, tw_id('retry_event'), tw_id('retry_user')),
+  'retry: a SECOND active participation is still rejected', '23505');
+
+-- And a second live join request must still be impossible.
+SELECT tw_expect_error(format($$
+  INSERT INTO event_join_requests (event_id, user_id, expires_at)
+  VALUES (%L, %L, now() + INTERVAL '24 hours')
+$$, tw_id('retry_event'), tw_id('retry_user')),
+  'retry: a SECOND live join request is still rejected', '23505');
+
+
+-- ---------------------------------------------------------------------------
 -- Report
 -- ---------------------------------------------------------------------------
 \echo ''
