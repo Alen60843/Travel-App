@@ -5,6 +5,15 @@ export interface CandidateCursor {
   readonly userId: string;
 }
 
+export interface CandidateFilters {
+  readonly homeCountryCode: string | null;
+  readonly nativeLanguageCode: string | null;
+  readonly minAge: number | null;
+  readonly maxAge: number | null;
+  /** Candidate must share at least one of these active editorial interests. */
+  readonly interestIds: readonly number[];
+}
+
 export interface CandidateQueryOptions {
   readonly viewerId: string;
   readonly asOf?: Date;
@@ -15,6 +24,7 @@ export interface CandidateQueryOptions {
   readonly pairWeights: ItineraryScoringOptions['pairWeights'];
   /** N, excluding the one additional proof row fetched by the repository. */
   readonly exactScoreLimit: number;
+  readonly filters?: CandidateFilters;
   readonly cursor?: CandidateCursor;
 }
 
@@ -68,6 +78,12 @@ export interface ViewerEligibilityOptions {
 }
 
 export interface ViewerScoringContextOptions extends ViewerEligibilityOptions {
+  readonly maximumAnchorRadiusMeters: number;
+}
+
+export interface PairEligibilityOptions extends ViewerEligibilityOptions {
+  readonly targetUserId: string;
+  /** Deployment cap; the viewer's lower max-distance setting still wins. */
   readonly maximumAnchorRadiusMeters: number;
 }
 

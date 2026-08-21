@@ -12,6 +12,105 @@ const RETURN_COUNT = 20;
 const AS_OF = new Date('2026-08-21T12:00:00.000Z');
 const TOS = process.env.BENCHMARK_TOS_VERSION ?? 'tos-test-v1';
 const PRIVACY = process.env.BENCHMARK_PRIVACY_VERSION ?? 'privacy-test-v1';
+const PLAN_ONLY = process.env.BENCHMARK_PLAN_ONLY === 'true';
+
+interface ExplainNode {
+  readonly [key: string]: unknown;
+  readonly Plans?: readonly ExplainNode[];
+}
+
+function explainRoot(value: unknown): Record<string, unknown> | null {
+  if (!Array.isArray(value)) return null;
+  const first = value[0] as Record<string, unknown> | undefined;
+  const queryPlan = first?.['QUERY PLAN'];
+  if (!Array.isArray(queryPlan)) return null;
+  const root = queryPlan[0];
+  return typeof root === 'object' && root !== null
+    ? root as Record<string, unknown>
+    : null;
+}
+
+function slowestPlanNodes(root: ExplainNode): readonly Record<string, unknown>[] {
+  const nodes: ExplainNode[] = [];
+  const visit = (node: ExplainNode): void => {
+    nodes.push(node);
+    for (const child of node.Plans ?? []) visit(child);
+  };
+  visit(root);
+  return nodes
+    .sort((left, right) =>
+      Number(right['Actual Total Time'] ?? 0) * Number(right['Actual Loops'] ?? 1)
+      - Number(left['Actual Total Time'] ?? 0) * Number(left['Actual Loops'] ?? 1),
+    )
+    .slice(0, 8)
+    .map((node) => ({
+      nodeType: node['Node Type'],
+      relation: node['Relation Name'] ?? null,
+      index: node['Index Name'] ?? null,
+      actualTotalMs: node['Actual Total Time'],
+      actualRows: node['Actual Rows'],
+      actualLoops: node['Actual Loops'],
+      sharedHitBlocks: node['Shared Hit Blocks'] ?? 0,
+      sharedReadBlocks: node['Shared Read Blocks'] ?? 0,
+      tempReadBlocks: node['Temp Read Blocks'] ?? 0,
+      tempWrittenBlocks: node['Temp Written Blocks'] ?? 0,
+    }));
+}
+
+function relationPlanNodes(root: ExplainNode): readonly Record<string, unknown>[] {
+  const nodes: ExplainNode[] = [];
+  const visit = (node: ExplainNode): void => {
+    if (node['Relation Name'] !== undefined || node['Index Name'] !== undefined) nodes.push(node);
+    for (const child of node.Plans ?? []) visit(child);
+  };
+  visit(root);
+  return nodes
+    .sort((left, right) =>
+      Number(right['Actual Total Time'] ?? 0) * Number(right['Actual Loops'] ?? 1)
+      - Number(left['Actual Total Time'] ?? 0) * Number(left['Actual Loops'] ?? 1),
+    )
+    .slice(0, 12)
+    .map((node) => ({
+      nodeType: node['Node Type'],
+      relation: node['Relation Name'] ?? null,
+      index: node['Index Name'] ?? null,
+      actualTotalMsPerLoop: node['Actual Total Time'],
+      actualRowsPerLoop: node['Actual Rows'],
+      actualLoops: node['Actual Loops'],
+      rowsRemovedByFilter: node['Rows Removed by Filter'] ?? 0,
+      sharedHitBlocks: node['Shared Hit Blocks'] ?? 0,
+      sharedReadBlocks: node['Shared Read Blocks'] ?? 0,
+    }));
+}
+
+function selfTimePlanNodes(root: ExplainNode): readonly Record<string, unknown>[] {
+  const nodes: Array<{ node: ExplainNode; selfMs: number }> = [];
+  const visit = (node: ExplainNode): void => {
+    const total = Number(node['Actual Total Time'] ?? 0) * Number(node['Actual Loops'] ?? 1);
+    const children = node.Plans ?? [];
+    const childTime = children.reduce(
+      (sum, child) => sum
+        + Number(child['Actual Total Time'] ?? 0) * Number(child['Actual Loops'] ?? 1),
+      0,
+    );
+    nodes.push({ node, selfMs: Math.max(0, total - childTime) });
+    for (const child of children) visit(child);
+  };
+  visit(root);
+  return nodes
+    .sort((left, right) => right.selfMs - left.selfMs)
+    .slice(0, 12)
+    .map(({ node, selfMs }) => ({
+      nodeType: node['Node Type'],
+      relation: node['Relation Name'] ?? null,
+      index: node['Index Name'] ?? null,
+      estimatedSelfMs: Number(selfMs.toFixed(3)),
+      actualTotalMsPerLoop: node['Actual Total Time'],
+      actualRowsPerLoop: node['Actual Rows'],
+      actualLoops: node['Actual Loops'],
+      joinType: node['Join Type'] ?? null,
+    }));
+}
 
 function percentile(values: readonly number[], fraction: number): number {
   const sorted = [...values].sort((left, right) => left - right);
@@ -45,7 +144,7 @@ async function main(): Promise<void> {
     }
 
     const results: Record<string, unknown>[] = [];
-    for (const cap of CAPS) {
+    for (const cap of PLAN_ONLY ? [] : CAPS) {
       const sqlTimes: number[] = [];
       const scoringTimes: number[] = [];
       const totalTimes: number[] = [];
@@ -150,6 +249,8 @@ async function main(): Promise<void> {
       exactScoreLimit: 200,
     });
     const planText = JSON.stringify(plan);
+    const root = explainRoot(plan);
+    const planNode = root?.['Plan'] as ExplainNode | undefined;
     const indexesUsed = [...planText.matchAll(/"Index Name":"([^"]+)"/g)]
       .map((match) => match[1]!)
       .filter((value, index, all) => all.indexOf(value) === index)
@@ -162,6 +263,15 @@ async function main(): Promise<void> {
         || planText.includes('user_blocks_pair_uk'),
       usesBlockedIndex: planText.includes('user_blocks_blocked_idx'),
       indexesUsed,
+      planningTimeMs: root?.['Planning Time'] ?? null,
+      executionTimeMs: root?.['Execution Time'] ?? null,
+      sharedHitBlocks: planNode?.['Shared Hit Blocks'] ?? null,
+      sharedReadBlocks: planNode?.['Shared Read Blocks'] ?? null,
+      tempReadBlocks: planNode?.['Temp Read Blocks'] ?? null,
+      tempWrittenBlocks: planNode?.['Temp Written Blocks'] ?? null,
+      slowestNodes: planNode ? slowestPlanNodes(planNode) : [],
+      relationNodes: planNode ? relationPlanNodes(planNode) : [],
+      estimatedSelfTimeNodes: planNode ? selfTimePlanNodes(planNode) : [],
     };
 
     process.stdout.write(`${JSON.stringify({

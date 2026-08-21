@@ -56,7 +56,9 @@ describe('UsersService (real PostgreSQL)', () => {
   let service: UsersService;
   let resolver: TripWithUserResolver;
   let consentPolicy: ConsentPolicyService;
-  const feedGeneration = { bump: jest.fn().mockResolvedValue(1) };
+  const feedGeneration = {
+    bump: jest.fn().mockResolvedValue('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'),
+  };
 
   beforeAll(async () => {
     await AppDataSource.initialize();

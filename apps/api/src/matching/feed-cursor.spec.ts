@@ -5,7 +5,7 @@ describe('FeedCursorCodec', () => {
   const codec = new FeedCursorCodec('test-cursor-secret-at-least-32-characters');
   const payload = {
     viewerId: '9fe67138-d718-4f75-a1ca-00264d277064',
-    generation: 7,
+    generation: '0123456789abcdef0123456789abcdef',
     filterHash: '0123456789abcdef01234567',
     batchKey: 'root',
     snapshotId: '0a9d5e5c-4f87-4d77-9c35-d3547a686139',

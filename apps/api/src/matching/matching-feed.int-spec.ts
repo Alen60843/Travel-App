@@ -30,6 +30,25 @@ describe('Matching feed cache/privacy integration (live PostgreSQL + Redis)', ()
   );
   let viewerId: string;
   let candidateId: string;
+  const rankingKeys = new Set<string>();
+
+  function defaultFilterHash(date = new Date()): string {
+    return generations.filterHash({
+      version: 1,
+      utcDate: date.toISOString().slice(0, 10),
+      radiusKm: config.matching.anchorRadiusKm,
+      pairWeights: config.matching.pairWeights,
+      breadthBeta: config.matching.breadthBeta,
+      candidateCap: config.matching.candidateCap,
+      terms: config.consentPolicy.currentTermsOfServiceVersion,
+      privacy: config.consentPolicy.currentPrivacyPolicyVersion,
+      homeCountryCode: null,
+      nativeLanguageCode: null,
+      minAge: null,
+      maxAge: null,
+      interestIds: [],
+    });
+  }
 
   beforeAll(async () => {
     await AppDataSource.initialize();
@@ -42,21 +61,9 @@ describe('Matching feed cache/privacy integration (live PostgreSQL + Redis)', ()
 
   afterAll(async () => {
     try {
-      const date = new Date().toISOString().slice(0, 10);
-      const filterHash = generations.filterHash({
-        version: 1,
-        utcDate: date,
-        radiusKm: config.matching.anchorRadiusKm,
-        pairWeights: config.matching.pairWeights,
-        breadthBeta: config.matching.breadthBeta,
-        candidateCap: config.matching.candidateCap,
-        terms: config.consentPolicy.currentTermsOfServiceVersion,
-        privacy: config.consentPolicy.currentPrivacyPolicyVersion,
-      });
       await redis.del(
         `feed:gen:${viewerId}`,
-        generations.rankingKey(viewerId, 0, filterHash),
-        generations.rankingKey(viewerId, 1, filterHash),
+        ...rankingKeys,
       );
       await AppDataSource.transaction(async (manager) => {
         await manager.query(
@@ -135,6 +142,9 @@ describe('Matching feed cache/privacy integration (live PostgreSQL + Redis)', ()
 
   it('uses cached ranking while immediately enforcing block, Ghost, and suspension changes', async () => {
     const first = await service.getFeed(viewerId, { limit: 10 });
+    rankingKeys.add(
+      generations.rankingKey(viewerId, first.generation, defaultFilterHash()),
+    );
     expect(first.items.map(({ id }) => id)).toEqual([candidateId]);
     expect(first.items[0]).not.toHaveProperty('scoringSegments');
     expect(first.items[0]).not.toHaveProperty('age');
@@ -170,9 +180,8 @@ describe('Matching feed cache/privacy integration (live PostgreSQL + Redis)', ()
     );
 
     await AppDataSource.query(
-      `INSERT INTO account_restrictions (user_id, type, reason, starts_at)
-       VALUES ($1, 'MATCHING_SUSPENDED', 'feed integration restriction',
-               now() - INTERVAL '1 second')`,
+      `INSERT INTO account_restrictions (user_id, type, reason)
+       VALUES ($1, 'MATCHING_SUSPENDED', 'feed integration restriction')`,
       [candidateId],
     );
     await expect(service.getFeed(viewerId, { limit: 10 })).resolves.toMatchObject({
@@ -198,12 +207,44 @@ describe('Matching feed cache/privacy integration (live PostgreSQL + Redis)', ()
       [viewerId, candidateId],
     );
 
-    await expect(generations.bump(viewerId)).resolves.toBe(1);
+    const bumped = await generations.bump(viewerId);
+    expect(bumped).toMatch(/^[a-f0-9]{32}$/);
     const regenerated = await service.getFeed(viewerId, { limit: 10 });
-    expect(regenerated.generation).toBe(1);
+    expect(regenerated.generation).toBe(bumped);
+    rankingKeys.add(
+      generations.rankingKey(viewerId, regenerated.generation, defaultFilterHash()),
+    );
     expect(regenerated.items.map(({ id }) => id)).toEqual([candidateId]);
     expect(metrics.getCounter('matching.cache_miss')).toBe(2);
     expect(metrics.getCounter('matching.cache_hit')).toBe(4);
     expect(metrics.getCounter('matching.cache_revalidated_removed')).toBe(4);
+  });
+
+  it('never re-addresses an old ranking after generation metadata is lost', async () => {
+    await redis.del(`feed:gen:${viewerId}`);
+    const oldFeed = await service.getFeed(viewerId, { limit: 10 });
+    const oldKey = generations.rankingKey(
+      viewerId,
+      oldFeed.generation,
+      defaultFilterHash(),
+    );
+    rankingKeys.add(oldKey);
+    expect(await redis.get(oldKey)).not.toBeNull();
+
+    const bumped = await generations.bump(viewerId);
+    expect(bumped).not.toBe(oldFeed.generation);
+    await redis.del(`feed:gen:${viewerId}`);
+
+    const afterLoss = await service.getFeed(viewerId, { limit: 10 });
+    const afterLossKey = generations.rankingKey(
+      viewerId,
+      afterLoss.generation,
+      defaultFilterHash(),
+    );
+    rankingKeys.add(afterLossKey);
+    expect(afterLoss.generation).not.toBe(oldFeed.generation);
+    expect(afterLoss.generation).not.toBe(bumped);
+    expect(afterLossKey).not.toBe(oldKey);
+    expect(await redis.get(oldKey)).not.toBeNull();
   });
 });

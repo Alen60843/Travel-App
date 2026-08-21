@@ -161,12 +161,14 @@ describe('redis infrastructure (integration)', () => {
       await expect(svc.get(testKey)).resolves.toBeNull();
     });
 
-    it('atomically increments a cache generation', async () => {
+    it('atomically claims cache metadata without overwriting the winner', async () => {
       const svc = cache();
       await svc.del(testKey);
-      await expect(svc.increment(testKey)).resolves.toBe(1);
-      await expect(svc.increment(testKey)).resolves.toBe(2);
-      await expect(svc.get<number>(testKey)).resolves.toBe(2);
+      await expect(svc.setIfAbsent(testKey, 'first')).resolves.toBe(true);
+      await expect(svc.setIfAbsent(testKey, 'second')).resolves.toBe(false);
+      await expect(svc.get<string>(testKey)).resolves.toBe('first');
+      await expect(svc.replace(testKey, 'replacement')).resolves.toBe(true);
+      await expect(svc.get<string>(testKey)).resolves.toBe('replacement');
     });
 
     it('get() NEVER throws and returns null when the connection is broken — the structural guarantee', async () => {
@@ -183,10 +185,11 @@ describe('redis infrastructure (integration)', () => {
       brokenRedis.disconnect();
     });
 
-    it('increment() returns null when Redis is unavailable', async () => {
+    it('metadata writes report Redis unavailability without throwing', async () => {
       const brokenRedis = createUnreachableRedis();
       const brokenCache = new CacheService(brokenRedis);
-      await expect(brokenCache.increment('anything')).resolves.toBeNull();
+      await expect(brokenCache.setIfAbsent('anything', 'token')).resolves.toBeNull();
+      await expect(brokenCache.replace('anything', 'token')).resolves.toBe(false);
       brokenRedis.disconnect();
     });
   });

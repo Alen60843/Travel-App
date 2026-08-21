@@ -55,7 +55,9 @@ async function createAccount(): Promise<SeededAccount> {
 describe('settings, privacy, and consent (real PostgreSQL)', () => {
   let settings: SettingsService;
   let consents: ConsentService;
-  const feedGeneration = { bump: jest.fn().mockResolvedValue(1) };
+  const feedGeneration = {
+    bump: jest.fn().mockResolvedValue('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'),
+  };
 
   beforeAll(async () => {
     await AppDataSource.initialize();

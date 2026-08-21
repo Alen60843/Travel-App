@@ -23,7 +23,7 @@ export interface MatchingFeedView {
   readonly items: readonly MatchingCandidateView[];
   readonly nextCursor: string | null;
   readonly rankingExact: boolean;
-  readonly generation: number;
+  readonly generation: string;
 }
 
 export interface CachedRankedCandidate extends MatchingCandidateView {

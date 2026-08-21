@@ -9,7 +9,11 @@ import { CacheService } from '../redis/cache.service';
 import { LOGGER, METRICS } from '../observability/tokens';
 import type { MetricsService } from '../observability/metrics.interface';
 import type { PinoLoggerService } from '../observability/pino-logger.service';
-import { CandidateRepository, type CandidateCursor } from './candidates';
+import {
+  CandidateRepository,
+  type CandidateCursor,
+  type CandidateFilters,
+} from './candidates';
 import { FeedCursorCodec, type FeedCursorPayload } from './feed-cursor';
 import { FeedGenerationService } from './feed-generation.service';
 import {
@@ -57,6 +61,7 @@ export class MatchingService {
       }
 
       const asOf = new Date();
+      const filters = this.normalizeFilters(query);
       const policy = this.policyOptions(viewerId, asOf);
       if (!(await this.candidates.isViewerEligible(policy))) {
         throw new MatchingNotEligibleError();
@@ -72,6 +77,11 @@ export class MatchingService {
         candidateCap: this.config.matching.candidateCap,
         terms: this.config.consentPolicy.currentTermsOfServiceVersion,
         privacy: this.config.consentPolicy.currentPrivacyPolicyVersion,
+        homeCountryCode: filters.homeCountryCode,
+        nativeLanguageCode: filters.nativeLanguageCode,
+        minAge: filters.minAge,
+        maxAge: filters.maxAge,
+        interestIds: filters.interestIds,
       });
       let cursor = query.cursor ? this.cursorCodec.decode(query.cursor) : null;
       if (cursor && cursor.viewerId !== viewerId) {
@@ -102,7 +112,7 @@ export class MatchingService {
         // A cursor names one immutable cache snapshot. Rebuilding the same key
         // after TTL expiry and continuing the old cursor would mix two feeds.
         if (cursor) throw new MatchingCursorStaleError();
-        ranking = await this.generateRanking(viewerId, asOf, null);
+        ranking = await this.generateRanking(viewerId, asOf, filters, null);
         await this.cache.set(cacheKey, ranking, this.config.matching.feedTtlSeconds);
       } else {
         this.metrics.increment('matching.cache_hit');
@@ -134,6 +144,7 @@ export class MatchingService {
           continuation = await this.generateRanking(
             viewerId,
             new Date(ranking.generatedAt),
+            filters,
             continuationCursor,
           );
           await this.cache.set(
@@ -171,6 +182,7 @@ export class MatchingService {
   private async generateRanking(
     viewerId: string,
     asOf: Date,
+    filters: CandidateFilters,
     coarseCursor: CandidateCursor | null,
   ): Promise<CachedMatchingRanking> {
     const viewer = await this.candidates.loadViewerScoringContext({
@@ -185,6 +197,7 @@ export class MatchingService {
       maximumAnchorRadiusMeters: this.config.matching.anchorRadiusKm * 1_000,
       pairWeights: this.config.matching.pairWeights,
       exactScoreLimit: this.config.matching.candidateCap,
+      filters,
       ...(coarseCursor ? { cursor: coarseCursor } : {}),
     });
     this.metrics.timing(
@@ -260,7 +273,7 @@ export class MatchingService {
   private async pageRanking(options: {
     readonly viewerId: string;
     readonly ranking: CachedMatchingRanking;
-    readonly generation: number;
+    readonly generation: string;
     readonly filterHash: string;
     readonly batchKey: string;
     readonly cursor: FeedCursorPayload | null;
@@ -338,6 +351,34 @@ export class MatchingService {
       currentPrivacyPolicyVersion:
         this.config.consentPolicy.currentPrivacyPolicyVersion,
     } as const;
+  }
+
+  private normalizeFilters(query: GetMatchingFeedQueryDto): CandidateFilters {
+    const minAge = query.minAge ?? null;
+    const maxAge = query.maxAge ?? null;
+    if (minAge !== null && maxAge !== null && minAge > maxAge) {
+      throw new ValidationError('minAge must not exceed maxAge', {
+        field: 'minAge',
+      });
+    }
+    const interestIds = [...(query.interestIds ?? [])].sort((left, right) => left - right);
+    if (
+      interestIds.length > 20
+      || new Set(interestIds).size !== interestIds.length
+      || interestIds.some((id) => !Number.isInteger(id) || id < 1)
+    ) {
+      throw new ValidationError(
+        'interestIds must contain at most 20 unique positive integers',
+        { field: 'interestIds' },
+      );
+    }
+    return {
+      homeCountryCode: query.homeCountryCode ?? null,
+      nativeLanguageCode: query.nativeLanguageCode ?? null,
+      minAge,
+      maxAge,
+      interestIds,
+    };
   }
 
   private toView(candidate: CachedRankedCandidate): MatchingCandidateView {

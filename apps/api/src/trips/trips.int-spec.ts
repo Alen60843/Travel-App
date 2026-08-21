@@ -33,7 +33,9 @@ async function createUser(suffix: string): Promise<UserEntity> {
 
 describe('TripsService (real PostgreSQL/PostGIS)', () => {
   let service: TripsService;
-  const feedGeneration = { bump: jest.fn().mockResolvedValue(1) };
+  const feedGeneration = {
+    bump: jest.fn().mockResolvedValue('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'),
+  };
 
   beforeAll(async () => {
     await AppDataSource.initialize();
@@ -53,6 +55,9 @@ describe('TripsService (real PostgreSQL/PostGIS)', () => {
   });
 
   it('creates, reads, lists, updates and deletes an owner trip with explicit visibility', async () => {
+    // Cache metadata is best-effort: a failed generation write must never
+    // roll back the already-authorized PostgreSQL mutation.
+    feedGeneration.bump.mockResolvedValueOnce(null);
     const owner = await createUser('crud');
     const created = await service.createTrip(owner.id, {
       title: '  One Day in Jerusalem  ',

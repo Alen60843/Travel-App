@@ -22,6 +22,8 @@ interface FixtureUserOptions {
   readonly minimumTrust?: number;
   readonly ghostUntil?: string;
   readonly consent?: 'current' | 'stale' | 'missing';
+  readonly homeCountryCode?: string;
+  readonly nativeLanguageCode?: string;
 }
 
 describe('CandidateRepository (live PostgreSQL/PostGIS)', () => {
@@ -61,9 +63,16 @@ describe('CandidateRepository (live PostgreSQL/PostGIS)', () => {
     );
     await runner.query(
       `INSERT INTO user_profiles
-         (user_id, display_name, home_country_code, languages_spoken, travel_style)
-       VALUES ($1, $2, 'FR', ARRAY['en','fr'], $3)`,
-      [id, `Match ${label}`, options.travelStyle ?? 3],
+         (user_id, display_name, home_country_code, native_language_code,
+          languages_spoken, travel_style)
+       VALUES ($1, $2, $3, $4, ARRAY['en','fr'], $5)`,
+      [
+        id,
+        `Match ${label}`,
+        options.homeCountryCode ?? 'FR',
+        options.nativeLanguageCode ?? 'fr',
+        options.travelStyle ?? 3,
+      ],
     );
     await runner.query(
       `INSERT INTO user_settings
@@ -128,8 +137,20 @@ describe('CandidateRepository (live PostgreSQL/PostGIS)', () => {
     await addSegment(viewer, 'viewer-paris');
     await addSegment(viewer, 'viewer-rome', 12.4964, 41.9028, 'remote-rome');
 
-    const stronger = await createUser('stronger', { trust: 5, travelStyle: 2 });
-    const weaker = await createUser('weaker', { trust: 8, travelStyle: 4 });
+    const stronger = await createUser('stronger', {
+      trust: 5,
+      travelStyle: 2,
+      homeCountryCode: 'FR',
+      nativeLanguageCode: 'fr',
+      dateOfBirth: '1992-06-15',
+    });
+    const weaker = await createUser('weaker', {
+      trust: 8,
+      travelStyle: 4,
+      homeCountryCode: 'ES',
+      nativeLanguageCode: 'es',
+      dateOfBirth: '1986-06-15',
+    });
     await addSegment(stronger, 'stronger');
     // A non-zero geodesic proves SQL spherical distance and the TS haversine
     // stay in parity, rather than only exercising the identity point.
@@ -233,6 +254,51 @@ describe('CandidateRepository (live PostgreSQL/PostGIS)', () => {
     expect(batch.candidates[0]!.matchUpperBound).toBeGreaterThanOrEqual(
       batch.nextUnscored!.matchUpperBound,
     );
+
+    const filterCases = [
+      [{ homeCountryCode: 'FR' }, stronger],
+      [{ nativeLanguageCode: 'es' }, weaker],
+      [{ minAge: 35 }, weaker],
+      [{ maxAge: 35 }, stronger],
+      [{ interestIds: [interestA] }, stronger],
+      [{ interestIds: [interestC] }, weaker],
+      [{
+        homeCountryCode: 'FR',
+        nativeLanguageCode: 'fr',
+        minAge: 30,
+        maxAge: 35,
+        interestIds: [interestA, interestC],
+      }, stronger],
+    ] as const;
+    for (const [partialFilters, expectedUserId] of filterCases) {
+      const filtered = await repository.findCoarseCandidates({
+        ...options,
+        exactScoreLimit: 10,
+        filters: {
+          homeCountryCode: null,
+          nativeLanguageCode: null,
+          minAge: null,
+          maxAge: null,
+          interestIds: [],
+          ...partialFilters,
+        },
+      });
+      expect(filtered.candidates.map(({ userId }) => userId)).toEqual([expectedUserId]);
+    }
+
+    await runner.query('UPDATE interests SET is_active = FALSE WHERE id = $1', [interestC]);
+    const inactiveInterestFilter = await repository.findCoarseCandidates({
+      ...options,
+      exactScoreLimit: 10,
+      filters: {
+        homeCountryCode: null,
+        nativeLanguageCode: null,
+        minAge: null,
+        maxAge: null,
+        interestIds: [interestC],
+      },
+    });
+    expect(inactiveInterestFilter.candidates).toEqual([]);
 
     const secondCoarsePage = await repository.findCoarseCandidates({
       ...options,

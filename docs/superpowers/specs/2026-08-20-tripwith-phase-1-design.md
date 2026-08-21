@@ -1,6 +1,6 @@
 # TripWith — Phase 1 Architecture and Database + Phase 2/3/4 Addenda
 
-**Date:** 2026-08-20 (revised through the Phase 4 close-out on 2026-08-21)
+**Date:** 2026-08-20 (revised through the Phase 4 post-review correction gate on 2026-08-21)
 **Status:** Phases 1–4 implemented, corrected and verified; Phase 4 closed; Phase 5 not started
 **Scope:** Architecture, complete relational model, initial migration, Phase 2 backend/infrastructure, Phase 3 Authentication & Users, and Phase 4 Trips & Matching. No frontend and no payment-provider business implementation.
 
@@ -414,7 +414,7 @@ When `U > M₍K₎`, exactness is *unproven* for that request — not necessaril
 
 Cross-user invalidation is not attempted — one user editing a trip would fan out to every possible viewer, unbounded. Instead the cache is split by *what kind of fact* it holds.
 
-**Cached (ranking):** the ordered candidate ID list and scores. Key `feed:v{gen}:{viewerId}:{filterHash}`, **TTL 90 s**. Viewer-side changes invalidate immediately via `INCR feed:gen:{viewerId}` — O(1), no `SCAN` — on swipe, block, filter change, Ghost Mode toggle, trip create/update/delete, and interest/style edits.
+**Cached (ranking):** the ordered candidate ID list and scores. Key `feed:v{generationToken}:{viewerId}:{filterHash}`, **TTL 90 s**. The generation is an opaque random 128-bit token, not a counter. A successful viewer-side mutation replaces it with a newly generated token — O(1), no `SCAN` — on swipe, filter/settings change, Ghost Mode toggle, trip create/update/delete, and interest/style edits. A missing or invalid generation key is initialized atomically with a fresh token and never falls back to a reusable default, so eviction cannot make an older ranking namespace addressable again.
 
 **Never cached (authorization).** Before any cached page is returned, its candidate IDs are revalidated against PostgreSQL with one indexed query over at most `K` ids:
 
@@ -445,7 +445,8 @@ Every predicate is index-backed (`users_discoverable_idx`, both `user_blocks` di
 | **Account restriction (matching/full suspension)** | **0** |
 | **Deactivation or deletion** | **0** |
 | **Ghost Mode / discovery visibility** | **0** |
-| Viewer's own swipes, filters, trips | 0 (generation bump) |
+| Viewer's own swipes, filters, trips after a successful Redis generation replacement | 0 |
+| Same mutations if Redis invalidation is unavailable | up to 90 s for ordinary ranking/profile state; authorization and prior swipes are still revalidated |
 
 Verified by test: of six candidates (clean, blocked-by-viewer, blocking-viewer, ghosted, deactivated, restricted), revalidation returns exactly the clean one.
 
@@ -1153,7 +1154,7 @@ DELETE /api/v1/me/trips/:tripId/segments/:segmentId
 
 ### Candidate generation and exact scoring
 
-`GET /api/v1/matching/feed` is authenticated and uses a validated `limit` plus an opaque signed cursor. PostgreSQL performs the hard-elimination and anchor stages. It excludes self; inactive/deleted, undiscoverable or effectively ghosted accounts; stale required-policy consent; active matching/full restrictions; blocks in either direction; the viewer's previous swipes; mutual age failures; trust-threshold failures; and candidates without a future date-and-distance itinerary anchor. Interests and travel style remain ranking signals rather than hard filters.
+`GET /api/v1/matching/feed` is authenticated and uses a validated `limit`, optional request-level filters (`homeCountryCode`, `nativeLanguageCode`, `minAge`, `maxAge`, and bounded `interestIds`), plus an opaque signed cursor. PostgreSQL performs the hard-elimination and anchor stages. It excludes self; inactive/deleted, undiscoverable or effectively ghosted accounts; stale required-policy consent; active matching/full restrictions; blocks in either direction; the viewer's previous swipes; mutual age failures; trust-threshold failures; candidates outside an explicitly supplied request filter; and candidates without a current-or-future date-and-distance itinerary anchor. Country/language are exact matches, age bounds are inclusive, and `interestIds` means sharing at least one requested active interest. Without that explicit filter, interests and travel style remain ranking signals rather than hard filters. Normalized filters are included in `filterHash`, so cache and HMAC-bound cursor state cannot cross filter sets.
 
 The implementation preserves the approved equations:
 
@@ -1190,12 +1191,12 @@ The average anchored survivor count was 1,992.8. `N=50` is the configurable init
 
 `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` used `trip_segments_loc_range_gix`, `swipes_source_idx`, `user_blocks_blocker_idx`, `user_blocks_blocked_idx`, `user_consents_lookup_idx` and relevant identity indexes. Splitting the bidirectional block predicate into two anti-joins made both existing direction indexes explicit to the planner. No index or schema change was required.
 
-Limitations are material: this is deterministic synthetic data, warm cache, one local PostgreSQL connection, 24 sampled viewers and no concurrent mixed workload. The roughly 0.86 s median candidate SQL is a tuning signal, not a supported-user-count claim. Production capacity and query-shape tuning require a concurrent workload with production-like geographic/date skew.
+Limitations are material: this is deterministic synthetic data, warm cache, one local PostgreSQL connection, 24 sampled viewers and no concurrent mixed workload. This initial pre-correction run's roughly 0.86 s median candidate SQL was a tuning signal, not a supported-user-count claim; §23 records the corrected query shape and same-fixture rerun. Production capacity still requires a concurrent workload with production-like geographic/date skew.
 
 ### Cache, cursors and privacy
 
-- Ranked batches use `feed:v{generation}:{viewerId}:{filterHash}` with a 90-second TTL; continuation batches append a deterministic keyset hash. The cached value contains ranking/safe display state, never authoritative authorization.
-- O(1) `INCR feed:gen:{viewerId}` invalidates on trip/segment, swipe, interest, travel-style, discovery, Ghost, age/trust and distance-preference changes. No Redis `SCAN` or cross-user fan-out is used.
+- Ranked batches use `feed:v{generationToken}:{viewerId}:{filterHash}` with a 90-second TTL; continuation batches append a deterministic keyset hash. The cached value contains ranking/safe display state, never authoritative authorization.
+- O(1) replacement of `feed:gen:{viewerId}` with a random 128-bit token invalidates on trip/segment, swipe, interest, travel-style, discovery, Ghost, age/trust and distance-preference changes. Missing/corrupt metadata is atomically initialized to a fresh token rather than a reusable default. No Redis `SCAN` or cross-user fan-out is used.
 - HMAC-SHA256 cursors bind the viewer, generation, filter hash, immutable cache snapshot, coarse batch and last exact `(score,user_id)`. Tampering, cross-user replay, generation drift and expired snapshots fail with stable invalid/stale cursor errors instead of mixing feeds.
 - Before every response, PostgreSQL rechecks viewer eligibility and candidate account/discovery/Ghost/consent/restriction/block state. Previous viewer swipes are also rechecked, closing generation-bump failure/race windows. A hidden candidate is removed before serialization; cached profile/ranking data alone may be stale for at most the TTL.
 - Responses contain only internal candidate ID, display name/avatar, country, spoken languages, style, trust, common active-interest IDs, score and score components. Firebase UID, contact data, DOB/age, consent/restriction state and all itinerary descriptions/dates/coordinates are absent.
@@ -1204,7 +1205,7 @@ Required metrics are emitted through the existing abstraction: `matching.candida
 
 ### Swipes and mutual matches
 
-`POST /api/v1/matching/swipes` accepts a validated v4 `targetUserId` and `LIKE` or `PASS`. The source is always the authenticated internal user. The first direction is final; an identical retry is idempotent, while an attempt to change it returns `SWIPE_ALREADY_EXISTS`. Self, absent, hidden, blocked, restricted or otherwise ineligible targets share the non-enumerating `SWIPE_TARGET_INVALID` boundary.
+`POST /api/v1/matching/swipes` accepts a validated v4 `targetUserId` and `LIKE` or `PASS`. The source is always the authenticated internal user. Under the unordered-pair lock and in the swipe transaction, one authoritative pair-eligibility query rechecks both users' current account/discovery/Ghost/consent/restriction/block/age/trust state and requires a current-or-future trip pair with both date overlap and the configured geographic anchor. It does not require a stale score or feed position. The first direction is final; an identical retry is idempotent, while an attempt to change it returns `SWIPE_ALREADY_EXISTS`. Self, absent, hidden, blocked, restricted, unanchored or otherwise ineligible targets share the non-enumerating `SWIPE_TARGET_INVALID` boundary.
 
 The unordered user pair is canonicalized and protected by a transaction-scoped advisory lock. A reciprocal pair of `LIKE` rows creates one canonical `matches` row, one `MATCH` `chat_rooms` row and exactly two `chat_members` rows in one transaction. The existing unique constraints remain the backstop for non-cooperating writers, and a losing writer removes its unused room. The 2-way race and repeated retries converge to 2 swipes, 1 match, 1 room, 2 members and 0 messages. Chat messaging remains Phase 7 work.
 
@@ -1271,11 +1272,113 @@ There are no changes to migrations, schema SQL, TypeORM entities, shared enums/d
 
 ### Remaining non-blocking risks
 
-- The synthetic benchmark's candidate SQL p50/p95 is approximately 0.86/1.26 seconds with about 1,993 anchored survivors. Before production scale, profile the plan under concurrent production-like data, then tune query shape/data distribution; do not infer capacity from this run.
+- After the focused query-shape correction in §23, the same synthetic fixture's candidate SQL p50/p95 at `N=50` is approximately 21/31 ms with about 1,993 anchored survivors. This remains a single-connection local measurement, not a throughput or production-capacity claim; profile under concurrent production-like data before scale decisions.
 - `N=50` achieved 0/96 unproven recalls for the sampled top-20 requests, not a universal recall guarantee. `matching.recall_unproven` and the configurable cap are the operational feedback loop; increase `N` only from observed evidence.
 - Segment containment and dense ordering are transactionally enforced by the owner API but are not new database triggers. Existing composite FKs prevent cross-parent ownership drift, while a privileged direct-SQL writer can still create out-of-parent dates or sparse order and must use controlled import validation.
 - Ranking/profile data can remain stale for the 90-second cache TTL. Security/privacy and previous-swipe state are revalidated at response time; ordinary score/display freshness is deliberately not zero-staleness.
 - Generation bumps are best-effort Redis operations after PostgreSQL commit. Redis loss can therefore retain stale ranking until TTL, but cannot expose a currently blocked, hidden, restricted, unusable, non-consenting or already-swiped account because those predicates are rechecked from PostgreSQL.
 - The existing Phase 2/3 non-failing ts-jest isolated-modules, shared implicit-ESM and pnpm audit `url.parse()` warnings remain tooling/dependency diagnostics.
 
-**Phase 4 Trips & Matching ends here and is fully closed. Do not begin Phase 5 without explicit approval.**
+**The initial Phase 4 close-out ends here. The focused post-review correction gate below supersedes its affected implementation and performance statements.**
+
+---
+
+## 23. Phase 4 Post-Review Correction Gate
+
+**Completed:** 2026-08-21
+
+**Approval state:** All four independent review concerns were confirmed, corrected with focused changes, and verified on `phase4/trips-matching`. Phase 4 is closed. The branch was not merged or pushed, and Phase 5 was not started.
+
+### Confirmed findings and corrections
+
+1. **Finding →** direct swipes did not require itinerary eligibility. **Evidence →** a regression first demonstrated that two otherwise eligible users with no trips could submit a direct `LIKE`; the feed would never have surfaced that pair. **Impact →** clients that knew UUIDs could create reciprocal matches outside the approved itinerary-eligible universe. **Fix →** `SwipesRepository` now calls the shared `CandidateRepository.isPairEligible()` seam inside the existing transaction and unordered-pair advisory lock. It rechecks current policy eligibility and requires a date-overlapping, geographically anchored trip pair without requiring rank or score freshness. **Verification →** no trips, geographically distant, date-disjoint, unknown, self, hidden, Ghost, consent, both block directions, both restriction types, mutual-age and trust failures all return the same non-enumerating `SWIPE_TARGET_INVALID`; a valid anchor succeeds. The concurrent reciprocal-LIKE test still converges to two swipes, one match, one room and two members.
+2. **Finding →** counter generations with a missing-key default permitted Redis ABA namespace reuse. **Evidence →** with an old generation-0 ranking retained, bumping the counter and deleting only `feed:gen:<viewer>` made generation 0 addressable again. **Impact →** an evicted metadata key could resurrect ranking state invalidated by a trip, interest, style, settings or swipe mutation. **Fix →** generations are random 128-bit lowercase hexadecimal tokens. Missing metadata is atomically created with `SET ... NX`; concurrent readers use the winner, invalid/counter-era values are replaced, and invalidation writes a fresh token. Redis failure yields a fresh uncacheable namespace and never a historical default. **Verification →** live Redis tests retain the old ranking while deleting only metadata and prove its token is never reused; missing/concurrent/corrupt initialization, restart-style key loss, stale cursor, successful bumps and Redis failure all pass.
+3. **Finding →** the approved Phase 4 request-level filters were absent. **Evidence →** the original Phase 4 requirements included dynamic home-country, native-language, age and interest filtering, while the DTO accepted only `limit` and `cursor`. **Impact →** the implemented API omitted an in-scope Social discovery capability, and no cache/cursor namespace could represent it. **Fix →** add optional `homeCountryCode`, `nativeLanguageCode`, inclusive `minAge`/`maxAge`, and at-most-20 unique positive `interestIds`. Country/language are normalized exact matches; interests mean at least one requested active interest. SQL remains static and parameterized, normalized filters enter `filterHash`, and cursors remain HMAC-bound to that hash. **Verification →** every filter and combinations, malformed/bounded inputs, inverted ages, inactive interests, cache separation and cross-filter cursor rejection pass.
+4. **Finding →** the candidate SQL materialized and joined a broad eligible/account universe with all anchored pairs before aggregation. **Evidence →** the correction-gate baseline on the unchanged 5,001-user/10,002-segment fixture measured `N=50` candidate SQL at 854.061/1266.596 ms p50/p95; representative `EXPLAIN (ANALYZE, BUFFERS)` took 1243.919 ms and 92,658 shared-buffer hits. **Impact →** `N=50` and `N=500` cost almost the same because work happened before the cap, making the request path materially slower than exact TypeScript scoring. **Fix →** use the composite GIST date/distance anchor first, materialize and aggregate every anchored pair once per candidate, then join only anchored candidate IDs through account/policy/block/swipe/dynamic-filter eligibility and rank them. No index, schema or diagnostic contract changed. **Verification →** all admissibility/parity/top-K tests pass with the same 1,992.8 average anchored survivors and zero unproven recalls; the representative plan fell to 37.738 ms and 44,777 shared-buffer hits with no reads or temp I/O.
+
+The focused final review found one additional concrete Medium security/correctness defect:
+
+5. **Finding →** live Ghost/restriction boundaries compared database timestamps with an application-created `Date`. **Impact →** a restriction inserted using PostgreSQL's current timestamp could be milliseconds newer than the application snapshot and be missed transiently by a direct swipe or feed/revalidation query. **Fix →** use PostgreSQL `statement_timestamp()` for current Ghost/restriction start/end decisions in candidate generation, viewer eligibility, pair eligibility and response-time revalidation; retain the request snapshot only for deterministic calendar/age/trip scoring. **Verification →** tests insert immediately effective restrictions with database-default `starts_at` and prove candidate, cache and direct-swipe paths fail closed.
+
+No review claim was rejected: A–D were each substantiated. Two speculative SQL rewrite variants were rejected after measurement: joining account eligibility before the anchor prevented the desired GIST plan, while inlining that eligibility into the pair join exceeded 90 seconds on the same fixture. Neither variant remains. No Critical or High finding remained, and the final focused review found no SQL injection, IDOR, privacy leak, stale-authorization path, mutual-match race, cursor/cache cross-talk or ranking-proof regression.
+
+### Corrected benchmark
+
+The before and after runs used the same deterministic fixture, 24 fixed eligible viewers per cap, warm cache and single local PostgreSQL connection. The default `N=50` comparison contains every requested metric:
+
+| Metric | Before | After |
+|---|---:|---:|
+| Candidate SQL p50 | 854.061 ms | 21.364 ms |
+| Candidate SQL p95 | 1266.596 ms | 30.703 ms |
+| Exact scoring p50 | 0.963 ms | 0.730 ms |
+| Exact scoring p95 | 1.560 ms | 0.897 ms |
+| Total p50 | 855.692 ms | 22.529 ms |
+| Total p95 | 1268.258 ms | 32.271 ms |
+| Recall unproven | 0/24 | 0/24 |
+| Average anchored survivors | 1,992.8 | 1,992.8 |
+| Cache payload p95 | 23,240 B | 23,240 B |
+
+The complete cap sweep was:
+
+| `N` | Candidate SQL before p50/p95 | Candidate SQL after p50/p95 | Improvement p50/p95 | Exact after p50/p95 | Total after p50/p95 | Recall | Payload p95 |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 50 | 854.061 / 1266.596 ms | 21.364 / 30.703 ms | 97.50% / 97.58% | 0.730 / 0.897 ms | 22.529 / 32.271 ms | 0/24 | 23,240 B |
+| 100 | 857.486 / 1272.661 ms | 22.402 / 31.862 ms | 97.39% / 97.50% | 1.352 / 1.455 ms | 24.360 / 34.735 ms | 0/24 | 46,595 B |
+| 200 | 863.941 / 1271.759 ms | 23.679 / 32.994 ms | 97.26% / 97.41% | 2.609 / 2.785 ms | 26.883 / 36.758 ms | 0/24 | 93,068 B |
+| 500 | 872.930 / 1293.210 ms | 28.442 / 37.712 ms | 96.74% / 97.08% | 6.631 / 6.809 ms | 36.289 / 45.600 ms | 0/24 | 231,819 B |
+
+The plan continues to use `trip_segments_loc_range_gix`, the swipe index, both directional block indexes, consent and identity indexes. Representative execution improved 96.97%, and shared-buffer hits fell 51.68%. The result is a measured query-shape improvement, not a production SLA or concurrency/throughput claim.
+
+### Final verification snapshot
+
+```text
+preflight strict TypeScript/build/focus          PASS (baseline 13 suites, 65 tests)
+strict workspace TypeScript                      PASS (API + shared)
+Nest build                                        PASS
+actual API boot + graceful SIGINT                 PASS (all Phase 1–4 modules composed)
+actual worker/relay boot + graceful SIGINT        PASS (claims stopped, worker drained)
+GET /health/live                                  PASS (HTTP 200)
+GET /health/ready                                 PASS (HTTP 200; PostgreSQL + both Redis healthy)
+unauthenticated GET /api/v1/matching/feed         PASS (HTTP 401, AUTH_TOKEN_MISSING)
+API Jest with open-handle detection               54 suites, 334 tests passed, 0 failed
+Phase 4 focused                                   14 suites, 82 tests passed, 0 failed
+  newly added by correction gate                   1 suite, 17 tests net, 0 failed
+direct swipe + mutual-like concurrency             1 suite, 6 tests passed, 0 failed
+proof/cache/candidate focus                        4 suites, 19 tests passed, 0 failed
+Phase 3 focused regression                        11 suites, 76 tests passed, 0 failed
+Firebase authentication focus                      5 suites, 38 tests passed, 0 failed
+age unit/live PostgreSQL focus                      2 suites, 17 tests passed, 0 failed
+dependency loss/recovery readiness                  2 suites, 12 tests passed, 0 failed
+automatic outbox process/redelivery                 2 suites, 8 tests passed, 0 failed
+shared TS + live PostgreSQL parity                 18 passed, 0 failed (7 live SQL cases)
+enum parity                                        23 ENUM types, 89 values, 0 drift
+Phase 1 invariant suite                            100 passed, 0 failed
+24-way capacity race                                5 committed, 19 rejected, 0 overbooked
+matching benchmark                                 PASS (96 requests, 0 unproven recalls)
+production dependency audit                        PASS (no known vulnerabilities)
+migration up -> down -> up                         NOT RE-RUN: no schema/entity/migration change
+```
+
+### Correction-gate files changed
+
+```text
+apps/api/src/matching/benchmark/run-matching-benchmark.ts
+apps/api/src/matching/candidates/{candidate.repository.ts,candidate.types.ts,*.spec.ts}
+apps/api/src/matching/dto/{get-matching-feed-query.dto.ts,get-matching-feed-query.dto.spec.ts}
+apps/api/src/matching/{feed-cursor*,feed-generation.service*,matching.service*,matching.types.ts,matching.module.ts}
+apps/api/src/redis/{cache.service.ts,redis.int-spec.ts}
+apps/api/src/swipes/{swipes.repository.ts,swipes.module.ts,swipes.spec.ts,swipes.int-spec.ts}
+apps/api/src/{trips/trips.int-spec.ts,users/users.int-spec.ts,settings/settings-consent.int-spec.ts}
+docs/superpowers/specs/2026-08-20-tripwith-phase-1-design.md
+```
+
+No migration, schema SQL, entity, shared enum/date, infrastructure, dependency, PaymentProvider or Phase 5 file changed. Benchmark fixtures were removed after measurement. No `.env`, credential, secret or machine-specific file is present in the diff.
+
+### Remaining non-blocking risks
+
+- Generation invalidation remains best-effort after PostgreSQL commit. If Redis is unavailable, ordinary ranking/profile data can be stale until the 90-second TTL; current authorization/privacy and prior-swipe state remain PostgreSQL-revalidated on every response.
+- The benchmark is deterministic synthetic, warm-cache and single-connection. It proves a large local plan improvement and preserved recall proof, not production throughput; retain latency/recall metrics and run a concurrent production-like workload before capacity decisions.
+- The narrow shared pair-eligibility seam intentionally checks hard eligibility at swipe time, not ranking position or score freshness. Future hard matching predicates must be added to both feed generation and this seam.
+- The pre-existing Phase 2/3 non-failing ts-jest isolated-modules, shared implicit-ESM and pnpm audit `url.parse()` warnings remain tooling/dependency diagnostics.
+
+**Phase 4 Trips & Matching is fully closed after the post-review correction gate. The branch remains unmerged. Do not begin Phase 5 without explicit approval.**

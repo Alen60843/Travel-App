@@ -6,7 +6,7 @@ const CURSOR_VERSION = 1;
 
 export interface FeedCursorPayload {
   readonly viewerId: string;
-  readonly generation: number;
+  readonly generation: string;
   readonly filterHash: string;
   readonly batchKey: string;
   /** Identifies one immutable cached ranking; TTL regeneration invalidates it. */
@@ -49,8 +49,8 @@ export class FeedCursorCodec {
         !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
           value.viewerId,
         ) ||
-        !Number.isSafeInteger(value.generation) ||
-        (value.generation as number) < 0 ||
+        typeof value.generation !== 'string' ||
+        !/^[a-f0-9]{32}$/.test(value.generation) ||
         typeof value.filterHash !== 'string' ||
         !/^[a-f0-9]{24}$/.test(value.filterHash) ||
         typeof value.batchKey !== 'string' ||

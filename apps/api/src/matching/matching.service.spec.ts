@@ -14,6 +14,9 @@ const SECOND_ID = '6cc7a367-f55e-4a16-a8af-a75cac337a52';
 const THIRD_ID = '4950b2ee-90ab-48ed-94fc-62da9493ea25';
 const SNAPSHOT_ID = '933ce613-3d81-45ba-8642-f3cdf150bfe8';
 const FILTER_HASH = '0123456789abcdef01234567';
+const OTHER_FILTER_HASH = '89abcdef0123456701234567';
+const GENERATION_A = '11111111111111111111111111111111';
+const GENERATION_B = '22222222222222222222222222222222';
 
 const segment = {
   destinationPlaceId: 'place-1',
@@ -126,7 +129,7 @@ describe('MatchingService', () => {
       del: jest.fn().mockResolvedValue(undefined),
     } as unknown as jest.Mocked<CacheService>;
     generations = {
-      current: jest.fn().mockResolvedValue(3),
+      current: jest.fn().mockResolvedValue(GENERATION_A),
       filterHash: jest.fn().mockReturnValue(FILTER_HASH),
       rankingKey: jest.fn().mockReturnValue('feed:key'),
     } as unknown as jest.Mocked<FeedGenerationService>;
@@ -166,6 +169,67 @@ describe('MatchingService', () => {
     expect(metrics.getCounter('matching.cache_miss')).toBe(1);
     expect(metrics.getCounter('matching.candidates_hard_filtered')).toBe(2);
     expect(metrics.getCounter('matching.candidates_exact_scored')).toBe(2);
+    expect(candidates.findCoarseCandidates).toHaveBeenCalledWith(
+      expect.objectContaining({
+        filters: {
+          homeCountryCode: null,
+          nativeLanguageCode: null,
+          minAge: null,
+          maxAge: null,
+          interestIds: [],
+        },
+      }),
+    );
+  });
+
+  it('normalizes request filters into SQL and the cache namespace', async () => {
+    await service.getFeed(VIEWER_ID, {
+      limit: 1,
+      homeCountryCode: 'FR',
+      nativeLanguageCode: 'es',
+      minAge: 25,
+      maxAge: 40,
+      interestIds: [9, 3],
+    });
+    expect(candidates.findCoarseCandidates).toHaveBeenCalledWith(
+      expect.objectContaining({
+        filters: {
+          homeCountryCode: 'FR',
+          nativeLanguageCode: 'es',
+          minAge: 25,
+          maxAge: 40,
+          interestIds: [3, 9],
+        },
+      }),
+    );
+    expect(generations.filterHash).toHaveBeenCalledWith(
+      expect.objectContaining({
+        homeCountryCode: 'FR',
+        nativeLanguageCode: 'es',
+        minAge: 25,
+        maxAge: 40,
+        interestIds: [3, 9],
+      }),
+    );
+  });
+
+  it('rejects an inverted dynamic age range', async () => {
+    await expect(service.getFeed(VIEWER_ID, { minAge: 50, maxAge: 40 }))
+      .rejects.toMatchObject({ code: 'VALIDATION_FAILED' });
+    expect(candidates.isViewerEligible).not.toHaveBeenCalled();
+  });
+
+  it('rejects a cursor under a different filter namespace', async () => {
+    const first = await service.getFeed(VIEWER_ID, {
+      limit: 1,
+      homeCountryCode: 'FR',
+    });
+    generations.filterHash.mockReturnValue(OTHER_FILTER_HASH);
+    await expect(service.getFeed(VIEWER_ID, {
+      limit: 1,
+      homeCountryCode: 'DE',
+      cursor: first.nextCursor!,
+    })).rejects.toBeInstanceOf(MatchingCursorStaleError);
   });
 
   it('removes newly hidden cached candidates and pulls the page forward', async () => {
@@ -192,7 +256,7 @@ describe('MatchingService', () => {
 
   it('rejects a cursor after the viewer generation changes', async () => {
     const first = await service.getFeed(VIEWER_ID, { limit: 1 });
-    generations.current.mockResolvedValue(4);
+    generations.current.mockResolvedValue(GENERATION_B);
     await expect(
       service.getFeed(VIEWER_ID, { limit: 1, cursor: first.nextCursor! }),
     ).rejects.toBeInstanceOf(MatchingCursorStaleError);

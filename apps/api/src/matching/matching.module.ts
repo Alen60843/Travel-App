@@ -13,6 +13,6 @@ import { MatchingService } from './matching.service';
   imports: [AuthModule, DatabaseModule, RedisModule, FeedCacheModule],
   controllers: [MatchingController],
   providers: [CandidateRepository, InterestProjectionService, MatchingService],
-  exports: [InterestProjectionService, MatchingService],
+  exports: [CandidateRepository, InterestProjectionService, MatchingService],
 })
 export class MatchingModule {}

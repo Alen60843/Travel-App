@@ -7,12 +7,18 @@ import type { ScoringSegment } from '../scoring';
 import type {
   CandidateCoarseBatch,
   CandidateCoarseResult,
+  CandidateFilters,
   CandidateQueryOptions,
   CandidateRevalidationOptions,
+  PairEligibilityOptions,
   ViewerEligibilityOptions,
   ViewerScoringContext,
   ViewerScoringContextOptions,
 } from './candidate.types';
+
+interface QueryExecutor {
+  query<T = unknown>(query: string, parameters?: unknown[]): Promise<T>;
+}
 
 interface CandidateRawRow {
   readonly candidateId: string;
@@ -71,7 +77,7 @@ WITH viewer AS MATERIALIZED (
      AND s.discovery_enabled
      AND NOT (
        s.ghost_mode_enabled
-       AND (s.ghost_mode_until IS NULL OR s.ghost_mode_until > $2::timestamptz)
+       AND (s.ghost_mode_until IS NULL OR s.ghost_mode_until > statement_timestamp())
      )
      AND COALESCE((
        SELECT consent.granted AND consent.policy_version = $3
@@ -94,9 +100,9 @@ WITH viewer AS MATERIALIZED (
          FROM account_restrictions restriction
         WHERE restriction.user_id = u.id
           AND restriction.type IN ('MATCHING_SUSPENDED', 'FULL_SUSPENSION')
-          AND restriction.starts_at <= $2::timestamptz
+          AND restriction.starts_at <= statement_timestamp()
           AND restriction.lifted_at IS NULL
-          AND (restriction.ends_at IS NULL OR restriction.ends_at > $2::timestamptz)
+          AND (restriction.ends_at IS NULL OR restriction.ends_at > statement_timestamp())
      )
 ),
 viewer_segments AS MATERIALIZED (
@@ -109,6 +115,59 @@ viewer_segments AS MATERIALIZED (
     FROM trip_segments s
     JOIN viewer v ON v.id = s.user_id
    WHERE s.end_date >= (($2::timestamptz AT TIME ZONE 'UTC')::date)
+),
+anchored_pairs AS MATERIALIZED (
+  SELECT candidate_segment.user_id AS candidate_id,
+         viewer_segment.destination_place_id AS viewer_destination_place_id,
+         candidate_segment.destination_place_id AS candidate_destination_place_id,
+         viewer_segment.start_date AS viewer_start_date,
+         viewer_segment.end_date AS viewer_end_date,
+         candidate_segment.start_date AS candidate_start_date,
+         candidate_segment.end_date AS candidate_end_date,
+         ST_Distance(
+           viewer_segment.location,
+           candidate_segment.location,
+           FALSE
+         ) AS distance_m,
+         viewer_segment.anchor_radius_m
+    FROM viewer_segments viewer_segment
+    JOIN trip_segments candidate_segment
+      ON candidate_segment.end_date >= (($2::timestamptz AT TIME ZONE 'UTC')::date)
+     AND candidate_segment.date_range && viewer_segment.date_range
+     AND ST_DWithin(
+       candidate_segment.location,
+       viewer_segment.location,
+       viewer_segment.anchor_radius_m,
+       FALSE
+     )
+),
+anchored_scores AS MATERIALIZED (
+  SELECT anchored.candidate_id,
+         max(
+           $6::double precision
+           * CASE
+               WHEN anchored.viewer_destination_place_id IS NOT NULL
+                AND anchored.candidate_destination_place_id IS NOT NULL
+                AND anchored.viewer_destination_place_id = anchored.candidate_destination_place_id
+               THEN 1.0 ELSE 0.0
+             END
+         + $7::double precision
+           * (
+               (LEAST(anchored.viewer_end_date, anchored.candidate_end_date)
+                 - GREATEST(anchored.viewer_start_date, anchored.candidate_start_date) + 1)::double precision
+               / LEAST(
+                   anchored.viewer_end_date - anchored.viewer_start_date + 1,
+                   anchored.candidate_end_date - anchored.candidate_start_date + 1
+                 )::double precision
+             )
+         + $8::double precision
+           * GREATEST(
+               0.0,
+               1.0 - anchored.distance_m / anchored.anchor_radius_m
+             )
+         )::double precision AS itinerary_upper_bound
+    FROM anchored_pairs anchored
+   GROUP BY anchored.candidate_id
 ),
 eligible AS MATERIALIZED (
   SELECT candidate.id AS candidate_id,
@@ -131,18 +190,21 @@ eligible AS MATERIALIZED (
            ELSE icount(viewer.interest_ids & profile.interest_ids)::double precision
                 / icount(viewer.interest_ids | profile.interest_ids)::double precision
          END AS interest_component,
-         viewer.anchor_radius_m
-    FROM viewer
+         viewer.anchor_radius_m,
+         anchored.itinerary_upper_bound
+    FROM anchored_scores anchored
     JOIN users candidate
-      ON candidate.id <> viewer.id
+      ON candidate.id = anchored.candidate_id
      AND candidate.account_status = 'ACTIVE'
      AND candidate.deleted_at IS NULL
     JOIN user_profiles profile ON profile.user_id = candidate.id
     JOIN user_settings settings ON settings.user_id = candidate.id
-   WHERE settings.discovery_enabled
+    CROSS JOIN viewer
+   WHERE candidate.id <> viewer.id
+     AND settings.discovery_enabled
      AND NOT (
        settings.ghost_mode_enabled
-       AND (settings.ghost_mode_until IS NULL OR settings.ghost_mode_until > $2::timestamptz)
+       AND (settings.ghost_mode_until IS NULL OR settings.ghost_mode_until > statement_timestamp())
      )
      AND candidate.trust_score >= viewer.min_trust_score_preference
      AND EXTRACT(YEAR FROM age(
@@ -174,9 +236,9 @@ eligible AS MATERIALIZED (
          FROM account_restrictions restriction
         WHERE restriction.user_id = candidate.id
           AND restriction.type IN ('MATCHING_SUSPENDED', 'FULL_SUSPENSION')
-          AND restriction.starts_at <= $2::timestamptz
+          AND restriction.starts_at <= statement_timestamp()
           AND restriction.lifted_at IS NULL
-          AND (restriction.ends_at IS NULL OR restriction.ends_at > $2::timestamptz)
+          AND (restriction.ends_at IS NULL OR restriction.ends_at > statement_timestamp())
      )
      AND NOT EXISTS (
        SELECT 1
@@ -196,82 +258,38 @@ eligible AS MATERIALIZED (
         WHERE swipe.source_user_id = viewer.id
           AND swipe.target_user_id = candidate.id
      )
-),
-anchored_pairs AS MATERIALIZED (
-  SELECT candidate_segment.user_id AS candidate_id,
-         viewer_segment.destination_place_id AS viewer_destination_place_id,
-         candidate_segment.destination_place_id AS candidate_destination_place_id,
-         viewer_segment.start_date AS viewer_start_date,
-         viewer_segment.end_date AS viewer_end_date,
-         candidate_segment.start_date AS candidate_start_date,
-         candidate_segment.end_date AS candidate_end_date,
-         ST_Distance(
-           viewer_segment.location,
-           candidate_segment.location,
-           FALSE
-         ) AS distance_m,
-         viewer_segment.anchor_radius_m
-    FROM viewer_segments viewer_segment
-    JOIN trip_segments candidate_segment
-      ON candidate_segment.end_date >= (($2::timestamptz AT TIME ZONE 'UTC')::date)
-     AND candidate_segment.date_range && viewer_segment.date_range
-     AND ST_DWithin(
-       candidate_segment.location,
-       viewer_segment.location,
-       viewer_segment.anchor_radius_m,
-       FALSE
+     AND ($12::text IS NULL OR profile.home_country_code = $12::text)
+     AND ($13::text IS NULL OR profile.native_language_code = $13::text)
+     AND ($14::int IS NULL OR EXTRACT(YEAR FROM age(
+           (($2::timestamptz AT TIME ZONE 'UTC')::date),
+           candidate.date_of_birth
+         ))::int >= $14::int)
+     AND ($15::int IS NULL OR EXTRACT(YEAR FROM age(
+           (($2::timestamptz AT TIME ZONE 'UTC')::date),
+           candidate.date_of_birth
+         ))::int <= $15::int)
+     AND (
+       $16::int[] IS NULL
+       OR EXISTS (
+         SELECT 1
+           FROM user_interests selected_interest
+           JOIN interests interest
+             ON interest.id = selected_interest.interest_id
+            AND interest.is_active
+          WHERE selected_interest.user_id = candidate.id
+            AND selected_interest.interest_id = ANY($16::int[])
+       )
      )
-),
-pair_scores AS (
-  SELECT eligible.candidate_id,
-         $6::double precision
-           * CASE
-               WHEN anchored.viewer_destination_place_id IS NOT NULL
-                AND anchored.candidate_destination_place_id IS NOT NULL
-                AND anchored.viewer_destination_place_id = anchored.candidate_destination_place_id
-               THEN 1.0 ELSE 0.0
-             END
-         + $7::double precision
-           * (
-               (LEAST(anchored.viewer_end_date, anchored.candidate_end_date)
-                 - GREATEST(anchored.viewer_start_date, anchored.candidate_start_date) + 1)::double precision
-               / LEAST(
-                   anchored.viewer_end_date - anchored.viewer_start_date + 1,
-                   anchored.candidate_end_date - anchored.candidate_start_date + 1
-                 )::double precision
-             )
-         + $8::double precision
-           * GREATEST(
-               0.0,
-               1.0 - anchored.distance_m / anchored.anchor_radius_m
-             ) AS pair_score
-    FROM anchored_pairs anchored
-    JOIN eligible ON eligible.candidate_id = anchored.candidate_id
 ),
 ranked AS (
   SELECT eligible.*,
-         max(pair_scores.pair_score)::double precision AS itinerary_upper_bound,
          (
-           0.40 * max(pair_scores.pair_score)
+           0.40 * eligible.itinerary_upper_bound
            + 0.30 * eligible.trust_component
            + 0.20 * eligible.style_component
            + 0.10 * eligible.interest_component
          )::double precision AS match_upper_bound
     FROM eligible
-    JOIN pair_scores ON pair_scores.candidate_id = eligible.candidate_id
-   GROUP BY eligible.candidate_id,
-            eligible.display_name,
-            eligible.avatar_url,
-            eligible.home_country_code,
-            eligible.languages_spoken,
-            eligible.travel_style,
-            eligible.interest_ids,
-            eligible.trust_score,
-            eligible.candidate_age,
-            eligible.trust_component,
-            eligible.style_component,
-            eligible.interest_component,
-            eligible.anchor_radius_m
 ),
 paged AS (
   SELECT ranked.*
@@ -376,7 +394,7 @@ SELECT users.id AS "userId",
    AND settings.discovery_enabled
    AND NOT (
      settings.ghost_mode_enabled
-     AND (settings.ghost_mode_until IS NULL OR settings.ghost_mode_until > $2::timestamptz)
+     AND (settings.ghost_mode_until IS NULL OR settings.ghost_mode_until > statement_timestamp())
    )
    AND COALESCE((
      SELECT consent.granted AND consent.policy_version = $3
@@ -399,9 +417,9 @@ SELECT users.id AS "userId",
        FROM account_restrictions restriction
       WHERE restriction.user_id = users.id
         AND restriction.type IN ('MATCHING_SUSPENDED', 'FULL_SUSPENSION')
-        AND restriction.starts_at <= $2::timestamptz
+        AND restriction.starts_at <= statement_timestamp()
         AND restriction.lifted_at IS NULL
-        AND (restriction.ends_at IS NULL OR restriction.ends_at > $2::timestamptz)
+        AND (restriction.ends_at IS NULL OR restriction.ends_at > statement_timestamp())
    )
  GROUP BY users.id, profile.travel_style, profile.interest_ids, settings.max_distance_km`;
 
@@ -416,7 +434,169 @@ SELECT EXISTS (
      AND settings.discovery_enabled
      AND NOT (
        settings.ghost_mode_enabled
-       AND (settings.ghost_mode_until IS NULL OR settings.ghost_mode_until > $2::timestamptz)
+       AND (settings.ghost_mode_until IS NULL OR settings.ghost_mode_until > statement_timestamp())
+     )
+     AND COALESCE((
+       SELECT consent.granted AND consent.policy_version = $2
+         FROM user_consents consent
+        WHERE consent.user_id = users.id
+          AND consent.consent_type = 'TERMS_OF_SERVICE'
+        ORDER BY consent.created_at DESC, consent.id DESC
+        LIMIT 1
+     ), FALSE)
+     AND COALESCE((
+       SELECT consent.granted AND consent.policy_version = $3
+         FROM user_consents consent
+        WHERE consent.user_id = users.id
+          AND consent.consent_type = 'PRIVACY_POLICY'
+        ORDER BY consent.created_at DESC, consent.id DESC
+        LIMIT 1
+     ), FALSE)
+     AND NOT EXISTS (
+       SELECT 1
+         FROM account_restrictions restriction
+        WHERE restriction.user_id = users.id
+          AND restriction.type IN ('MATCHING_SUSPENDED', 'FULL_SUSPENSION')
+          AND restriction.starts_at <= statement_timestamp()
+          AND restriction.lifted_at IS NULL
+          AND (restriction.ends_at IS NULL OR restriction.ends_at > statement_timestamp())
+     )
+) AS eligible`;
+
+/**
+ * Authoritative hard-eligibility check for a single viewer/target pair.
+ * Ranking and prior position are deliberately absent: this boundary answers
+ * only whether a direct swipe is inside the current matching universe.
+ */
+export const PAIR_ELIGIBILITY_SQL = `
+WITH viewer AS MATERIALIZED (
+  SELECT users.id,
+         users.date_of_birth,
+         settings.min_age_preference,
+         settings.max_age_preference,
+         settings.min_trust_score_preference,
+         LEAST(settings.max_distance_km * 1000.0, $6::double precision) AS anchor_radius_m
+    FROM users
+    JOIN user_profiles profile ON profile.user_id = users.id
+    JOIN user_settings settings ON settings.user_id = users.id
+   WHERE users.id = $1::uuid
+     AND users.account_status = 'ACTIVE'
+     AND users.deleted_at IS NULL
+     AND settings.discovery_enabled
+     AND NOT (
+       settings.ghost_mode_enabled
+       AND (settings.ghost_mode_until IS NULL OR settings.ghost_mode_until > statement_timestamp())
+     )
+     AND COALESCE((
+       SELECT consent.granted AND consent.policy_version = $4
+         FROM user_consents consent
+        WHERE consent.user_id = users.id
+          AND consent.consent_type = 'TERMS_OF_SERVICE'
+        ORDER BY consent.created_at DESC, consent.id DESC
+        LIMIT 1
+     ), FALSE)
+     AND COALESCE((
+       SELECT consent.granted AND consent.policy_version = $5
+         FROM user_consents consent
+        WHERE consent.user_id = users.id
+          AND consent.consent_type = 'PRIVACY_POLICY'
+        ORDER BY consent.created_at DESC, consent.id DESC
+        LIMIT 1
+     ), FALSE)
+     AND NOT EXISTS (
+       SELECT 1 FROM account_restrictions restriction
+        WHERE restriction.user_id = users.id
+          AND restriction.type IN ('MATCHING_SUSPENDED', 'FULL_SUSPENSION')
+          AND restriction.starts_at <= statement_timestamp()
+          AND restriction.lifted_at IS NULL
+          AND (restriction.ends_at IS NULL OR restriction.ends_at > statement_timestamp())
+     )
+)
+SELECT EXISTS (
+  SELECT 1
+    FROM viewer
+    JOIN users target ON target.id = $2::uuid
+    JOIN user_profiles target_profile ON target_profile.user_id = target.id
+    JOIN user_settings target_settings ON target_settings.user_id = target.id
+   WHERE target.id <> viewer.id
+     AND target.account_status = 'ACTIVE'
+     AND target.deleted_at IS NULL
+     AND target_settings.discovery_enabled
+     AND NOT (
+       target_settings.ghost_mode_enabled
+       AND (target_settings.ghost_mode_until IS NULL OR target_settings.ghost_mode_until > statement_timestamp())
+     )
+     AND target.trust_score >= viewer.min_trust_score_preference
+     AND EXTRACT(YEAR FROM age(
+           (($3::timestamptz AT TIME ZONE 'UTC')::date), target.date_of_birth
+         ))::int BETWEEN viewer.min_age_preference AND viewer.max_age_preference
+     AND EXTRACT(YEAR FROM age(
+           (($3::timestamptz AT TIME ZONE 'UTC')::date), viewer.date_of_birth
+         ))::int BETWEEN target_settings.min_age_preference AND target_settings.max_age_preference
+     AND COALESCE((
+       SELECT consent.granted AND consent.policy_version = $4
+         FROM user_consents consent
+        WHERE consent.user_id = target.id
+          AND consent.consent_type = 'TERMS_OF_SERVICE'
+        ORDER BY consent.created_at DESC, consent.id DESC
+        LIMIT 1
+     ), FALSE)
+     AND COALESCE((
+       SELECT consent.granted AND consent.policy_version = $5
+         FROM user_consents consent
+        WHERE consent.user_id = target.id
+          AND consent.consent_type = 'PRIVACY_POLICY'
+        ORDER BY consent.created_at DESC, consent.id DESC
+        LIMIT 1
+     ), FALSE)
+     AND NOT EXISTS (
+       SELECT 1 FROM account_restrictions restriction
+        WHERE restriction.user_id = target.id
+          AND restriction.type IN ('MATCHING_SUSPENDED', 'FULL_SUSPENSION')
+          AND restriction.starts_at <= statement_timestamp()
+          AND restriction.lifted_at IS NULL
+          AND (restriction.ends_at IS NULL OR restriction.ends_at > statement_timestamp())
+     )
+     AND NOT EXISTS (
+       SELECT 1 FROM user_blocks block
+        WHERE block.blocker_user_id = viewer.id
+          AND block.blocked_user_id = target.id
+     )
+     AND NOT EXISTS (
+       SELECT 1 FROM user_blocks block
+        WHERE block.blocker_user_id = target.id
+          AND block.blocked_user_id = viewer.id
+     )
+     AND EXISTS (
+       SELECT 1
+         FROM trip_segments viewer_segment
+         JOIN trip_segments target_segment
+           ON target_segment.user_id = target.id
+          AND target_segment.end_date >= (($3::timestamptz AT TIME ZONE 'UTC')::date)
+          AND target_segment.date_range && viewer_segment.date_range
+          AND ST_DWithin(
+                target_segment.location,
+                viewer_segment.location,
+                viewer.anchor_radius_m,
+                FALSE
+              )
+        WHERE viewer_segment.user_id = viewer.id
+          AND viewer_segment.end_date >= (($3::timestamptz AT TIME ZONE 'UTC')::date)
+     )
+) AS eligible`;
+
+export const CANDIDATE_REVALIDATION_SQL = `
+WITH viewer AS (
+  SELECT users.id
+    FROM users
+    JOIN user_settings settings ON settings.user_id = users.id
+   WHERE users.id = $1::uuid
+     AND users.account_status = 'ACTIVE'
+     AND users.deleted_at IS NULL
+     AND settings.discovery_enabled
+     AND NOT (
+       settings.ghost_mode_enabled
+       AND (settings.ghost_mode_until IS NULL OR settings.ghost_mode_until > statement_timestamp())
      )
      AND COALESCE((
        SELECT consent.granted AND consent.policy_version = $3
@@ -439,49 +619,9 @@ SELECT EXISTS (
          FROM account_restrictions restriction
         WHERE restriction.user_id = users.id
           AND restriction.type IN ('MATCHING_SUSPENDED', 'FULL_SUSPENSION')
-          AND restriction.starts_at <= $2::timestamptz
+          AND restriction.starts_at <= statement_timestamp()
           AND restriction.lifted_at IS NULL
-          AND (restriction.ends_at IS NULL OR restriction.ends_at > $2::timestamptz)
-     )
-) AS eligible`;
-
-export const CANDIDATE_REVALIDATION_SQL = `
-WITH viewer AS (
-  SELECT users.id
-    FROM users
-    JOIN user_settings settings ON settings.user_id = users.id
-   WHERE users.id = $1::uuid
-     AND users.account_status = 'ACTIVE'
-     AND users.deleted_at IS NULL
-     AND settings.discovery_enabled
-     AND NOT (
-       settings.ghost_mode_enabled
-       AND (settings.ghost_mode_until IS NULL OR settings.ghost_mode_until > $3::timestamptz)
-     )
-     AND COALESCE((
-       SELECT consent.granted AND consent.policy_version = $4
-         FROM user_consents consent
-        WHERE consent.user_id = users.id
-          AND consent.consent_type = 'TERMS_OF_SERVICE'
-        ORDER BY consent.created_at DESC, consent.id DESC
-        LIMIT 1
-     ), FALSE)
-     AND COALESCE((
-       SELECT consent.granted AND consent.policy_version = $5
-         FROM user_consents consent
-        WHERE consent.user_id = users.id
-          AND consent.consent_type = 'PRIVACY_POLICY'
-        ORDER BY consent.created_at DESC, consent.id DESC
-        LIMIT 1
-     ), FALSE)
-     AND NOT EXISTS (
-       SELECT 1
-         FROM account_restrictions restriction
-        WHERE restriction.user_id = users.id
-          AND restriction.type IN ('MATCHING_SUSPENDED', 'FULL_SUSPENSION')
-          AND restriction.starts_at <= $3::timestamptz
-          AND restriction.lifted_at IS NULL
-          AND (restriction.ends_at IS NULL OR restriction.ends_at > $3::timestamptz)
+          AND (restriction.ends_at IS NULL OR restriction.ends_at > statement_timestamp())
      )
 )
 SELECT requested.candidate_id AS "candidateId"
@@ -496,10 +636,10 @@ SELECT requested.candidate_id AS "candidateId"
    AND settings.discovery_enabled
    AND NOT (
      settings.ghost_mode_enabled
-     AND (settings.ghost_mode_until IS NULL OR settings.ghost_mode_until > $3::timestamptz)
+     AND (settings.ghost_mode_until IS NULL OR settings.ghost_mode_until > statement_timestamp())
    )
    AND COALESCE((
-     SELECT consent.granted AND consent.policy_version = $4
+     SELECT consent.granted AND consent.policy_version = $3
        FROM user_consents consent
       WHERE consent.user_id = candidate.id
         AND consent.consent_type = 'TERMS_OF_SERVICE'
@@ -507,7 +647,7 @@ SELECT requested.candidate_id AS "candidateId"
       LIMIT 1
    ), FALSE)
    AND COALESCE((
-     SELECT consent.granted AND consent.policy_version = $5
+     SELECT consent.granted AND consent.policy_version = $4
        FROM user_consents consent
       WHERE consent.user_id = candidate.id
         AND consent.consent_type = 'PRIVACY_POLICY'
@@ -519,9 +659,9 @@ SELECT requested.candidate_id AS "candidateId"
        FROM account_restrictions restriction
       WHERE restriction.user_id = candidate.id
         AND restriction.type IN ('MATCHING_SUSPENDED', 'FULL_SUSPENSION')
-        AND restriction.starts_at <= $3::timestamptz
+        AND restriction.starts_at <= statement_timestamp()
         AND restriction.lifted_at IS NULL
-        AND (restriction.ends_at IS NULL OR restriction.ends_at > $3::timestamptz)
+        AND (restriction.ends_at IS NULL OR restriction.ends_at > statement_timestamp())
    )
    AND NOT EXISTS (
      SELECT 1
@@ -561,6 +701,7 @@ function assertOptions(options: CandidateQueryOptions): Date {
   if (!Number.isInteger(options.exactScoreLimit) || options.exactScoreLimit < 1 || options.exactScoreLimit > 1_000) {
     throw new RangeError('exactScoreLimit must be an integer in [1, 1000]');
   }
+  assertFilters(options.filters);
   // Reuse the pure scorer's authoritative option validation.
   scoreItinerary([], [], {
     anchorRadiusMeters: options.maximumAnchorRadiusMeters,
@@ -578,6 +719,31 @@ function assertOptions(options: CandidateQueryOptions): Date {
   return asOf;
 }
 
+function assertFilters(filters: CandidateFilters | undefined): void {
+  if (!filters) return;
+  if (filters.homeCountryCode !== null && !/^[A-Z]{2}$/.test(filters.homeCountryCode)) {
+    throw new RangeError('filters.homeCountryCode must be an ISO alpha-2 code');
+  }
+  if (filters.nativeLanguageCode !== null && !/^[a-z]{2,3}$/.test(filters.nativeLanguageCode)) {
+    throw new RangeError('filters.nativeLanguageCode must be a lowercase language code');
+  }
+  for (const [field, value] of [['minAge', filters.minAge], ['maxAge', filters.maxAge]] as const) {
+    if (value !== null && (!Number.isInteger(value) || value < 18 || value > 120)) {
+      throw new RangeError(`filters.${field} must be an integer in [18, 120]`);
+    }
+  }
+  if (filters.minAge !== null && filters.maxAge !== null && filters.minAge > filters.maxAge) {
+    throw new RangeError('filters.minAge must not exceed filters.maxAge');
+  }
+  if (
+    filters.interestIds.length > 20
+    || new Set(filters.interestIds).size !== filters.interestIds.length
+    || filters.interestIds.some((id) => !Number.isInteger(id) || id < 1)
+  ) {
+    throw new RangeError('filters.interestIds must contain at most 20 unique positive integers');
+  }
+}
+
 function parameters(options: CandidateQueryOptions, asOf: Date): readonly unknown[] {
   return [
     options.viewerId,
@@ -591,6 +757,13 @@ function parameters(options: CandidateQueryOptions, asOf: Date): readonly unknow
     options.cursor?.matchUpperBound ?? null,
     options.cursor?.userId ?? null,
     options.exactScoreLimit + 1,
+    options.filters?.homeCountryCode ?? null,
+    options.filters?.nativeLanguageCode ?? null,
+    options.filters?.minAge ?? null,
+    options.filters?.maxAge ?? null,
+    options.filters && options.filters.interestIds.length > 0
+      ? [...options.filters.interestIds]
+      : null,
   ];
 }
 
@@ -640,6 +813,35 @@ export class CandidateRepository {
     };
   }
 
+  async isPairEligible(
+    options: PairEligibilityOptions,
+    executor: QueryExecutor = this.dataSource,
+  ): Promise<boolean> {
+    if (!options.currentTermsOfServiceVersion.trim()) {
+      throw new RangeError('currentTermsOfServiceVersion must not be blank');
+    }
+    if (!options.currentPrivacyPolicyVersion.trim()) {
+      throw new RangeError('currentPrivacyPolicyVersion must not be blank');
+    }
+    if (
+      !Number.isFinite(options.maximumAnchorRadiusMeters)
+      || options.maximumAnchorRadiusMeters <= 0
+    ) {
+      throw new RangeError('maximumAnchorRadiusMeters must be positive');
+    }
+    const asOf = options.asOf ?? new Date();
+    if (Number.isNaN(asOf.getTime())) throw new RangeError('asOf must be a valid Date');
+    const rows = await executor.query<{ eligible: boolean }[]>(PAIR_ELIGIBILITY_SQL, [
+      options.viewerId,
+      options.targetUserId,
+      asOf,
+      options.currentTermsOfServiceVersion,
+      options.currentPrivacyPolicyVersion,
+      options.maximumAnchorRadiusMeters,
+    ]);
+    return rows[0]?.eligible === true;
+  }
+
   /** Cheap cache-hit boundary that does not aggregate itinerary segments. */
   async isViewerEligible(options: ViewerEligibilityOptions): Promise<boolean> {
     if (!options.currentTermsOfServiceVersion.trim()) {
@@ -652,7 +854,6 @@ export class CandidateRepository {
     if (Number.isNaN(asOf.getTime())) throw new RangeError('asOf must be a valid Date');
     const rows = await this.dataSource.query<{ eligible: boolean }[]>(VIEWER_ELIGIBILITY_SQL, [
       options.viewerId,
-      asOf,
       options.currentTermsOfServiceVersion,
       options.currentPrivacyPolicyVersion,
     ]);
@@ -721,7 +922,6 @@ export class CandidateRepository {
       [
         options.viewerId,
         [...new Set(options.candidateIds)],
-        asOf,
         options.currentTermsOfServiceVersion,
         options.currentPrivacyPolicyVersion,
       ],

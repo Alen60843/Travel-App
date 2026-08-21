@@ -1,10 +1,11 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 import { Injectable } from '@nestjs/common';
 
 import { CacheService } from '../redis/cache.service';
 
 const GENERATION_PREFIX = 'feed:gen:';
+const GENERATION_TOKEN = /^[a-f0-9]{32}$/;
 
 /**
  * Owns the O(1) generation invalidation used by ranked-feed cache keys.
@@ -15,20 +16,41 @@ const GENERATION_PREFIX = 'feed:gen:';
 export class FeedGenerationService {
   constructor(private readonly cache: CacheService) {}
 
-  async current(viewerId: string): Promise<number> {
-    const generation = await this.cache.get<number>(this.generationKey(viewerId));
-    return Number.isSafeInteger(generation) && (generation as number) >= 0
-      ? (generation as number)
-      : 0;
+  async current(viewerId: string): Promise<string> {
+    const key = this.generationKey(viewerId);
+    const existing = await this.cache.get<unknown>(key);
+    if (this.isToken(existing)) return existing;
+
+    const candidate = this.newToken();
+    if (existing !== null) {
+      // Replace legacy/corrupt metadata with a namespace that cannot alias it.
+      await this.cache.replace(key, candidate);
+      return candidate;
+    }
+
+    const claimed = await this.cache.setIfAbsent(key, candidate);
+    if (claimed === true || claimed === null) return candidate;
+
+    const winner = await this.cache.get<unknown>(key);
+    if (this.isToken(winner)) return winner;
+
+    // Metadata was lost/corrupted between the atomic claim and read. A fresh
+    // random fallback may create duplicate work, but cannot revive an old key.
+    const replacement = this.newToken();
+    await this.cache.replace(key, replacement);
+    return replacement;
   }
 
-  async bump(viewerId: string): Promise<number | null> {
-    return this.cache.increment(this.generationKey(viewerId));
+  async bump(viewerId: string): Promise<string | null> {
+    const generation = this.newToken();
+    return (await this.cache.replace(this.generationKey(viewerId), generation))
+      ? generation
+      : null;
   }
 
   rankingKey(
     viewerId: string,
-    generation: number,
+    generation: string,
     filterHash: string,
     batchKey = 'root',
   ): string {
@@ -45,5 +67,13 @@ export class FeedGenerationService {
 
   private generationKey(viewerId: string): string {
     return `${GENERATION_PREFIX}${viewerId}`;
+  }
+
+  private isToken(value: unknown): value is string {
+    return typeof value === 'string' && GENERATION_TOKEN.test(value);
+  }
+
+  private newToken(): string {
+    return randomBytes(16).toString('hex');
   }
 }

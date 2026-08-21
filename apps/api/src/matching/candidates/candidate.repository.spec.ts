@@ -3,6 +3,7 @@ import type { DataSource } from 'typeorm';
 import {
   CANDIDATE_GENERATION_SQL,
   CANDIDATE_REVALIDATION_SQL,
+  PAIR_ELIGIBILITY_SQL,
   CandidateRepository,
 } from './candidate.repository';
 import type { CandidateQueryOptions } from './candidate.types';
@@ -15,6 +16,13 @@ const OPTIONS: CandidateQueryOptions = {
   maximumAnchorRadiusMeters: 100_000,
   pairWeights: { destination: 0.2, temporal: 0.5, geographic: 0.3 },
   exactScoreLimit: 1,
+  filters: {
+    homeCountryCode: 'FR',
+    nativeLanguageCode: 'fr',
+    minAge: 25,
+    maxAge: 45,
+    interestIds: [1, 2],
+  },
 };
 
 function rawCandidate(id: string, upperBound: number) {
@@ -42,7 +50,9 @@ describe('CandidateRepository SQL contract', () => {
     expect(CANDIDATE_GENERATION_SQL).toContain("candidate.account_status = 'ACTIVE'");
     expect(CANDIDATE_GENERATION_SQL).toContain('candidate.deleted_at IS NULL');
     expect(CANDIDATE_GENERATION_SQL).toContain('settings.discovery_enabled');
-    expect(CANDIDATE_GENERATION_SQL).toContain('settings.ghost_mode_until > $2');
+    expect(CANDIDATE_GENERATION_SQL).toContain(
+      'settings.ghost_mode_until > statement_timestamp()',
+    );
     expect(CANDIDATE_GENERATION_SQL).toContain("restriction.type IN ('MATCHING_SUSPENDED', 'FULL_SUSPENSION')");
     expect(CANDIDATE_GENERATION_SQL).toContain('block.blocker_user_id = viewer.id');
     expect(CANDIDATE_GENERATION_SQL).toContain('block.blocked_user_id = viewer.id');
@@ -50,6 +60,11 @@ describe('CandidateRepository SQL contract', () => {
     expect(CANDIDATE_GENERATION_SQL).toContain('BETWEEN viewer.min_age_preference');
     expect(CANDIDATE_GENERATION_SQL).toContain('BETWEEN settings.min_age_preference');
     expect(CANDIDATE_GENERATION_SQL).toContain('candidate.trust_score >= viewer.min_trust_score_preference');
+    expect(CANDIDATE_GENERATION_SQL).toContain('profile.home_country_code = $12');
+    expect(CANDIDATE_GENERATION_SQL).toContain('profile.native_language_code = $13');
+    expect(CANDIDATE_GENERATION_SQL).toContain('candidate.date_of_birth');
+    expect(CANDIDATE_GENERATION_SQL).toContain('selected_interest.interest_id = ANY($16');
+    expect(CANDIDATE_GENERATION_SQL).toContain('interest.is_active');
     expect(CANDIDATE_GENERATION_SQL).toContain('candidate_segment.date_range && viewer_segment.date_range');
     expect(CANDIDATE_GENERATION_SQL).toContain('ST_DWithin(');
     expect(CANDIDATE_GENERATION_SQL).toContain('ORDER BY ranked.match_upper_bound DESC, ranked.candidate_id ASC');
@@ -94,6 +109,11 @@ describe('CandidateRepository SQL contract', () => {
       null,
       null,
       2,
+      'FR',
+      'fr',
+      25,
+      45,
+      [1, 2],
     ]);
   });
 
@@ -109,6 +129,12 @@ describe('CandidateRepository SQL contract', () => {
         pairWeights: { destination: 0.8, temporal: 0.5, geographic: 0.3 },
       }),
     ).rejects.toThrow('sum to 1');
+    await expect(
+      repository.findCoarseCandidates({
+        ...OPTIONS,
+        filters: { ...OPTIONS.filters!, minAge: 50, maxAge: 40 },
+      }),
+    ).rejects.toThrow('minAge');
     expect(query).not.toHaveBeenCalled();
   });
 
@@ -128,7 +154,6 @@ describe('CandidateRepository SQL contract', () => {
     expect(query).toHaveBeenCalledWith(CANDIDATE_REVALIDATION_SQL, [
       OPTIONS.viewerId,
       [candidateId],
-      OPTIONS.asOf,
       'tos-current',
       'privacy-current',
     ]);
@@ -146,5 +171,35 @@ describe('CandidateRepository SQL contract', () => {
       }),
     ).resolves.toBe(false);
     expect(String(query.mock.calls[0]?.[0])).toContain('SELECT EXISTS');
+    expect(query.mock.calls[0]?.[1]).toEqual([
+      OPTIONS.viewerId,
+      'tos-current',
+      'privacy-current',
+    ]);
+  });
+
+  it('checks one direct-swipe pair through the authoritative current-state seam', async () => {
+    const targetUserId = '00000000-0000-4000-8000-000000000002';
+    const query = jest.fn().mockResolvedValue([{ eligible: true }]);
+    const repository = new CandidateRepository({ query } as unknown as DataSource);
+    await expect(repository.isPairEligible({
+      viewerId: OPTIONS.viewerId,
+      targetUserId,
+      asOf: OPTIONS.asOf!,
+      currentTermsOfServiceVersion: 'tos-current',
+      currentPrivacyPolicyVersion: 'privacy-current',
+      maximumAnchorRadiusMeters: 100_000,
+    })).resolves.toBe(true);
+    expect(query).toHaveBeenCalledWith(PAIR_ELIGIBILITY_SQL, [
+      OPTIONS.viewerId,
+      targetUserId,
+      OPTIONS.asOf!,
+      'tos-current',
+      'privacy-current',
+      100_000,
+    ]);
+    expect(PAIR_ELIGIBILITY_SQL).toContain('statement_timestamp()');
+    expect(PAIR_ELIGIBILITY_SQL).toContain('target_segment.date_range && viewer_segment.date_range');
+    expect(PAIR_ELIGIBILITY_SQL).toContain('ST_DWithin(');
   });
 });

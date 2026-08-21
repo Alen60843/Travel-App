@@ -43,6 +43,11 @@ export class CacheService {
    * and lookups only, never authorization state).
    */
   async set<T>(key: string, value: T, ttlSeconds?: number): Promise<void> {
+    await this.replace(key, value, ttlSeconds);
+  }
+
+  /** Best-effort write whose boolean result is useful for cache metadata. */
+  async replace<T>(key: string, value: T, ttlSeconds?: number): Promise<boolean> {
     try {
       const raw = JSON.stringify(value);
       if (ttlSeconds !== undefined && ttlSeconds > 0) {
@@ -50,8 +55,25 @@ export class CacheService {
       } else {
         await this.redis.set(key, raw);
       }
+      return true;
     } catch (err) {
       this.logger.warn(`cache set failed, ignoring: key=${key} error=${(err as Error).message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Atomically claims an absent metadata key. `false` means another caller
+   * already owns it; `null` means Redis was unavailable.
+   */
+  async setIfAbsent<T>(key: string, value: T): Promise<boolean | null> {
+    try {
+      return (await this.redis.set(key, JSON.stringify(value), 'NX')) === 'OK';
+    } catch (err) {
+      this.logger.warn(
+        `cache set-if-absent failed, ignoring: key=${key} error=${(err as Error).message}`,
+      );
+      return null;
     }
   }
 
@@ -64,19 +86,4 @@ export class CacheService {
     }
   }
 
-  /**
-   * Best-effort atomic generation bump. `null` means Redis was unavailable;
-   * callers must continue without caching rather than making a cache write a
-   * prerequisite for a successful PostgreSQL mutation.
-   */
-  async increment(key: string): Promise<number | null> {
-    try {
-      return await this.redis.incr(key);
-    } catch (err) {
-      this.logger.warn(
-        `cache increment failed, disabling cache for this operation: key=${key} error=${(err as Error).message}`,
-      );
-      return null;
-    }
-  }
 }

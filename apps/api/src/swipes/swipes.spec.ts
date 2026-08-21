@@ -25,7 +25,9 @@ describe('swipe API boundary', () => {
   };
 
   const repository = { persist: jest.fn().mockResolvedValue(persisted) };
-  const feedGeneration = { bump: jest.fn().mockResolvedValue(1) };
+  const feedGeneration = {
+    bump: jest.fn().mockResolvedValue('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'),
+  };
   const service = new SwipesService(
     repository as unknown as SwipesRepository,
     feedGeneration as unknown as FeedGenerationService,

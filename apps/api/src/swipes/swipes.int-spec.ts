@@ -10,6 +10,7 @@ import {
 import { loadConfig } from '../config/configuration';
 import { ConsentPolicyService } from '../consent/consent-policy.service';
 import { AppDataSource } from '../database/data-source';
+import { CandidateRepository } from '../matching/candidates';
 import {
   MatchingNotEligibleError,
   SelfSwipeError,
@@ -27,7 +28,28 @@ interface TestAccount {
   readonly firebaseUid: string;
 }
 
-async function createEligibleAccount(suffix: string): Promise<TestAccount> {
+async function addAnchorItinerary(account: TestAccount, suffix: string): Promise<void> {
+  const [trip] = await AppDataSource.query(
+    `INSERT INTO trips (user_id, title, start_date, end_date, visibility)
+     VALUES ($1, $2, DATE '2090-09-01', DATE '2090-09-07', 'PRIVATE')
+     RETURNING id`,
+    [account.id, `Swipe anchor ${suffix}`],
+  );
+  await AppDataSource.query(
+    `INSERT INTO trip_segments
+       (trip_id, user_id, destination_place_id, destination_name, location,
+        start_date, end_date, sort_order)
+     VALUES ($1, $2, 'swipe-anchor', 'Swipe anchor',
+             ST_SetSRID(ST_MakePoint(139.6917, 35.6895), 4326)::geography,
+             DATE '2090-09-01', DATE '2090-09-07', 0)`,
+    [trip.id, account.id],
+  );
+}
+
+async function createEligibleAccount(
+  suffix: string,
+  withAnchorItinerary = true,
+): Promise<TestAccount> {
   const firebaseUid = `${UID_PREFIX}-${suffix}`;
   const [user] = await AppDataSource.query(
     `INSERT INTO users (firebase_uid, email, email_verified_at, account_status, date_of_birth)
@@ -52,7 +74,9 @@ async function createEligibleAccount(suffix: string): Promise<TestAccount> {
       'privacy-test-v1',
     ],
   );
-  return { id: user.id as string, firebaseUid };
+  const account = { id: user.id as string, firebaseUid };
+  if (withAnchorItinerary) await addAnchorItinerary(account, suffix);
+  return account;
 }
 
 async function aggregateCounts(left: TestAccount, right: TestAccount): Promise<{
@@ -87,9 +111,12 @@ describe('swipes and mutual matches (real PostgreSQL)', () => {
 
   beforeAll(async () => {
     await AppDataSource.initialize();
+    const config = loadConfig();
     repository = new SwipesRepository(
       AppDataSource,
-      new ConsentPolicyService(loadConfig()),
+      new ConsentPolicyService(config),
+      new CandidateRepository(AppDataSource),
+      config,
     );
     service = new SwipesService(repository);
   });
@@ -154,6 +181,62 @@ describe('swipes and mutual matches (real PostgreSQL)', () => {
       members: 0,
       messages: 0,
     });
+  });
+
+  it('enforces the itinerary anchor on direct swipes without requiring score freshness', async () => {
+    const noTripSource = await createEligibleAccount('no-anchor-source', false);
+    const noTripTarget = await createEligibleAccount('no-anchor-target', false);
+
+    await expect(
+      service.create(noTripSource.id, {
+        targetUserId: noTripTarget.id,
+        direction: SwipeDirection.Like,
+      }),
+    ).rejects.toBeInstanceOf(SwipeTargetInvalidError);
+
+    const farSource = await createEligibleAccount('far-source');
+    const farTarget = await createEligibleAccount('far-target');
+    await AppDataSource.query(
+      `UPDATE trip_segments
+          SET location = ST_SetSRID(ST_MakePoint(-149.9003, 61.2181), 4326)::geography
+        WHERE user_id = $1`,
+      [farTarget.id],
+    );
+    await expect(
+      service.create(farSource.id, {
+        targetUserId: farTarget.id,
+        direction: SwipeDirection.Like,
+      }),
+    ).rejects.toBeInstanceOf(SwipeTargetInvalidError);
+
+    const dateSource = await createEligibleAccount('date-source');
+    const dateTarget = await createEligibleAccount('date-target');
+    await AppDataSource.query(
+      `UPDATE trips SET start_date = DATE '2090-10-01', end_date = DATE '2090-10-07'
+        WHERE user_id = $1`,
+      [dateTarget.id],
+    );
+    await AppDataSource.query(
+      `UPDATE trip_segments
+          SET start_date = DATE '2090-10-01', end_date = DATE '2090-10-07'
+        WHERE user_id = $1`,
+      [dateTarget.id],
+    );
+    await expect(
+      service.create(dateSource.id, {
+        targetUserId: dateTarget.id,
+        direction: SwipeDirection.Like,
+      }),
+    ).rejects.toBeInstanceOf(SwipeTargetInvalidError);
+
+    const eligibleSource = await createEligibleAccount('anchor-source');
+    const eligibleTarget = await createEligibleAccount('anchor-target');
+    await expect(
+      service.create(eligibleSource.id, {
+        targetUserId: eligibleTarget.id,
+        direction: SwipeDirection.Like,
+      }),
+    ).resolves.toMatchObject({ match: null });
   });
 
   it('makes identical retries idempotent and rejects changing the first swipe', async () => {
@@ -233,13 +316,20 @@ describe('swipes and mutual matches (real PostgreSQL)', () => {
     });
   });
 
-  it('fails closed for self, unknown, hidden, blocked, and matching-suspended users', async () => {
+  it('fails closed across every direct-swipe security and eligibility boundary', async () => {
     const source = await createEligibleAccount('eligibility-source');
     const hidden = await createEligibleAccount('eligibility-hidden');
     const ghosted = await createEligibleAccount('eligibility-ghosted');
     const blocked = await createEligibleAccount('eligibility-blocked');
+    const blockedOutgoing = await createEligibleAccount('eligibility-blocked-outgoing');
+    const withdrawnConsent = await createEligibleAccount('eligibility-withdrawn-consent');
     const targetSuspended = await createEligibleAccount('eligibility-target-suspended');
+    const targetFullySuspended = await createEligibleAccount('eligibility-target-full-suspended');
     const suspended = await createEligibleAccount('eligibility-suspended');
+    const ageSource = await createEligibleAccount('eligibility-age-source');
+    const ageTarget = await createEligibleAccount('eligibility-age-target');
+    const trustSource = await createEligibleAccount('eligibility-trust-source');
+    const lowTrustTarget = await createEligibleAccount('eligibility-low-trust-target');
 
     await expect(
       service.create(source.id, { targetUserId: source.id, direction: SwipeDirection.Like }),
@@ -276,6 +366,30 @@ describe('swipes and mutual matches (real PostgreSQL)', () => {
     ).rejects.toBeInstanceOf(SwipeTargetInvalidError);
 
     await AppDataSource.query(
+      `INSERT INTO user_blocks (blocker_user_id, blocked_user_id) VALUES ($1, $2)`,
+      [source.id, blockedOutgoing.id],
+    );
+    await expect(
+      service.create(source.id, {
+        targetUserId: blockedOutgoing.id,
+        direction: SwipeDirection.Like,
+      }),
+    ).rejects.toBeInstanceOf(SwipeTargetInvalidError);
+
+    await AppDataSource.query(
+      `INSERT INTO user_consents
+         (user_id, consent_type, granted, policy_version, created_at)
+       VALUES ($1, $2, FALSE, 'tos-test-v1', now() + INTERVAL '1 second')`,
+      [withdrawnConsent.id, ConsentType.TermsOfService],
+    );
+    await expect(
+      service.create(source.id, {
+        targetUserId: withdrawnConsent.id,
+        direction: SwipeDirection.Like,
+      }),
+    ).rejects.toBeInstanceOf(SwipeTargetInvalidError);
+
+    await AppDataSource.query(
       `INSERT INTO account_restrictions (user_id, type, reason)
        VALUES ($1, $2, 'target matching integration test')`,
       [targetSuspended.id, RestrictionType.MatchingSuspended],
@@ -283,6 +397,46 @@ describe('swipes and mutual matches (real PostgreSQL)', () => {
     await expect(
       service.create(source.id, {
         targetUserId: targetSuspended.id,
+        direction: SwipeDirection.Like,
+      }),
+    ).rejects.toBeInstanceOf(SwipeTargetInvalidError);
+
+    await AppDataSource.query(
+      `INSERT INTO account_restrictions (user_id, type, reason)
+       VALUES ($1, $2, 'target full suspension integration test')`,
+      [targetFullySuspended.id, RestrictionType.FullSuspension],
+    );
+    await expect(
+      service.create(source.id, {
+        targetUserId: targetFullySuspended.id,
+        direction: SwipeDirection.Like,
+      }),
+    ).rejects.toBeInstanceOf(SwipeTargetInvalidError);
+
+    await AppDataSource.query(
+      `UPDATE user_settings
+          SET min_age_preference = 50, max_age_preference = 70
+        WHERE user_id = $1`,
+      [ageTarget.id],
+    );
+    await expect(
+      service.create(ageSource.id, {
+        targetUserId: ageTarget.id,
+        direction: SwipeDirection.Like,
+      }),
+    ).rejects.toBeInstanceOf(SwipeTargetInvalidError);
+
+    await AppDataSource.query(
+      `UPDATE user_settings SET min_trust_score_preference = 8 WHERE user_id = $1`,
+      [trustSource.id],
+    );
+    await AppDataSource.query(
+      `UPDATE users SET trust_score_raw = 2 WHERE id = $1`,
+      [lowTrustTarget.id],
+    );
+    await expect(
+      service.create(trustSource.id, {
+        targetUserId: lowTrustTarget.id,
         direction: SwipeDirection.Like,
       }),
     ).rejects.toBeInstanceOf(SwipeTargetInvalidError);
