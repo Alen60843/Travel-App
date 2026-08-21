@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "findings"],
+  "properties": {
+    "status": { "enum": ["approved", "changes_requested", "blocked"] },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "severity", "category", "file", "location", "problem", "evidence", "impact", "suggestedFix", "verificationRequired"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^F[0-9]{3,}$" },
+          "severity": { "enum": ["critical", "high", "medium", "low"] },
+          "category": { "enum": ["correctness", "security", "performance", "concurrency", "architecture", "testing", "maintainability"] },
+          "file": { "type": "string" },
+          "location": { "type": "string" },
+          "problem": { "type": "string" },
+          "evidence": { "type": "string" },
+          "impact": { "type": "string" },
+          "suggestedFix": { "type": "string" },
+          "verificationRequired": { "type": "string" }
+        }
+      }
+    }
+  }
+}

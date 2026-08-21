@@ -1,0 +1,157 @@
+export type AgentName = 'codex' | 'claude';
+
+export type AgentRole =
+  | 'implementation'
+  | 'review'
+  | 'correction'
+  | 'final_review'
+  | 'integration'
+  | 'debate';
+
+export type AgentEffort = 'medium' | 'high' | 'extra_high';
+
+export type AgentAccess = 'read_only' | 'writer';
+
+export type AgentRunStatus =
+  | 'succeeded'
+  | 'failed'
+  | 'timed_out'
+  | 'aborted'
+  | 'not_found'
+  | 'spawn_error';
+
+export type AgentFailureCode =
+  | 'AGENT_NOT_FOUND'
+  | 'AGENT_FAILED'
+  | 'AGENT_TIMEOUT'
+  | 'AGENT_ABORTED'
+  | 'AGENT_SPAWN_ERROR';
+
+export interface AgentTestReport {
+  readonly command: string;
+  readonly result: 'pass' | 'fail' | 'not_run';
+  readonly details: string;
+}
+
+export interface AgentRequest {
+  readonly runId: string;
+  readonly taskId: string;
+  readonly role: AgentRole;
+  readonly worktreePath: string;
+  readonly baseSha: string;
+  readonly taskSpecification: unknown;
+  readonly canonicalDesignDocumentPath: string;
+  readonly allowedFileOwnership: readonly string[];
+  readonly dependencyHandoffs: readonly unknown[];
+  readonly previousReviewFindings: readonly unknown[];
+  readonly requestedEffort: AgentEffort;
+  readonly timeoutMs: number;
+  readonly artifactsDirectory: string;
+  readonly access?: AgentAccess;
+  readonly attempt?: number;
+  readonly abortSignal?: AbortSignal;
+  /** Persist the child PID before awaiting completion so crash recovery can inspect it. */
+  readonly onStarted?: (pid: number) => void | Promise<void>;
+}
+
+export interface AgentResult {
+  readonly agent: AgentName;
+  readonly runId: string;
+  readonly taskId: string;
+  readonly status: AgentRunStatus;
+  readonly failureCode: AgentFailureCode | null;
+  readonly exitCode: number | null;
+  readonly signal: NodeJS.Signals | null;
+  readonly stdoutPath: string;
+  readonly stderrPath: string;
+  readonly structuredHandoff: unknown | null;
+  readonly changedFiles: readonly string[];
+  readonly gitDiffSummary: string | null;
+  readonly testsReported: readonly AgentTestReport[];
+  readonly unresolvedQuestions: readonly string[];
+  readonly startedAt: string;
+  readonly endedAt: string;
+  readonly durationMs: number;
+  readonly timedOut: boolean;
+  readonly aborted: boolean;
+  readonly errorMessage: string | null;
+}
+
+export interface Agent {
+  readonly name: AgentName;
+
+  run(request: AgentRequest): Promise<AgentResult>;
+}
+
+export function defaultAccessForRole(role: AgentRole): AgentAccess {
+  return role === 'review' || role === 'final_review' || role === 'debate'
+    ? 'read_only'
+    : 'writer';
+}
+
+export function buildAgentPrompt(request: AgentRequest): string {
+  const access = request.access ?? defaultAccessForRole(request.role);
+
+  return [
+    'You are executing one bounded task for the TripWith local development orchestrator.',
+    '',
+    'Execution contract:',
+    `- Run ID: ${request.runId}`,
+    `- Task ID: ${request.taskId}`,
+    `- Role: ${request.role}`,
+    `- Access: ${access}`,
+    `- Assigned worktree: ${request.worktreePath}`,
+    `- Immutable run base SHA: ${request.baseSha}`,
+    `- Canonical design document: ${request.canonicalDesignDocumentPath}`,
+    `- Allowed file ownership: ${JSON.stringify(request.allowedFileOwnership)}`,
+    '- Never modify a path outside the allowed ownership list.',
+    access === 'read_only'
+      ? '- This is a read-only task. Do not modify files, create commits, or change Git state.'
+      : '- Work only in the assigned worktree. Do not push, merge, force-push, or rewrite branch history.',
+    access === 'read_only'
+      ? '- Inspect the supplied actual diff and relevant repository files as evidence.'
+      : '- Produce at most one local task commit. Leave no mixture of committed and uncommitted task changes.',
+    '- Do not reveal private chain-of-thought. Return conclusions, evidence, decisions, diffs, and test outcomes only.',
+    '- Do not print credentials, tokens, private keys, or complete environment dumps.',
+    '',
+    'Role contract:',
+    roleContract(request.role),
+    '',
+    'Task specification:',
+    stringifyPromptValue(request.taskSpecification),
+    '',
+    'Dependency handoffs:',
+    stringifyPromptValue(request.dependencyHandoffs),
+    '',
+    'Previous review findings:',
+    stringifyPromptValue(request.previousReviewFindings),
+    '',
+    'Your final response must be one JSON object matching the task handoff or review schema supplied by the task. Do not wrap it in Markdown.',
+  ].join('\n');
+}
+
+function roleContract(role: AgentRole): string {
+  switch (role) {
+    case 'implementation':
+      return 'Implement the smallest complete change, verify it proportionately, and report only the structured handoff evidence.';
+    case 'review':
+      return 'Independently review the supplied actual diff read-only. Findings require concrete evidence and material impact; omit style-only preferences.';
+    case 'correction':
+      return 'Do not apply findings blindly. In decisions, classify every finding as CONFIRMED or REJECTED with evidence. For confirmed findings report Finding -> Evidence -> Fix -> Verification; for rejected findings report why it is incorrect and the supporting evidence.';
+    case 'final_review':
+      return 'Review the corrected actual diff, prior findings, correction responses, and tests read-only. Approve only if no material issue remains; otherwise return evidence-backed remaining findings.';
+    case 'integration':
+      return 'Perform only the explicitly owned Lead composition work. If bounded debate artifacts are supplied, record an explicit A, B, HYBRID, or BLOCKED selection in decisions. Do not merge the phase branch or push; the orchestrator performs deterministic integration and verification later.';
+    case 'debate':
+      return 'If no peer proposal is supplied, produce one bounded proposal. If one peer proposal is supplied, critique that proposal once. Do not start an open-ended conversation.';
+  }
+}
+
+function stringifyPromptValue(value: unknown): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  const serialized = JSON.stringify(value, null, 2);
+  return serialized ?? 'null';
+}

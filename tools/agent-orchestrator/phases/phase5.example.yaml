@@ -1,0 +1,92 @@
+phase: 5
+name: Explorer
+baseBranch: phase5/explorer
+canonicalDesignDocument: docs/superpowers/specs/2026-08-20-tripwith-phase-1-design.md
+concurrency: 2
+agentRetries: 1
+maxReviewRounds: 2
+agentTimeoutMs: 3600000
+
+tasks:
+  - id: explorer-query-api
+    title: Explorer viewport query and authenticated API
+    owner: codex
+    effort: high
+    mode: implementation
+    files:
+      - apps/api/src/explorer/**
+    dependsOn: []
+    instructions: Run pnpm install --frozen-lockfile in this isolated worktree before repository tests if dependencies are not present.
+
+  - id: explorer-postgis-evidence
+    title: Explorer PostGIS plan and benchmark evidence
+    owner: codex
+    effort: high
+    mode: implementation
+    files:
+      - apps/api/src/database/scripts/explorer-*.sql
+    dependsOn: []
+    instructions: Run pnpm install --frozen-lockfile in this isolated worktree before repository tests if dependencies are not present.
+
+  - id: explorer-query-review
+    title: Independent query, privacy, cache and clustering review
+    owner: claude
+    effort: high
+    mode: review
+    files: []
+    dependsOn:
+      - explorer-query-api
+      - explorer-postgis-evidence
+
+  - id: explorer-query-correction
+    title: Verify and correct Explorer review findings
+    owner: codex
+    effort: high
+    mode: correction
+    files:
+      - apps/api/src/explorer/**
+      - apps/api/src/database/scripts/explorer-*.sql
+    dependsOn:
+      - explorer-query-review
+    instructions: Run pnpm install --frozen-lockfile in this isolated worktree before repository tests if dependencies are not present.
+
+  - id: explorer-final-review
+    title: Final independent Explorer cross-review
+    owner: claude
+    effort: high
+    mode: final_review
+    files: []
+    dependsOn:
+      - explorer-query-correction
+
+  - id: explorer-lead-integration
+    title: Lead composition and verification preparation
+    owner: codex
+    effort: extra_high
+    mode: integration
+    files:
+      - apps/api/src/app.module.ts
+      - apps/api/src/config/**
+      - docs/superpowers/specs/**
+    dependsOn:
+      - explorer-final-review
+    instructions: Run pnpm install --frozen-lockfile in this isolated worktree before repository tests if dependencies are not present.
+
+integration:
+  commands:
+    - command: pnpm install --frozen-lockfile
+      timeoutMs: 600000
+    - pnpm --filter @tripwith/shared typecheck
+    - pnpm --filter @tripwith/api typecheck
+    - pnpm --filter @tripwith/api build
+    - pnpm --filter @tripwith/shared test
+    - command: pnpm --filter @tripwith/api test -- --runInBand --detectOpenHandles
+      timeoutMs: 1800000
+    - pnpm run check:enums
+    - command: pnpm --filter @tripwith/api db:verify
+      timeoutMs: 1800000
+  diagnostics:
+    - pnpm audit --prod
+
+# This is a plan only. Running it invokes paid/local agents and writes Phase 5
+# code; do not run until the human explicitly approves Phase 5 execution.

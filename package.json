@@ -12,6 +12,11 @@
     }
   },
   "scripts": {
+    "agents:plan": "pnpm --filter @tripwith/agent-orchestrator plan",
+    "agents:run": "pnpm --filter @tripwith/agent-orchestrator start",
+    "agents:resume": "pnpm --filter @tripwith/agent-orchestrator resume",
+    "agents:status": "pnpm --filter @tripwith/agent-orchestrator status",
+    "agents:cleanup": "pnpm --filter @tripwith/agent-orchestrator cleanup",
     "check:enums": "node scripts/check-enum-parity.mjs",
     "db:up": "docker compose -f infra/docker-compose.yml up -d",
     "db:down": "docker compose -f infra/docker-compose.yml down",

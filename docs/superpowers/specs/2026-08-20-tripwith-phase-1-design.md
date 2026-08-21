@@ -1382,3 +1382,17 @@ No migration, schema SQL, entity, shared enum/date, infrastructure, dependency, 
 - The pre-existing Phase 2/3 non-failing ts-jest isolated-modules, shared implicit-ESM and pnpm audit `url.parse()` warnings remain tooling/dependency diagnostics.
 
 **Phase 4 Trips & Matching is fully closed after the post-review correction gate. The branch remains unmerged. Do not begin Phase 5 without explicit approval.**
+
+---
+
+## 24. Local multi-agent developer tooling addendum
+
+**Added:** 2026-08-21
+
+`tools/agent-orchestrator` is a local development-only coordinator for future approved phases. It does not change TripWith's runtime architecture, application behavior, database schema, deployment topology or Phase 1–4 approval state.
+
+The tool gives Codex and Claude bounded DAG tasks in separate Git worktrees, validates declared file ownership, exchanges runtime-validated handoffs/reviews, persists crash-resumable run state, and executes the configured integration gate itself. Its normal cross-model flow is implementation → independent review → evidence-based correction → final review → deterministic integration worktree → repository verification.
+
+No orchestrator command automatically merges into a phase branch, pushes a remote, resolves integration conflicts, rewrites history, edits secrets or deploys. A human must inspect the integration worktree and run artifacts and explicitly approve any later merge or push. Detailed setup, security boundaries, phase-file format and commands live in `tools/agent-orchestrator/README.md`.
+
+This tooling work did not start Phase 5 Explorer implementation.
