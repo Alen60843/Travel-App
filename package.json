@@ -6,6 +6,11 @@
   "engines": {
     "node": ">=20.11"
   },
+  "pnpm": {
+    "overrides": {
+      "uuid@<11.1.1": "11.1.1"
+    }
+  },
   "scripts": {
     "check:enums": "node scripts/check-enum-parity.mjs",
     "db:up": "docker compose -f infra/docker-compose.yml up -d",

@@ -79,6 +79,17 @@ export const configSchema = z.object({
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
   LOG_PRETTY: booleanSchema.default('false'),
   SERVICE_NAME: z.string().default('tripwith-api'),
+}).superRefine((config, context) => {
+  const hasClientEmail = config.FIREBASE_CLIENT_EMAIL !== undefined;
+  const hasPrivateKey = config.FIREBASE_PRIVATE_KEY !== undefined;
+  if (hasClientEmail !== hasPrivateKey) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['FIREBASE_CLIENT_EMAIL'],
+      message:
+        'FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY must either both be set or both be omitted',
+    });
+  }
 });
 
 export type RawConfig = z.infer<typeof configSchema>;

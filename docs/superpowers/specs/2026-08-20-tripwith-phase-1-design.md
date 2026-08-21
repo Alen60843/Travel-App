@@ -1,8 +1,8 @@
-# TripWith — Phase 1 Architecture and Database + Phase 2 Foundation Addendum
+# TripWith — Phase 1 Architecture and Database + Phase 2/3 Addenda
 
-**Date:** 2026-08-20 (revised after Phase 1 correction pass)
-**Status:** Phase 1 and Phase 2 Backend Foundation implemented and verified; Phase 3 approved to begin but not started
-**Scope:** Architecture, complete relational model, initial migration, and the Phase 2 backend/infrastructure foundation. No frontend and no payment-provider business implementation.
+**Date:** 2026-08-20 (revised through the Phase 3 close-out on 2026-08-21)
+**Status:** Phases 1–3 implemented and verified; Phase 3 closed; Phase 4 not started
+**Scope:** Architecture, complete relational model, initial migration, Phase 2 backend/infrastructure, and Phase 3 Authentication & Users. No frontend and no payment-provider business implementation.
 
 ---
 
@@ -832,7 +832,7 @@ infra/docker-compose.yml                                                   pinne
 
 **Completed:** 2026-08-21
 
-**Approval state:** Phase 2 fully closed; Phase 3 approved to begin, but not started in this synchronization step.
+**Approval state at this checkpoint:** Phase 2 fully closed; Phase 3 was approved to begin but had not yet started. Its later implementation is recorded in §20.
 
 Phase 2 implements the approved foundation without adding PaymentProvider business behavior:
 
@@ -893,4 +893,144 @@ production dependency audit          PASS (no known vulnerabilities)
 - The Jest/Node toolchain reports non-failing deprecation/module-format warnings (`ts-jest` isolatedModules configuration and the shared package's implicit ESM parsing). These are cosmetic/tooling follow-ups, not runtime defects.
 - The Phase 1 product risks above (deposit legal characterisation, calibration, retention and scale/load characterization) remain open in their assigned later phases.
 
-**Phase 2 Backend Foundation ends here and is fully closed. Phase 3 is approved to begin in a subsequent step; no Phase 3 work is included here.**
+**Phase 2 Backend Foundation ends here and is fully closed. The addendum below records the subsequently approved Phase 3 implementation.**
+
+---
+
+## 20. Phase 3 Authentication & Users addendum
+
+**Completed:** 2026-08-21
+
+**Approval state:** Phase 3 implemented, integrated and verified. Phase 3 is closed; Phase 4 has not started.
+
+Phase 3 used three independent implementation workstreams—Authentication, Users/Profile/Interests, and Settings/Privacy/Consent—with the Lead owning composition, cross-module authorization review, live boot/regression gates, dependency security and this canonical close-out. It adds no matching, trip, explorer, event, chat, marketplace, payment-provider, trust, SOS or mobile behavior.
+
+### Authentication architecture
+
+```text
+Authorization: Bearer <Firebase ID token>
+  -> Firebase Admin signature, issuer, audience/project and expiry validation
+  -> verified Firebase UID
+  -> users.firebase_uid lookup
+  -> active/deleted/deactivated/suspended/FULL_SUSPENSION boundary
+  -> internal PostgreSQL users.id attached to the request
+```
+
+- Normal HTTP and Socket.IO authentication calls `verifyIdToken(token, false)`. Firebase Admin validates locally against cached Google signing certificates in steady state; it does not perform a Firebase account lookup on every request.
+- The intentional provisioning path uses `verifyIdToken(token, true)`, opting into the remote revocation check before creating or returning account data.
+- Bearer parsing accepts exactly one non-empty credential and returns stable errors for missing/malformed, invalid-signature, expired, revoked and wrong-project tokens. Neither tokens nor upstream Firebase error details are logged or returned.
+- `TripWithAuthGuard` resolves only the verified Firebase UID. Domain controllers receive the internal UUID through `@CurrentUser`; request body, query, path and Firebase custom claims cannot choose an owner ID.
+- Active account status and the absence of a current `FULL_SUSPENSION` are required for normal access. Deleted, soft-deleted, deactivated, suspended, pending/unusable and fully restricted accounts fail closed.
+- Socket.IO now uses the same verification and internal-user resolution instead of the Phase 2 rejecting placeholder, and joins only the resolved `user:{internal_uuid}` room.
+
+### Account provisioning and onboarding
+
+`POST /api/v1/auth/provision` is the only first-account creation path. It requires a revocation-checked Firebase identity with a verified email plus date of birth, display name, and current Terms of Service and Privacy Policy versions. One PostgreSQL transaction creates:
+
+```text
+users (ACTIVE, verified email, 18+ DOB)
+  + user_profiles
+  + user_settings (schema defaults)
+  + two granted user_consents ledger entries
+```
+
+The insert uses PostgreSQL uniqueness as the concurrency authority. Concurrent first requests wait on the unique conflict and resolve the winner; tests prove one user, one profile, one settings row and exactly two required consent rows. Repeated provisioning is idempotent for the active account and re-enters the normal account-status/restriction boundary before returning owner data.
+
+No onboarding boolean was added. Completeness is derived from active status, verified email, profile/settings presence, display name and the latest required-consent states. Discoverability additionally requires `discovery_enabled` and an inactive/effectively expired Ghost Mode. A partially complete account is therefore never reported as discoverable.
+
+The API age validator parses an exact `YYYY-MM-DD` calendar date in UTC and uses the shared `MINIMUM_ACCOUNT_AGE_YEARS`; PostgreSQL's existing `tw_enforce_minimum_age()` trigger remains authoritative. Below-18, exact-18, older, impossible-date and future-date cases are covered.
+
+### Phase 3 API contract
+
+All paths below include the configured default `/api` prefix and URI version. Owner routes require `TripWithAuthGuard`; provisioning requires the revocation-checked Firebase guard.
+
+| Method and path | Purpose and major request fields | Major response fields | Important stable failures |
+|---|---|---|---|
+| `POST /api/v1/auth/provision` | Create/idempotently resolve the account; `dateOfBirth`, `displayName`, exact TOS/privacy `requiredConsents[].policyVersion` | Safe current-user representation | missing/invalid/expired/revoked/wrong-project token; verified email required; underage/invalid DOB; invalid required consent; identity conflict; unusable account |
+| `GET /api/v1/me` | Read the authenticated owner | internal `id`, email verification/status, DOB, profile, effective settings, derived onboarding/discoverability | auth/account boundary failures |
+| `GET /api/v1/me/profile` | Read the owner's private Phase 3 profile | display name, bio, avatar URL, country/languages, travel style and selected active interests | auth/account boundary failures |
+| `PATCH /api/v1/me/profile` | Update display name, bio, home country, native/spoken languages and travel style | Updated private profile | invalid lengths/codes/style; unknown fields rejected |
+| `GET /api/v1/me/interests/available` | List the active editorial source interests | `id`, `code`, `label`, `grouping` | auth/account boundary failures |
+| `PUT /api/v1/me/interests` | Replace `interestIds` transactionally while serializing concurrent replacements | Updated profile/interests | invalid/duplicate/inactive/unknown interest |
+| `GET /api/v1/me/settings` | Read effective owner settings and durably normalize an elapsed Ghost expiry | Ghost/discovery, visibility, age/trust/distance, notification, locale/timezone settings | auth/account boundary failures |
+| `PATCH /api/v1/me/settings` | Partial settings update using the same fields | Updated settings | empty patch; invalid range/order/enum/locale/timezone; invalid Ghost expiry; missing required consent when enabling discovery |
+| `POST /api/v1/me/consents` | Append grant or withdrawal; `consentType`, `granted`, `policyVersion` only | New timestamped ledger event and transport-derived provenance | unknown consent type; invalid/blank/oversized version |
+| `GET /api/v1/me/consents` | Project the latest event per approved consent type | Current consent events | auth/account boundary failures |
+| `GET /api/v1/me/consents/history` | Read the owner's append-only ledger | Reverse-chronological consent events | auth/account boundary failures |
+
+### Profile, interests, settings and consent invariants
+
+- `/me` routes structurally eliminate cross-user IDOR: there is no arbitrary user ID route or accepted owner field. DTO whitelisting rejects injected `userId` or source-metadata properties.
+- Profile validation mirrors the migration's country, language, display-name, bio and travel-style constraints. Character limits count Unicode characters consistently with PostgreSQL and reject PostgreSQL-invalid NULs before SQL.
+- `user_interests` is the source of truth. Replacement locks the profile aggregate, validates every selected interest is active, replaces the relationship set transactionally, and relies exclusively on `tw_sync_interest_ids()` for `user_profiles.interest_ids`.
+- Timed Ghost Mode is active through (but not at) its future expiry instant. A non-null expiry requires enabled Ghost Mode; disabling clears the expiry. Reads conditionally and durably clear elapsed state without overwriting a concurrent extension. Phase 3 stores this state only; Phase 4 will consume it for new discovery.
+- Consent grants and withdrawals are `INSERT` operations only. A per-user/type transaction advisory lock orders competing events, and current projection uses `(created_at DESC, id DESC)`. The database append-only trigger still rejects direct update/delete.
+- Withdrawing current TOS or Privacy consent atomically disables discovery. Re-enabling discovery takes the same ordered consent locks and requires the latest TOS and Privacy entries both to be granted, closing the withdrawal/re-enable race. A later re-grant does not silently opt the user back into discovery.
+- Consent source IP and user-agent values come from sanitized request transport metadata, never request-body claims.
+
+### Integrated code-review findings and fixes
+
+No Critical or High findings remained after integration. The concrete Medium correctness/security/reliability defects found at the cross-module gate were fixed:
+
+1. **Finding:** the first auth decorator exposed only `request.user`, while provisioning has a verified Firebase identity before an internal user exists. **Impact:** provisioning dependency injection could receive `undefined` or be tempted to weaken the guard. **Fix:** separate `@CurrentFirebaseIdentity` from `@CurrentUser`, with explicit guard contracts. **Verification:** AuthModule composition and both guard suites pass.
+2. **Finding:** idempotent reprovisioning initially returned an existing record without applying the inactive/deleted/full-restriction boundary. **Impact:** a valid Firebase token could use provisioning to bypass normal account usability checks and retrieve owner data. **Fix:** resolve every newly created or existing row through `TripWithUserResolver` before responding. **Verification:** live PostgreSQL inactive reprovisioning plus account-status/restriction unit cases pass.
+3. **Finding:** a supplied Ghost expiry could be silently discarded while Ghost Mode remained disabled. **Impact:** a client could receive a successful no-op instead of a stable validation failure. **Fix:** validate the effective enabled/until pair before clearing disabled state. **Verification:** disabled/future, explicitly disabled/future, past and durable-expiry integration cases pass.
+4. **Finding:** required-consent withdrawal did not initially change discovery state, and a concurrent settings write could restore it. **Impact:** a user without current required consent could remain or become discoverable. **Fix:** atomically disable discovery on withdrawal and use ordered consent locks plus latest-state checks before re-enable. **Verification:** live grant/withdraw/current/history/re-enable tests pass.
+5. **Finding:** a partial Firebase service-account credential pair silently fell back to application-default credentials. **Impact:** a typo could boot against unintended credentials and fail only on authentication traffic. **Fix:** startup configuration now requires client email/private key together or omits both. **Verification:** configuration tests and real API boot pass.
+6. **Finding:** the production audit found transitive `uuid@9.0.1` below the patched `11.1.1`, through Firebase Admin's optional Google Cloud dependencies. **Impact:** the audited tree contained a moderate buffer-bounds advisory, although the affected name-based UUID APIs are not used by this Auth path. **Fix:** a pnpm override resolves all transitive UUID consumers to `11.1.1`; Firebase Admin stays on CommonJS/Jest-compatible `13.10.0`. **Verification:** `pnpm why uuid`, strict compile/build, all Jest suites, actual API boot and `pnpm audit --prod` pass with no known vulnerabilities.
+
+Additional integration corrections included request-provenance sanitization, effective settings in `GET /me`, finite/missing `auth_time` rejection, stable NUL/Unicode validation, and explicit Phase 3 Socket.IO composition. No speculative schema or architecture redesign was made.
+
+### Phase 3 final verification snapshot
+
+```text
+strict workspace TypeScript                PASS (API + shared)
+Nest build                                  PASS
+actual API boot                             PASS (Auth/Users/Settings/Consent + Firebase socket auth composed)
+GET /health/live                            PASS (HTTP 200)
+GET /health/ready                           PASS (HTTP 200; database + Redis healthy)
+unauthenticated GET /api/v1/me              PASS (HTTP 401, AUTH_TOKEN_MISSING, correlated safe envelope)
+actual worker boot + graceful SIGINT        PASS
+API graceful SIGINT                         PASS
+API Jest with open-handle detection         39 suites, 227 tests passed, 0 failed
+Phase 3 focused coverage                     10 suites, 61 tests passed, 0 failed
+shared TS + live PostgreSQL parity           18 passed, 0 failed (7 live SQL cases)
+enum parity                                  23 ENUM types, 89 values, 0 drift
+Phase 1 invariant suite                      100 passed, 0 failed
+24-way concurrency race                     5 committed, 19 rejected, 0 overbooked
+automatic outbox process/regression          PASS
+dependency loss/recovery readiness           PASS
+production dependency audit                  PASS (no known vulnerabilities)
+migration up -> down -> up                    NOT RE-RUN: no schema/entity/migration change; Phase 2 gate remains authoritative
+```
+
+The API/Jest count includes all Phase 3 and Phase 2 suites, live PostgreSQL/Redis behavior, automatic outbox relay, BullMQ redelivery/idempotency, readiness dependency loss/recovery, and graceful lifecycle coverage. Firebase failure modes are tested at the real AuthModule verifier seam; the integrated module wiring is real, while token edge claims use controlled Firebase Admin responses rather than external network calls.
+
+### Files changed in Phase 3
+
+```text
+package.json, pnpm-lock.yaml                         Firebase transitive security override/lock
+apps/api/package.json                                firebase-admin dependency
+apps/api/src/app.module.ts                           Phase 3 module + Socket.IO auth composition
+apps/api/src/config/configuration.ts                 Firebase credential-pair validation
+apps/api/src/config/configuration.spec.ts            configuration regression
+apps/api/src/auth/**                                  Firebase/HTTP/socket authentication and tests
+apps/api/src/users/**                                 provisioning, /me, profile, interests and tests
+apps/api/src/settings/**                              settings/privacy/Ghost Mode and tests
+apps/api/src/consent/**                               append-only consent API and tests
+docs/superpowers/specs/2026-08-20-tripwith-phase-1-design.md  this addendum
+```
+
+There are no changes to migrations, schema SQL, TypeORM entities, shared enums/date behavior, Phase 1 invariant/concurrency scripts, infrastructure definitions, or PaymentProvider behavior. The pre-existing `.claude/settings.local.json` modification remains untouched and excluded from this work.
+
+### Remaining non-blocking risks
+
+- The test suite composes the real AuthModule and exercises the Firebase Admin adapter seam, but CI does not call a live Firebase project or emulator. Perform a deployment smoke test with the intended service account/project before production traffic.
+- Normal requests deliberately do not perform a revocation network lookup, so Firebase revocation becomes effective there when the short-lived ID token expires. Sensitive provisioning checks revocation immediately; this is the approved cached-key architecture.
+- Consent history is currently an unpaginated owner-only read, and Phase 2 has no application rate-limiter to attach to provisioning/consent endpoints. Edge/WAF rate limiting remains assumed; add bounded keyset pagination and endpoint limits before high-volume public exposure.
+- Transport IP provenance reflects Express's trusted connection view. Configure and test the production proxy trust boundary before treating stored IP as legal/audit-grade client attribution.
+- A newly suspended account is rejected on its next HTTP request or Socket.IO connection; Phase 3 does not proactively disconnect already-established sockets. Moderation-driven live revocation belongs with the later safety phase.
+- Firebase Admin `13.10.0` is pinned because the tested v14 dependency graph broke the repository's Jest 29/CommonJS runtime. The patched UUID override is covered by the complete gate, but both pins should be revalidated on the next Firebase/Jest upgrade.
+- The existing non-failing ts-jest isolated-modules and shared implicit-ESM warnings remain tooling cleanup items.
+
+**Phase 3 Authentication & Users ends here and is fully closed. Do not begin Phase 4 without explicit approval.**

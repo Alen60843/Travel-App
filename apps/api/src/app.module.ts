@@ -1,6 +1,8 @@
 import { Global, Module } from '@nestjs/common';
 
+import { AuthModule, FirebaseSocketAuthenticator } from './auth';
 import { ConfigModule } from './config/config.module';
+import { ConsentModule } from './consent';
 import { DatabaseModule } from './database/database.module';
 import { DatabaseReadinessCheck } from './database/database-readiness.check';
 import { HealthModule } from './health/health.module';
@@ -11,6 +13,9 @@ import { QueueModule } from './queue/queue.module';
 import { RedisModule } from './redis/redis.module';
 import { RedisReadinessCheck } from './redis/redis-readiness.check';
 import { RealtimeModule } from './realtime/realtime.module';
+import { SOCKET_AUTHENTICATOR } from './realtime/socket-authenticator';
+import { SettingsModule } from './settings';
+import { UsersModule } from './users';
 
 /**
  * Binds the concrete readiness checks to the token HealthModule consumes.
@@ -46,9 +51,9 @@ export class ReadinessRegistryModule {}
 /**
  * Root module — the composition root, owned by the Lead.
  *
- * Phase 2 wires infrastructure only. Domain modules (Auth, Users, Trips,
- * Explorer, Matching, Events, Chat, Marketplace, Payments, Trust, Safety)
- * arrive in their own phases and must not be imported here before then.
+ * Phase 2 wires infrastructure; Phase 3 adds only identity-domain modules.
+ * Trips, Explorer, Matching, Events, Chat, Marketplace, Payments, Trust and
+ * Safety remain intentionally absent until their approved phases.
  *
  * Import order below follows the dependency direction rather than
  * alphabetical: configuration and observability first because everything
@@ -72,11 +77,19 @@ export class ReadinessRegistryModule {}
     // poller for every autoscaled web replica.
     OutboxModule.forRoot({ runRelay: false }),
 
-    // Fail-closed by default: RejectingSocketAuthenticator refuses every
-    // connection until Phase 3 supplies a real Firebase authenticator via
-    // RealtimeModule.forRoot({ authenticatorProvider: ... }). Wiring a
-    // permissive default here would be a security hole introduced by omission.
-    RealtimeModule.forRoot(),
+    AuthModule,
+    UsersModule,
+    SettingsModule,
+    ConsentModule,
+
+    // Phase 3 explicitly replaces the infrastructure shell's fail-closed
+    // authenticator with Firebase verification plus internal-user resolution.
+    RealtimeModule.forRoot({
+      authenticatorProvider: {
+        provide: SOCKET_AUTHENTICATOR,
+        useExisting: FirebaseSocketAuthenticator,
+      },
+    }),
 
     ReadinessRegistryModule,
     HealthModule,

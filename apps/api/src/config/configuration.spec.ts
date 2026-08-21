@@ -104,6 +104,11 @@ describe('loadConfig — valid input', () => {
     expect('clientEmail' in config.firebase).toBe(false);
     expect('privateKey' in config.firebase).toBe(false);
   });
+
+  it('rejects a partial Firebase service-account credential pair', () => {
+    expect(() => loadConfig(envWithout('FIREBASE_PRIVATE_KEY'))).toThrow(ConfigValidationError);
+    expect(() => loadConfig(envWithout('FIREBASE_CLIENT_EMAIL'))).toThrow(ConfigValidationError);
+  });
 });
 
 describe('loadConfig — missing required variables', () => {
