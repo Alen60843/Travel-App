@@ -22,6 +22,38 @@
       }
     },
     "openQuestions": { "type": "array", "items": { "type": "string" } },
-    "reviewRequested": { "type": "array", "items": { "type": "string" } }
+    "reviewRequested": { "type": "array", "items": { "type": "string" } },
+    "assumptions": {
+      "description": "Optional, implementation/Solver tasks: non-obvious constraints or choices a reviewer could not derive from the diff alone.",
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "knownRisks": {
+      "description": "Optional, implementation/Solver tasks: known gaps or trade-offs, stated up front.",
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "attackSurface": {
+      "description": "Optional, implementation/Solver tasks: where an adversarial Verifier is most likely to find a real defect. A hint the Verifier may ignore, not a substitute for its own judgment.",
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "findingResponses": {
+      "description": "Optional, correction/Fixer tasks: a CONFIRMED or REJECTED verdict, with evidence, for every finding this task acted on.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["findingId", "decision", "evidence"],
+        "properties": {
+          "findingId": { "type": "string", "pattern": "^F[0-9]{3,}$" },
+          "decision": { "enum": ["confirmed", "rejected"] },
+          "evidence": { "type": "string" },
+          "fix": { "type": "string", "description": "Populated when decision is confirmed." },
+          "verification": { "type": "string", "description": "Populated when decision is confirmed." },
+          "reason": { "type": "string", "description": "Populated when decision is rejected." }
+        }
+      }
+    }
   }
 }

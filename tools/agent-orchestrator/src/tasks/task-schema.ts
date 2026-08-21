@@ -8,6 +8,7 @@ export const TASK_MODES = [
   'review',
   'correction',
   'final_review',
+  'escalation',
   'integration',
   'debate',
 ] as const;
@@ -21,6 +22,15 @@ export interface TaskSpec {
   readonly title: string;
   readonly owner: AgentName;
   readonly effort: EffortLevel;
+  /**
+   * Explicit model selection, independent of effort. Optional: most tasks
+   * should let the agent's own default apply. Only wired through to an
+   * adapter that has verified CLI support for a model flag — see
+   * agents/claude-agent.ts and agents/codex-agent.ts for what each adapter
+   * actually does with it. An unsupported adapter accepts the field (so a
+   * phase file stays portable across agents) but does not fabricate a flag.
+   */
+  readonly model?: string;
   readonly mode: TaskMode;
   readonly files: readonly string[];
   readonly dependsOn: readonly string[];
@@ -34,6 +44,7 @@ const TASK_KEYS = new Set([
   'title',
   'owner',
   'effort',
+  'model',
   'mode',
   'files',
   'dependsOn',
@@ -107,6 +118,10 @@ export function parseTaskSpec(value: unknown, index: number): TaskSpec {
   if (!(EFFORT_LEVELS as readonly string[]).includes(effort)) {
     invalid(`${path}.effort`, `must be one of ${EFFORT_LEVELS.join(', ')}`);
   }
+  let model: string | undefined;
+  if (value.model !== undefined) {
+    model = stringValue(value.model, `${path}.model`);
+  }
   const mode = stringValue(value.mode, `${path}.mode`);
   if (!(TASK_MODES as readonly string[]).includes(mode)) {
     invalid(`${path}.mode`, `must be one of ${TASK_MODES.join(', ')}`);
@@ -131,6 +146,10 @@ export function parseTaskSpec(value: unknown, index: number): TaskSpec {
     invalid(`${path}.dependsOn`, 'a task cannot depend on itself');
   }
 
+  // Escalation (JUDGE) defaults to read-only, matching review/final_review:
+  // its job is to arbitrate a disagreement and record a decision, not to
+  // change code itself. A phase that genuinely wants the Judge to also patch
+  // something can still set writer: true explicitly with ownership globs.
   const defaultWriter = ['implementation', 'correction', 'integration'].includes(mode);
   const writer = value.writer ?? defaultWriter;
   if (typeof writer !== 'boolean') {
@@ -166,6 +185,7 @@ export function parseTaskSpec(value: unknown, index: number): TaskSpec {
     title,
     owner: owner as AgentName,
     effort: effort as EffortLevel,
+    ...(model === undefined ? {} : { model }),
     mode: mode as TaskMode,
     files,
     dependsOn,

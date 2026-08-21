@@ -23,11 +23,26 @@ export interface ReviewFinding {
   readonly category: FindingCategory;
   readonly file: string;
   readonly location: string;
+  /** The claim: what is wrong. (Named `problem` for backward compatibility with existing generic review usage.) */
   readonly problem: string;
   readonly evidence: string;
   readonly impact: string;
   readonly suggestedFix: string;
   readonly verificationRequired: string;
+  /**
+   * Adversarial-verification fields (§4). All optional so plain `review`/
+   * `final_review` usage is unaffected — a Verifier task is instructed
+   * (prompts/adversarial-verifier.md) to prefer supplying these over a bare
+   * claim, but the schema does not hard-require them: enforcing that only for
+   * solver_verifier-mode reviews would need mode-conditional validation this
+   * MVP does not implement. A finding lacking them is weaker evidence, not an
+   * invalid one — the Fixer's CONFIRMED/REJECTED response and the subsequent
+   * re-Verify are what actually catch an unsubstantiated finding.
+   */
+  readonly counterexample?: string;
+  readonly reproduction?: string;
+  readonly expectedBehavior?: string;
+  readonly violatingBehavior?: string;
 }
 
 export interface StructuredReview {
@@ -47,6 +62,10 @@ const FINDING_KEYS = new Set([
   'impact',
   'suggestedFix',
   'verificationRequired',
+  'counterexample',
+  'reproduction',
+  'expectedBehavior',
+  'violatingBehavior',
 ]);
 
 function invalid(path: string, message: string, cause?: unknown): never {
@@ -110,6 +129,22 @@ function parseFinding(value: unknown, index: number): ReviewFinding {
   ) {
     invalid(`${path}.file`, 'must be a safe repository-relative path');
   }
+  const counterexample =
+    candidate.counterexample === undefined
+      ? undefined
+      : text(candidate.counterexample, `${path}.counterexample`, true);
+  const reproduction =
+    candidate.reproduction === undefined
+      ? undefined
+      : text(candidate.reproduction, `${path}.reproduction`, true);
+  const expectedBehavior =
+    candidate.expectedBehavior === undefined
+      ? undefined
+      : text(candidate.expectedBehavior, `${path}.expectedBehavior`, true);
+  const violatingBehavior =
+    candidate.violatingBehavior === undefined
+      ? undefined
+      : text(candidate.violatingBehavior, `${path}.violatingBehavior`, true);
   return {
     id,
     severity: severity as FindingSeverity,
@@ -124,6 +159,10 @@ function parseFinding(value: unknown, index: number): ReviewFinding {
       candidate.verificationRequired,
       `${path}.verificationRequired`,
     ),
+    ...(counterexample === undefined ? {} : { counterexample }),
+    ...(reproduction === undefined ? {} : { reproduction }),
+    ...(expectedBehavior === undefined ? {} : { expectedBehavior }),
+    ...(violatingBehavior === undefined ? {} : { violatingBehavior }),
   };
 }
 

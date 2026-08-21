@@ -5,6 +5,7 @@ export type AgentRole =
   | 'review'
   | 'correction'
   | 'final_review'
+  | 'escalation'
   | 'integration'
   | 'debate';
 
@@ -45,6 +46,8 @@ export interface AgentRequest {
   readonly dependencyHandoffs: readonly unknown[];
   readonly previousReviewFindings: readonly unknown[];
   readonly requestedEffort: AgentEffort;
+  /** See TaskSpec.model: optional, only honored by adapters with verified CLI support. */
+  readonly requestedModel?: string;
   readonly timeoutMs: number;
   readonly artifactsDirectory: string;
   readonly access?: AgentAccess;
@@ -84,7 +87,7 @@ export interface Agent {
 }
 
 export function defaultAccessForRole(role: AgentRole): AgentAccess {
-  return role === 'review' || role === 'final_review' || role === 'debate'
+  return role === 'review' || role === 'final_review' || role === 'escalation' || role === 'debate'
     ? 'read_only'
     : 'writer';
 }
@@ -140,6 +143,8 @@ function roleContract(role: AgentRole): string {
       return 'Do not apply findings blindly. In decisions, classify every finding as CONFIRMED or REJECTED with evidence. For confirmed findings report Finding -> Evidence -> Fix -> Verification; for rejected findings report why it is incorrect and the supporting evidence.';
     case 'final_review':
       return 'Review the corrected actual diff, prior findings, correction responses, and tests read-only. Approve only if no material issue remains; otherwise return evidence-backed remaining findings.';
+    case 'escalation':
+      return 'You are the Judge. This task runs whenever a corrected diff has been re-reviewed, whether or not that re-review actually found a remaining disagreement — the orchestrator has no cheaper way to know in advance. If the re-review approved the diff, there is nothing to arbitrate: say so plainly and return status "complete" immediately. Do not invent objections to justify your own involvement. If it did not approve, read the disputed findings, the correction responses, and the actual diff read-only, and decide with evidence whether the disagreement is resolved. Report your ruling in decisions. Return status "complete" if resolved (state exactly what is and is not confirmed, so a following task can act on it) or status "blocked" if it is not (state precisely what remains unresolved and why a human must decide). This is a single bounded arbitration, not a new review round: do not request another round of review.';
     case 'integration':
       return 'Perform only the explicitly owned Lead composition work. If bounded debate artifacts are supplied, record an explicit A, B, HYBRID, or BLOCKED selection in decisions. Do not merge the phase branch or push; the orchestrator performs deterministic integration and verification later.';
     case 'debate':

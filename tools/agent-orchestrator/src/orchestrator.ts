@@ -3,7 +3,7 @@ import { open, readFile, rename, rm } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 
 import { ClaudeAgent, CodexAgent, type Agent, type AgentRequest, type AgentResult } from './agents';
-import { loadPhaseConfig, type PhaseConfig } from './config';
+import type { PhaseConfig } from './config';
 import { OrchestratorError, type ErrorCode } from './errors';
 import { findExecutable } from './executable';
 import {
@@ -43,6 +43,7 @@ import {
   type TaskSpec,
   type TaskStatus,
 } from './tasks';
+import { loadAnyPhaseConfig } from './workflow/solver-verifier';
 
 export interface PlanResult {
   readonly repositoryRoot: string;
@@ -78,7 +79,7 @@ export async function planPhase(
   phaseFile: string,
   options: OrchestratorOptions,
 ): Promise<PlanResult> {
-  const config = await loadPhaseConfig(resolve(phaseFile));
+  const config = await loadAnyPhaseConfig(resolve(phaseFile));
   const git = options.git ?? new GitClient();
   const repositoryRoot = await git.repositoryRoot(resolve(options.repositoryPath));
   const baseSha = await resolveBaseSha(git, repositoryRoot, config.baseBranch);
@@ -217,7 +218,7 @@ export class AgentOrchestrator {
         details: { expected: state.repositoryRoot, actual: repositoryRoot },
       });
     }
-    const config = await loadPhaseConfig(join(stateStore.runDirectory, 'phase.yaml'));
+    const config = await loadAnyPhaseConfig(join(stateStore.runDirectory, 'phase.yaml'));
     if (config.baseBranch !== state.baseBranch) {
       throw new OrchestratorError('STATE_CORRUPT', 'Stored phase base branch differs from run state');
     }
@@ -486,6 +487,7 @@ export class AgentOrchestrator {
       dependencyHandoffs: prepared.dependencyHandoffs,
       previousReviewFindings: prepared.previousReviewFindings,
       requestedEffort: task.effort,
+      ...(task.model === undefined ? {} : { requestedModel: task.model }),
       timeoutMs: task.timeoutMs ?? this.config.agentTimeoutMs,
       artifactsDirectory: join(this.stateStore.runDirectory, 'logs'),
       access: task.writer ? 'writer' : 'read_only',
@@ -556,10 +558,17 @@ export class AgentOrchestrator {
     );
     await this.event('HANDOFF_WRITTEN', prepared.task.id, { handoffPath });
     if (handoff.status !== 'complete') {
+      // An escalation (JUDGE) task that cannot resolve the disagreement is
+      // exactly the BLOCKED_FOR_HUMAN_REVIEW case final_review already uses
+      // below in finishReview — same terminal meaning ("no automated path
+      // forward"), so it gets the same stable code rather than the generic
+      // REVIEW_BLOCKED a plain review-mode task would report.
+      const blockedCode =
+        prepared.task.mode === 'escalation' ? 'BLOCKED_FOR_HUMAN_REVIEW' : 'REVIEW_BLOCKED';
       await this.failTask(
         prepared.task.id,
         new OrchestratorError(
-          handoff.status === 'blocked' ? 'REVIEW_BLOCKED' : 'AGENT_FAILED',
+          handoff.status === 'blocked' ? blockedCode : 'AGENT_FAILED',
           handoff.summary,
         ),
         handoff.status === 'blocked' ? 'BLOCKED' : 'FAILED',
@@ -612,8 +621,24 @@ export class AgentOrchestrator {
         file: finding.file,
       });
     }
-    if (review.status === 'blocked'
-      || (prepared.task.mode === 'final_review' && review.status !== 'approved')) {
+    // §8 escalation seam: a non-approved final_review normally stops the run
+    // as BLOCKED_FOR_HUMAN_REVIEW immediately below, unconditionally — that
+    // remains the exact behavior for every phase that does not opt in. It
+    // changes ONLY when this specific task has an escalation-mode (JUDGE)
+    // dependent in the graph: then the disagreement is handed to the Judge
+    // for one bounded arbitration attempt instead. Detected structurally from
+    // the DAG, not from configuration, so nothing needs to be threaded
+    // through the phase config to enable it, and a phase with no escalation
+    // task literally cannot exercise this branch.
+    const routeToEscalation =
+      prepared.task.mode === 'final_review'
+      && review.status !== 'approved'
+      && this.hasEscalationDependent(prepared.task.id);
+    if (
+      !routeToEscalation
+      && (review.status === 'blocked'
+        || (prepared.task.mode === 'final_review' && review.status !== 'approved'))
+    ) {
       await this.failTask(
         prepared.task.id,
         new OrchestratorError(
@@ -711,6 +736,13 @@ export class AgentOrchestrator {
         `Read-only task ${prepared.task.id} changed its worktree`,
       );
     }
+  }
+
+  /** True if any task in the graph both depends on `taskId` and has mode 'escalation'. */
+  private hasEscalationDependent(taskId: string): boolean {
+    return this.config.tasks.some(
+      (candidate) => candidate.mode === 'escalation' && candidate.dependsOn.includes(taskId),
+    );
   }
 
   private dependencyCommits(task: TaskSpec): IntegrationCommit[] {
@@ -1269,6 +1301,19 @@ function handoffResponseSchema(): unknown {
     tests: [{ command: 'string', result: 'pass | fail | not_run', details: 'string' }],
     openQuestions: ['string'],
     reviewRequested: ['string'],
+    'assumptions (optional; implementation tasks)':
+      ['non-obvious constraint or choice a reviewer could not derive from the diff alone'],
+    'knownRisks (optional; implementation tasks)': ['known gap or trade-off, stated up front'],
+    'attackSurface (optional; implementation tasks)':
+      ['where an adversarial reviewer is most likely to find a real defect'],
+    'findingResponses (optional; correction tasks — one entry per finding you are responding to)': [{
+      findingId: 'F001',
+      decision: 'confirmed | rejected',
+      evidence: 'string',
+      'fix (when confirmed)': 'string',
+      'verification (when confirmed)': 'string',
+      'reason (when rejected)': 'string',
+    }],
   };
 }
 
@@ -1281,11 +1326,15 @@ function reviewResponseSchema(): unknown {
       category: 'correctness | security | performance | concurrency | architecture | testing | maintainability',
       file: 'repository-relative path',
       location: 'symbol/line if known',
-      problem: 'string',
+      problem: 'string (state your claim precisely)',
       evidence: 'string',
       impact: 'string',
       suggestedFix: 'string',
       verificationRequired: 'string',
+      'counterexample (optional, prefer supplying)': 'concrete input/state that triggers the defect',
+      'reproduction (optional, prefer supplying)': 'exact steps or a failing test to reproduce it',
+      'expectedBehavior (optional, prefer supplying)': 'string',
+      'violatingBehavior (optional, prefer supplying)': 'string',
     }],
   };
 }

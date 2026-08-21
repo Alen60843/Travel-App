@@ -40,6 +40,15 @@ export class ClaudeAgent extends ProcessAgent {
       access === 'read_only' ? 'Read,Glob,Grep' : 'default',
     ];
 
+    // `claude --help` documents `--model <model>` as a real, independent flag
+    // (accepting an alias or a full model name) alongside --effort, verified
+    // against Claude Code 2.1.220 before wiring this. Only added when a task
+    // explicitly requests one, so the default behavior (session default
+    // model) is unchanged for every existing phase file.
+    if (request.requestedModel !== undefined) {
+      args.push('--model', request.requestedModel);
+    }
+
     return {
       args,
       prompt: buildAgentPrompt(request),

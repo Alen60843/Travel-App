@@ -12,6 +12,27 @@ export interface HandoffTest {
   readonly details: string;
 }
 
+export const FINDING_DECISIONS = ['confirmed', 'rejected'] as const;
+export type FindingDecision = (typeof FINDING_DECISIONS)[number];
+
+/**
+ * A Fixer's verdict on exactly one Verifier finding. §5: the Fixer must not
+ * apply findings blindly, so every finding it acts on (or declines to act on)
+ * is recorded here with the evidence behind that decision — not just the
+ * resulting diff.
+ */
+export interface FindingResponse {
+  readonly findingId: string;
+  readonly decision: FindingDecision;
+  readonly evidence: string;
+  /** Populated when decision is "confirmed": what was changed. */
+  readonly fix?: string;
+  /** Populated when decision is "confirmed": how the fix was verified. */
+  readonly verification?: string;
+  /** Populated when decision is "rejected": why the finding does not hold. */
+  readonly reason?: string;
+}
+
 export interface StructuredHandoff {
   readonly status: HandoffStatus;
   readonly summary: string;
@@ -20,6 +41,26 @@ export interface StructuredHandoff {
   readonly tests: readonly HandoffTest[];
   readonly openQuestions: readonly string[];
   readonly reviewRequested: readonly string[];
+  /**
+   * Present on implementation/"Solver" tasks. Non-obvious constraints or
+   * choices the task made that a downstream reviewer could not derive from
+   * the diff alone — kept separate from `decisions` because these are
+   * specifically things an adversarial Verifier should be told, not general
+   * narration of what was done.
+   */
+  readonly assumptions?: readonly string[];
+  /** Present on implementation/"Solver" tasks: known gaps or trade-offs, stated rather than discovered later. */
+  readonly knownRisks?: readonly string[];
+  /**
+   * Present on implementation/"Solver" tasks: the Solver's own pointer to
+   * where an adversarial Verifier is most likely to find a real defect —
+   * boundary conditions, concurrency, error paths, trust boundaries. This is
+   * a hint the Verifier is free to ignore; it is not a substitute for the
+   * Verifier's own independent judgment.
+   */
+  readonly attackSurface?: readonly string[];
+  /** Present on correction/"Fixer" tasks: see FindingResponse. */
+  readonly findingResponses?: readonly FindingResponse[];
 }
 
 const HANDOFF_KEYS = new Set([
@@ -30,8 +71,20 @@ const HANDOFF_KEYS = new Set([
   'tests',
   'openQuestions',
   'reviewRequested',
+  'assumptions',
+  'knownRisks',
+  'attackSurface',
+  'findingResponses',
 ]);
 const TEST_KEYS = new Set(['command', 'result', 'details']);
+const FINDING_RESPONSE_KEYS = new Set([
+  'findingId',
+  'decision',
+  'evidence',
+  'fix',
+  'verification',
+  'reason',
+]);
 
 function invalid(path: string, message: string, cause?: unknown): never {
   throw new OrchestratorError('HANDOFF_INVALID', `${path}: ${message}`, {
@@ -92,6 +145,34 @@ function parseTest(value: unknown, index: number): HandoffTest {
   };
 }
 
+function optionalTextArray(value: unknown, path: string): string[] | undefined {
+  return value === undefined ? undefined : textArray(value, path);
+}
+
+function parseFindingResponse(value: unknown, index: number): FindingResponse {
+  const path = `handoff.findingResponses[${index}]`;
+  const object = record(value, path);
+  knownKeys(object, FINDING_RESPONSE_KEYS, path);
+  const findingId = text(object.findingId, `${path}.findingId`);
+  if (!/^F[0-9]{3,}$/.test(findingId)) {
+    invalid(`${path}.findingId`, 'must match /^F[0-9]{3,}$/');
+  }
+  const decision = text(object.decision, `${path}.decision`);
+  if (!(FINDING_DECISIONS as readonly string[]).includes(decision)) {
+    invalid(`${path}.decision`, `must be one of ${FINDING_DECISIONS.join(', ')}`);
+  }
+  return {
+    findingId,
+    decision: decision as FindingDecision,
+    evidence: text(object.evidence, `${path}.evidence`),
+    ...(object.fix === undefined ? {} : { fix: text(object.fix, `${path}.fix`) }),
+    ...(object.verification === undefined
+      ? {}
+      : { verification: text(object.verification, `${path}.verification`) }),
+    ...(object.reason === undefined ? {} : { reason: text(object.reason, `${path}.reason`) }),
+  };
+}
+
 export function validateHandoff(value: unknown): StructuredHandoff {
   const object = record(value, 'handoff');
   knownKeys(object, HANDOFF_KEYS, 'handoff');
@@ -112,6 +193,20 @@ export function validateHandoff(value: unknown): StructuredHandoff {
       invalid(`handoff.filesChanged[${index}]`, 'must be a safe repository-relative path');
     }
   }
+  let findingResponses: FindingResponse[] | undefined;
+  if (object.findingResponses !== undefined) {
+    if (!Array.isArray(object.findingResponses)) {
+      invalid('handoff.findingResponses', 'must be an array');
+    }
+    findingResponses = object.findingResponses.map(parseFindingResponse);
+    const ids = findingResponses.map((response) => response.findingId);
+    if (new Set(ids).size !== ids.length) {
+      invalid('handoff.findingResponses', 'findingId must be unique per response');
+    }
+  }
+  const assumptions = optionalTextArray(object.assumptions, 'handoff.assumptions');
+  const knownRisks = optionalTextArray(object.knownRisks, 'handoff.knownRisks');
+  const attackSurface = optionalTextArray(object.attackSurface, 'handoff.attackSurface');
   return {
     status: status as HandoffStatus,
     summary: text(object.summary, 'handoff.summary'),
@@ -120,5 +215,9 @@ export function validateHandoff(value: unknown): StructuredHandoff {
     tests: object.tests.map(parseTest),
     openQuestions: textArray(object.openQuestions, 'handoff.openQuestions'),
     reviewRequested: textArray(object.reviewRequested, 'handoff.reviewRequested'),
+    ...(assumptions === undefined ? {} : { assumptions }),
+    ...(knownRisks === undefined ? {} : { knownRisks }),
+    ...(attackSurface === undefined ? {} : { attackSurface }),
+    ...(findingResponses === undefined ? {} : { findingResponses }),
   };
 }

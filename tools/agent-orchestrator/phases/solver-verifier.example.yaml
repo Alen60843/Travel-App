@@ -1,0 +1,79 @@
+# Solver / Verifier MVP — illustrative example, NOT tied to any real phase.
+#
+# This demonstrates the `workflow: solver_verifier` declarative shorthand
+# (README: "Solver/Verifier workflow mode") end to end:
+#
+#   Codex Solver
+#     -> Claude adversarial Verifier
+#     -> Codex Fixer (CONFIRMED/REJECTED per finding)
+#     -> Claude re-Verifier
+#     -> deterministic integration gate
+#     -> Claude Judge, ONLY if the re-review still disagrees (one bounded attempt)
+#
+# Deliberately targets a disposable documentation path, not real application
+# code — this file exists to prove the mechanism, not to do work.
+#
+# `agents:plan tools/agent-orchestrator/phases/solver-verifier.example.yaml`
+# is read-only and safe to run any time. `agents:run` on this file would
+# invoke real, paid/local agent processes: do not run it without first
+# approving that specific, scoped piece of work, exactly like any other
+# phase file in this directory.
+
+phase: solver-verifier-demo
+name: Solver/Verifier MVP demonstration
+baseBranch: main
+canonicalDesignDocument: docs/superpowers/specs/2026-08-20-tripwith-phase-1-design.md
+concurrency: 1
+agentRetries: 1
+agentTimeoutMs: 3600000
+
+workflow:
+  mode: solver_verifier
+
+  # Ownership shared by the generated solve/fix tasks. A real phase would
+  # point this at the actual feature being built; this example intentionally
+  # points at a scratch path so the file is safe to plan against any repo
+  # state without implying real ownership of application code.
+  files:
+    - tools/agent-orchestrator/runs/.solver-verifier-demo-scratch/**
+
+  solver:
+    agent: codex
+    effort: high
+    # model: gpt-5-example      # optional; only honored by adapters with
+                                  # verified CLI support — see agents/codex-agent.ts
+
+  verifier:
+    agent: claude
+    effort: high
+    # model: claude-example
+
+  correction:
+    agent: codex
+    effort: high
+
+  # §6 MVP bound: 0 or 1. 1 means one bounded correction round is generated
+  # (solve -> verify -> fix -> reverify); 0 means solve -> verify only, and a
+  # non-approved verify simply stops the run for a human, same as any
+  # generic phase's `review` mode.
+  maxCorrectionRounds: 1
+
+  escalation:
+    enabled: true
+    agent: claude
+    effort: extra_high
+    # Requires maxCorrectionRounds: 1 — escalation arbitrates a disagreement
+    # that survived one correction round; rejected at parse time otherwise.
+
+deterministicGate:
+  commands:
+    - command: pnpm install --frozen-lockfile
+      timeoutMs: 600000
+    - pnpm --filter @tripwith/agent-orchestrator typecheck
+    - command: pnpm --filter @tripwith/agent-orchestrator test
+      timeoutMs: 600000
+  diagnostics:
+    - pnpm audit --prod
+
+# Plan only. Running it invokes paid/local agents; do not run until a human
+# explicitly approves this specific scoped demonstration.

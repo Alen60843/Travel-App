@@ -45,14 +45,18 @@ const TOP_LEVEL_KEYS = new Set([
 const INTEGRATION_KEYS = new Set(['commands', 'diagnostics']);
 const COMMAND_KEYS = new Set(['command', 'required', 'timeoutMs']);
 
-function invalid(path: string, message: string, cause?: unknown): never {
+// Exported (not just used internally) so src/workflow/solver-verifier.ts can
+// build a plain-object PhaseConfig shape with the same validation rules
+// instead of duplicating them — the declarative solver_verifier workflow is
+// a shorthand that expands into exactly this schema, not a parallel one.
+export function invalid(path: string, message: string, cause?: unknown): never {
   throw new OrchestratorError('CONFIG_INVALID', `${path}: ${message}`, {
     ...(cause === undefined ? {} : { cause }),
     details: { path },
   });
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
@@ -68,7 +72,7 @@ function assertKnownKeys(
   }
 }
 
-function nonEmptyString(value: unknown, path: string): string {
+export function nonEmptyString(value: unknown, path: string): string {
   if (typeof value !== 'string' || value.trim() === '') {
     invalid(path, 'must be a non-empty string');
   }
@@ -78,7 +82,7 @@ function nonEmptyString(value: unknown, path: string): string {
   return value.trim();
 }
 
-function boundedInteger(
+export function boundedInteger(
   value: unknown,
   path: string,
   minimum: number,
@@ -95,7 +99,7 @@ function boundedInteger(
   return value;
 }
 
-function repositoryRelativePath(value: unknown, path: string): string {
+export function repositoryRelativePath(value: unknown, path: string): string {
   const result = nonEmptyString(value, path);
   if (
     result.startsWith('/') ||
@@ -156,7 +160,7 @@ function parseCommandList(
   );
 }
 
-function parseIntegration(value: unknown): IntegrationConfig {
+export function parseIntegration(value: unknown): IntegrationConfig {
   if (value === undefined) {
     return { commands: [], diagnostics: [] };
   }

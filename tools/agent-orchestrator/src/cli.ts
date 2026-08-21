@@ -3,8 +3,10 @@
 import { join, resolve } from 'node:path';
 
 import { GitClient, WorktreeManager } from './git';
+import { computeRunMetrics } from './metrics/compute-metrics';
 import { AgentOrchestrator, planPhase } from './orchestrator';
 import { StateStore, type RunState } from './state';
+import { loadAnyPhaseConfig } from './workflow/solver-verifier';
 
 const USAGE = `TripWith local agent orchestrator
 
@@ -14,9 +16,12 @@ Usage:
   pnpm agents:resume <run-id>
   pnpm agents:status <run-id>
   pnpm agents:cleanup <run-id>
+  pnpm agents:metrics <run-id>
 
 Planning is read-only. Running or resuming may invoke locally authenticated paid agents.
-No command merges into the phase branch or pushes to a remote.`;
+No command merges into the phase branch or pushes to a remote.
+metrics is read-only: it recomputes a summary from persisted run artifacts and never
+touches agents, worktrees, or state.`;
 
 async function main(argv: readonly string[]): Promise<number> {
   const [command, argument, ...extra] = argv;
@@ -67,6 +72,14 @@ async function main(argv: readonly string[]): Promise<number> {
   if (command === 'status') {
     const { store } = await locateRun(repositoryPath, argument);
     process.stdout.write(renderStatus(await store.load()));
+    return 0;
+  }
+  if (command === 'metrics') {
+    const { store } = await locateRun(repositoryPath, argument);
+    const state = await store.load();
+    const config = await loadAnyPhaseConfig(join(store.runDirectory, 'phase.yaml'));
+    const metrics = await computeRunMetrics(store.runDirectory, state, config);
+    process.stdout.write(`${JSON.stringify(metrics, null, 2)}\n`);
     return 0;
   }
   if (command === 'cleanup') {

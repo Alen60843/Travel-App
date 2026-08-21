@@ -17,11 +17,27 @@
           "category": { "enum": ["correctness", "security", "performance", "concurrency", "architecture", "testing", "maintainability"] },
           "file": { "type": "string" },
           "location": { "type": "string" },
-          "problem": { "type": "string" },
+          "problem": { "type": "string", "description": "The claim: what is wrong, stated precisely." },
           "evidence": { "type": "string" },
           "impact": { "type": "string" },
           "suggestedFix": { "type": "string" },
-          "verificationRequired": { "type": "string" }
+          "verificationRequired": { "type": "string" },
+          "counterexample": {
+            "type": "string",
+            "description": "Optional; prefer supplying for adversarial review. Concrete input/state that triggers the defect."
+          },
+          "reproduction": {
+            "type": "string",
+            "description": "Optional; prefer supplying for adversarial review. Exact steps or a failing test to reproduce it."
+          },
+          "expectedBehavior": {
+            "type": "string",
+            "description": "Optional; prefer supplying for adversarial review."
+          },
+          "violatingBehavior": {
+            "type": "string",
+            "description": "Optional; prefer supplying for adversarial review."
+          }
         }
       }
     }
