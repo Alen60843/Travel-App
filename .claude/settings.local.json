@@ -69,7 +69,18 @@
       "Bash(redis-server --port 6398 --daemonize yes --appendonly no --maxmemory 256mb --maxmemory-policy allkeys-lru --dir __TRACKED_VAR__/redis-cache --logfile __TRACKED_VAR__/redis-cache/redis.log)",
       "Bash(TEST_DB_NAME=tripwith TEST_DB_PORT=55432 TEST_DB_USER=postgres TEST_DB_HOST=localhost REDIS_QUEUE_URL=redis://localhost:6399 REDIS_CACHE_URL=redis://localhost:6398 QUEUE_PREFIX=leadint npx jest --config jest.config.js --runInBand)",
       "Bash(echo \"tsc=$?\")",
-      "Bash(perl -pi -e \"s/INSERT job_outbox \\\\\\('payment\\\\.capture:<id>'\\\\\\)/INSERT job_outbox \\('payment.capture.<id>'\\)/\" docs/superpowers/specs/2026-08-20-tripwith-phase-1-design.md)"
+      "Bash(perl -pi -e \"s/INSERT job_outbox \\\\\\('payment\\\\.capture:<id>'\\\\\\)/INSERT job_outbox \\('payment.capture.<id>'\\)/\" docs/superpowers/specs/2026-08-20-tripwith-phase-1-design.md)",
+      "Bash(perl -0pi -e \"s/    QueueModule,\\\\n    OutboxModule,/    QueueModule,\\\\n\\\\n    \\\\/\\\\/ Enqueue-only in the HTTP deployable: domain code writes job_outbox rows\\\\n    \\\\/\\\\/ inside its transactions, but the polling relay runs exclusively in the\\\\n    \\\\/\\\\/ worker process \\(see worker.module.ts\\). Running it here would put\\\\n    \\\\/\\\\/ background polling on the request event loop and would add another\\\\n    \\\\/\\\\/ poller for every autoscaled web replica.\\\\n    OutboxModule.forRoot\\({ runRelay: false }\\),/\" src/app.module.ts)",
+      "Bash(perl -0pi -e \"s/import \\\\{ WORKER_DEFINITION, type WorkerDefinition \\\\} from '.\\\\/queue\\\\/worker-definition';/import {\\\\n  WORKER_DEFINITION,\\\\n  defineWorker,\\\\n  type WorkerDefinition,\\\\n} from '.\\\\/queue\\\\/worker-definition';/\" src/worker.module.ts)",
+      "Bash(perl -0pi -e \"s/      \\\\\\): WorkerDefinition\\\\[\\\\] => \\\\[\\\\n        \\\\{\\\\n          name: INFRA_ECHO_TOPIC,\\\\n          processor: createInfraEchoProcessor\\\\\\(dataSource, acknowledger, effects\\\\\\),\\\\n        \\\\},\\\\n      \\\\],/      \\): WorkerDefinition[] => [\\\\n        defineWorker\\({\\\\n          name: INFRA_ECHO_TOPIC,\\\\n          processor: createInfraEchoProcessor\\(dataSource, acknowledger, effects\\),\\\\n        }\\),\\\\n      ],/\" src/worker.module.ts)",
+      "Bash(grep -iE \"no worker definitions|worker started: queue\" /tmp/worker.log | head -3 *)",
+      "Read(//private/tmp/**)",
+      "Bash(python3 -)",
+      "Bash(TEST_DB_NAME=tripwith TEST_DB_PORT=55432 TEST_DB_USER=postgres TEST_DB_HOST=localhost REDIS_QUEUE_URL=redis://localhost:6399 REDIS_CACHE_URL=redis://localhost:6398 npx jest --config jest.config.js --runInBand src/outbox/outbox-runner.int-spec.ts)",
+      "Bash(cp src/worker.module.ts /tmp/wm.bak)",
+      "Bash(perl -0pi -e \"s/^    WorkerHost,\\\\n/    \\\\/\\\\/ TAMPER\\\\n/m\" src/worker.module.ts)",
+      "Bash(cp /tmp/wm.bak src/worker.module.ts)",
+      "Bash(rm -f /tmp/wm.bak)"
     ],
     "additionalDirectories": [
       "/tmp",

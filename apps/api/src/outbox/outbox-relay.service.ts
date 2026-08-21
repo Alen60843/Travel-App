@@ -90,6 +90,10 @@ export class OutboxRelay implements OnModuleInit, OnModuleDestroy {
   start(): void {
     if (!this.stopped) return;
     this.stopped = false;
+    this.logger.log(
+      `outbox relay started: pollInterval=${this.config.outbox.pollIntervalMs}ms ` +
+        `batchSize=${this.config.outbox.batchSize} lease=${this.config.outbox.leaseMs}ms`,
+    );
     this.scheduleNext(0);
   }
 
@@ -101,6 +105,9 @@ export class OutboxRelay implements OnModuleInit, OnModuleDestroy {
    * because `stopped` is already true by the time it checks).
    */
   async onModuleDestroy(): Promise<void> {
+    if (this.stopped && this.timer === null && this.tickInFlight === null) return;
+
+    this.logger.log('outbox relay stopping: no new rows will be claimed');
     this.stopped = true;
     if (this.timer) {
       clearTimeout(this.timer);
@@ -109,23 +116,38 @@ export class OutboxRelay implements OnModuleInit, OnModuleDestroy {
     if (this.tickInFlight) {
       await this.tickInFlight;
     }
+    this.logger.log('outbox relay stopped');
   }
 
   private scheduleNext(delayMs: number): void {
     if (this.stopped) return;
     const timer = setTimeout(() => {
       this.tickInFlight = (async () => {
+        let published = 0;
         try {
-          await this.tick();
+          published = await this.tick();
         } catch (err) {
           this.logger.error(`outbox relay tick failed: ${(err as Error).message}`);
         } finally {
           this.tickInFlight = null;
-          this.scheduleNext(this.config.outbox.pollIntervalMs);
+          // Drain a backlog at full speed, idle politely when there is none.
+          //
+          // A full batch almost certainly means more rows are waiting, so
+          // sleeping the poll interval between batches would make a spike take
+          // (backlog / batchSize) * pollInterval to clear — minutes, for work
+          // the database could hand over immediately. Re-polling only when the
+          // last tick actually did something keeps that fast without turning
+          // an idle relay into a busy-loop against Postgres.
+          this.scheduleNext(published > 0 ? 0 : this.config.outbox.pollIntervalMs);
         }
       })();
     }, delayMs);
-    timer.unref?.();
+
+    // Deliberately NOT unref'd. In the worker deployable the relay may be the
+    // only thing holding the event loop open; an unref'd timer would let the
+    // process exit immediately at boot, and the resulting "worker starts and
+    // vanishes" is exactly the kind of failure that looks like a crash-loop
+    // with no error. Shutdown clears the timer explicitly above.
     this.timer = timer;
   }
 

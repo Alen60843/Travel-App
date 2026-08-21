@@ -64,7 +64,13 @@ export class ReadinessRegistryModule {}
     RedisModule,
 
     QueueModule,
-    OutboxModule,
+
+    // Enqueue-only in the HTTP deployable: domain code writes job_outbox rows
+    // inside its transactions, but the polling relay runs exclusively in the
+    // worker process (see worker.module.ts). Running it here would put
+    // background polling on the request event loop and would add another
+    // poller for every autoscaled web replica.
+    OutboxModule.forRoot({ runRelay: false }),
 
     // Fail-closed by default: RejectingSocketAuthenticator refuses every
     // connection until Phase 3 supplies a real Firebase authenticator via
