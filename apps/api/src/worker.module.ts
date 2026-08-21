@@ -17,6 +17,7 @@ import {
   type WorkerDefinition,
 } from './queue/worker-definition';
 import { RedisModule } from './redis/redis.module';
+import { WorkerShutdownCoordinator } from './worker-shutdown-coordinator.service';
 
 /**
  * Composition root for the **worker deployable**.
@@ -52,6 +53,7 @@ import { RedisModule } from './redis/redis.module';
     // providers from an imported module's exports to its importer, never the
     // reverse.
     WorkerHost,
+    WorkerShutdownCoordinator,
     {
       // The infrastructure proof-of-pipeline job. It has no business meaning:
       // it exists so the full path DB -> relay -> BullMQ -> worker -> ack is

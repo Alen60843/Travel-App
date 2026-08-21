@@ -1,6 +1,8 @@
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable } from '@nestjs/common';
 import { InjectDataSource } from '@nestjs/typeorm';
 import type { DataSource } from 'typeorm';
+import { withTimeout } from '../common/with-timeout';
+import { APP_CONFIG, type AppConfig } from '../config/configuration';
 
 /**
  * Contract owned by Agent C (health/readiness). Declared locally rather than
@@ -23,10 +25,34 @@ export interface ReadinessCheck {
 @Injectable()
 export class DatabaseReadinessCheck implements ReadinessCheck {
   readonly name = 'database';
+  private probeInFlight: Promise<{ healthy: boolean; detail?: string }> | null = null;
 
-  constructor(@InjectDataSource() private readonly dataSource: DataSource) {}
+  constructor(
+    @InjectDataSource() private readonly dataSource: DataSource,
+    @Inject(APP_CONFIG) private readonly config: AppConfig,
+  ) {}
 
-  async check(): Promise<{ healthy: boolean; detail?: string }> {
+  check(): Promise<{ healthy: boolean; detail?: string }> {
+    if (!this.probeInFlight) {
+      let probe: Promise<{ healthy: boolean; detail?: string }>;
+      probe = this.runProbe().finally(() => {
+        if (this.probeInFlight === probe) this.probeInFlight = null;
+      });
+      this.probeInFlight = probe;
+    }
+
+    const timeoutMs = this.config.app.dependencyCheckTimeoutMs;
+    return withTimeout(
+      this.probeInFlight,
+      timeoutMs,
+      `database readiness probe timed out after ${timeoutMs}ms`,
+    ).catch((error: unknown) => ({
+      healthy: false,
+      detail: `connection failed: ${describeError(error)}`,
+    }));
+  }
+
+  private async runProbe(): Promise<{ healthy: boolean; detail?: string }> {
     try {
       await this.dataSource.query('SELECT 1');
     } catch (error) {
@@ -34,9 +60,9 @@ export class DatabaseReadinessCheck implements ReadinessCheck {
     }
 
     try {
-      const rows: unknown[] = await this.dataSource.query(
+      const rows = (await this.dataSource.query(
         "SELECT 1 FROM pg_extension WHERE extname = 'postgis'",
-      );
+      )) as unknown[];
       if (rows.length === 0) {
         return { healthy: false, detail: 'postgis extension is not installed' };
       }

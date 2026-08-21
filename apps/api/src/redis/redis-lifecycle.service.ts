@@ -1,5 +1,6 @@
 import { Inject, Injectable, Logger, type OnModuleDestroy } from '@nestjs/common';
 import type { Redis } from 'ioredis';
+import { OperationTimeoutError, withTimeout } from '../common/with-timeout';
 import { CACHE_REDIS, QUEUE_REDIS } from './redis.tokens';
 
 /**
@@ -34,45 +35,51 @@ export class RedisLifecycleService implements OnModuleDestroy {
 
   async onModuleDestroy(): Promise<void> {
     await Promise.all([
-      this.closeGracefully(this.queueRedis, 'queue'),
-      this.closeGracefully(this.cacheRedis, 'cache'),
+      closeRedisGracefully(this.queueRedis, 'queue', 2_000, this.logger),
+      closeRedisGracefully(this.cacheRedis, 'cache', 2_000, this.logger),
     ]);
-  }
-
-  private async closeGracefully(redis: Redis, label: string): Promise<void> {
-    if (redis.status === 'end') return;
-
-    const reachedEnd = new Promise<void>((resolve) => {
-      if (redis.status === 'end') {
-        resolve();
-        return;
-      }
-      redis.once('end', () => resolve());
-    });
-
-    try {
-      await redis.quit();
-      await Promise.race([reachedEnd, sleep(2_000)]);
-      // Re-read into a widened local: TS's control-flow narrowing from the
-      // `=== 'end'` check at the top of this function incorrectly persists
-      // across the awaits above, even though `.status` is a live getter that
-      // has since changed. Without this, TS reports the comparison below as
-      // having no overlap — which is exactly backwards, since detecting that
-      // `quit()` did NOT reach 'end' is the whole point of this check.
-      const statusAfterQuit: string = redis.status;
-      if (statusAfterQuit !== 'end') {
-        this.logger.warn(`${label} redis did not reach 'end' within 2s of quit(); forcing disconnect`);
-        redis.disconnect();
-      }
-    } catch (err) {
-      this.logger.warn(
-        `graceful quit failed for ${label} redis, forcing disconnect: ${(err as Error).message}`,
-      );
-      redis.disconnect();
-    }
   }
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/**
+ * Closes one ioredis connection within a hard deadline.
+ *
+ * The timeout wraps `quit()` itself, not only the later socket `end` event.
+ * Otherwise an unavailable Redis with persistent reconnect enabled can block
+ * Nest's `onModuleDestroy` phase forever, before any later shutdown watchdog
+ * gets a chance to run.
+ */
+export async function closeRedisGracefully(
+  redis: Redis,
+  label: string,
+  timeoutMs: number,
+  logger: Pick<Logger, 'warn'> = new Logger(RedisLifecycleService.name),
+): Promise<void> {
+  if (redis.status === 'end') return;
+
+  const reachedEnd = new Promise<void>((resolve) => {
+    if (redis.status === 'end') {
+      resolve();
+      return;
+    }
+    redis.once('end', () => resolve());
+  });
+
+  try {
+    await withTimeout(
+      (async () => {
+        await redis.quit();
+        await reachedEnd;
+      })(),
+      timeoutMs,
+      `${label} Redis did not close within ${timeoutMs}ms`,
+    );
+  } catch (err) {
+    const reason = err instanceof OperationTimeoutError ? err.message : (err as Error).message;
+    logger.warn(`graceful quit failed for ${label} Redis, forcing disconnect: ${reason}`);
+    const statusAfterFailure: string = redis.status;
+    if (statusAfterFailure !== 'end') {
+      redis.disconnect();
+    }
+  }
 }

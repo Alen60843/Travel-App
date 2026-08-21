@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { Logger } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { loadConfig, type AppConfig } from '../config/configuration';
 import { createQueueRedisConnection } from '../redis/redis-connection.factory';
@@ -57,7 +58,8 @@ describe('OutboxRelay claim/re-drive/dead-letter semantics (integration)', () =>
 
   async function getRow(dedupeKey: string) {
     const rows = (await dataSource.query(
-      `SELECT attempts, publish_attempts, published_at, completed_at, failed_at, max_attempts
+      `SELECT attempts, publish_attempts, published_at, completed_at, failed_at, max_attempts,
+              available_at, last_error
        FROM job_outbox WHERE dedupe_key = $1`,
       [dedupeKey],
     )) as Array<{
@@ -67,6 +69,8 @@ describe('OutboxRelay claim/re-drive/dead-letter semantics (integration)', () =>
       completed_at: Date | null;
       failed_at: Date | null;
       max_attempts: number;
+      available_at: Date;
+      last_error: string | null;
     }>;
     return rows[0] ?? null;
   }
@@ -149,10 +153,13 @@ describe('OutboxRelay claim/re-drive/dead-letter semantics (integration)', () =>
     await registry.getQueue(topic).obliterate({ force: true });
 
     await sleep(200); // let the lease lapse
+    const warnSpy = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
     const secondPassClaimed = await relay.tick();
 
     expect(secondPassClaimed).toBe(1);
     expect(metrics.snapshot().redrive).toBe(1);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('outbox redrive'));
+    warnSpy.mockRestore();
 
     const row = await getRow(dedupeKey);
     expect(row?.attempts).toBe(2);
@@ -162,6 +169,46 @@ describe('OutboxRelay claim/re-drive/dead-letter semantics (integration)', () =>
 
     const job = await registry.getQueue(topic).getJob(dedupeKey);
     expect(job).toBeDefined(); // a fresh job was created with the same id
+  });
+
+  it('persists publish failures, schedules bounded backoff, logs the retry, and clears the error after recovery', async () => {
+    const topic = uniqueTopic('publish-retry');
+    const dedupeKey = `${topic}.${randomUUID()}`;
+    await insertRow({ topic, dedupeKey });
+
+    const metrics = new OutboxMetrics();
+    const relay = makeRelay(withLease(100), metrics);
+    const errorSpy = jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    const warnSpy = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const addSpy = jest
+      .spyOn(registry, 'addJob')
+      .mockRejectedValueOnce(new Error('simulated queue Redis outage'));
+
+    try {
+      await relay.tick();
+
+      const failed = await getRow(dedupeKey);
+      expect(failed?.last_error).toContain('simulated queue Redis outage');
+      expect(failed?.available_at.getTime()).toBeGreaterThan(Date.now() - 50);
+      expect(metrics.snapshot().publishFailure).toBe(1);
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('retryIn=100ms'));
+
+      // Backoff and the publication lease both prevent an immediate retry.
+      await expect(relay.tick()).resolves.toBe(0);
+
+      await sleep(200);
+      await expect(relay.tick()).resolves.toBe(1);
+
+      const recovered = await getRow(dedupeKey);
+      expect(recovered?.last_error).toBeNull();
+      expect(recovered?.publish_attempts).toBe(2);
+      expect(metrics.snapshot().redrive).toBe(1);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('outbox redrive'));
+    } finally {
+      addSpy.mockRestore();
+      errorSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
   });
 
   it('dead-letters a row once attempts would exceed max_attempts, without publishing again', async () => {
@@ -249,5 +296,19 @@ describe('OutboxRelay claim/re-drive/dead-letter semantics (integration)', () =>
     const counts = await queue.getJobCounts('waiting', 'active', 'completed', 'delayed');
     const totalJobs = Object.values(counts).reduce((sum, n) => sum + (n ?? 0), 0);
     expect(totalJobs).toBe(rowCount); // no duplicate BullMQ jobs either
+  });
+
+  it('coalesces overlapping tick calls within one relay process', async () => {
+    const topic = uniqueTopic('same-process-overlap');
+    const dedupeKey = `${topic}.${randomUUID()}`;
+    await insertRow({ topic, dedupeKey });
+
+    const relay = makeRelay(withLease(60_000));
+    const first = relay.tick();
+    const overlapping = relay.tick();
+
+    expect(overlapping).toBe(first);
+    await expect(first).resolves.toBe(1);
+    expect((await getRow(dedupeKey))?.attempts).toBe(1);
   });
 });

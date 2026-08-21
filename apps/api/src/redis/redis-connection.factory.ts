@@ -27,12 +27,26 @@ const commonOptions: RedisOptions = {
 export function createQueueRedisConnection(config: AppConfig): Redis {
   return new Redis(config.redisQueue.url, {
     ...commonOptions,
-    // BullMQ REQUIRES this. It issues blocking commands internally (e.g. the
-    // Lua-scripted equivalents of BZPOPMIN) that legitimately block for a
-    // long time waiting for work; ioredis's per-command retry counter would
-    // otherwise abort those waits with a spurious "reached the max retries
-    // per request" error. This is not a tuning choice — BullMQ's own docs
-    // mandate it and refuse connections that don't set it.
+    // This connection is used by Queue producers and readiness checks, not by
+    // BullMQ Worker blocking commands. Producer calls must fail in bounded
+    // time during an outage so the PostgreSQL outbox can schedule a retry and
+    // readiness can return 503 instead of hanging forever.
+    maxRetriesPerRequest: 1,
+  });
+}
+
+/**
+ * Creates the dedicated connection used only by BullMQ Workers.
+ *
+ * Workers legitimately issue blocking Redis commands and BullMQ requires
+ * `maxRetriesPerRequest: null` for that role. Keeping this separate from the
+ * producer/readiness connection is what gives each side the correct failure
+ * behavior: persistent reconnect for consumers, bounded failure for calls.
+ * The WorkerHost owns and closes this connection.
+ */
+export function createWorkerRedisConnection(config: AppConfig): Redis {
+  return new Redis(config.redisQueue.url, {
+    ...commonOptions,
     maxRetriesPerRequest: null,
   });
 }

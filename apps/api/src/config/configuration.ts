@@ -30,6 +30,7 @@ export const configSchema = z.object({
   API_PREFIX: z.string().default('api'),
   API_DEFAULT_VERSION: z.string().regex(/^\d+$/).default('1'),
   SHUTDOWN_TIMEOUT_MS: durationMsSchema.default(15_000),
+  DEPENDENCY_CHECK_TIMEOUT_MS: durationMsSchema.default(2_000),
   BODY_LIMIT: z.string().default('1mb'),
 
   // ---- PostgreSQL -------------------------------------------------------
@@ -91,6 +92,7 @@ export interface AppConfig {
     readonly apiPrefix: string;
     readonly defaultVersion: string;
     readonly shutdownTimeoutMs: number;
+    readonly dependencyCheckTimeoutMs: number;
     readonly bodyLimit: string;
   };
   readonly database: {
@@ -164,6 +166,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       apiPrefix: c.API_PREFIX,
       defaultVersion: c.API_DEFAULT_VERSION,
       shutdownTimeoutMs: c.SHUTDOWN_TIMEOUT_MS,
+      dependencyCheckTimeoutMs: c.DEPENDENCY_CHECK_TIMEOUT_MS,
       bodyLimit: c.BODY_LIMIT,
     }),
     database: Object.freeze({

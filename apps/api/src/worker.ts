@@ -38,11 +38,9 @@ async function bootstrap(): Promise<void> {
   const logger = app.get(LOGGER);
   app.useLogger(logger);
 
-  // Wires SIGTERM/SIGINT to app.close(). Ordering matters and Nest guarantees
-  // it: every onModuleDestroy runs before any onApplicationShutdown, so the
-  // relay stops claiming new rows (OutboxRelay.onModuleDestroy) before the
-  // workers drain (WorkerHost.onApplicationShutdown). Draining while still
-  // claiming would never converge.
+  // Wires SIGTERM/SIGINT to app.close(). WorkerShutdownCoordinator lives in
+  // the root module, so Nest destroys it before imported resource modules: it
+  // stops relay claims, drains workers, and only then allows DB/Redis teardown.
   app.enableShutdownHooks();
 
   logger.log(

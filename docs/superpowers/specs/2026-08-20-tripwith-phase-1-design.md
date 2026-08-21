@@ -1,8 +1,8 @@
-# TripWith — Phase 1: Architecture and Database
+# TripWith — Phase 1 Architecture and Database + Phase 2 Foundation Addendum
 
 **Date:** 2026-08-20 (revised after Phase 1 correction pass)
-**Status:** Implemented and verified against PostgreSQL 17.11 / PostGIS 3.6.4
-**Scope:** Architecture, complete relational model, initial migration. No controllers, no frontend, no payment-provider implementation.
+**Status:** Phase 1 and Phase 2 Backend Foundation implemented and verified; Phase 3 approved to begin but not started
+**Scope:** Architecture, complete relational model, initial migration, and the Phase 2 backend/infrastructure foundation. No frontend and no payment-provider business implementation.
 
 ---
 
@@ -40,9 +40,9 @@ flowchart TB
     subgraph api["NestJS API (stateless, horizontally scaled)"]
         HTTP["HTTP modules"]
         GW["Socket.IO gateway"]
-        Rel["Outbox relay"]
     end
     subgraph workers["BullMQ workers (separate deployable)"]
+        Rel["Continuous outbox relay"]
         W["Lifecycle · payments · notifications · enrichment · retention"]
     end
     subgraph data["Stateful"]
@@ -163,13 +163,15 @@ Every transition, and what makes it recoverable.
 | Approval commits, capture job never published | `APPROVED`, seat held, outbox row unpublished | `job_outbox_undelivered_idx` | relay publishes on next pass |
 | Capture published, Redis loses it | outbox row published, **not acknowledged** | same index (lease lapsed) | re-published with the same `dedupe_key` |
 | Capture in flight, worker crashes | `capture_requested_at` set, status still `AUTHORIZED` | `payments_unconfirmed_capture_idx` | `getPaymentStatus` → adopt `CAPTURED` or retry; provider idempotency key makes retry safe |
-| Capture **permanently** fails | `APPROVED` request, seat held, funds not taken | outbox `failed_at` (operator queue) | compensate: cancel the participant (trigger frees the seat), set payment `FAILED`, notify both parties |
+| Capture **permanently** fails | `APPROVED` request, seat held, funds not taken | outbox `failed_at` (operator queue) | compensate: cancel the participant (trigger frees the seat), set payment `FAILED`, transition the request `APPROVED → PAYMENT_FAILED`, notify both parties |
 | Duplicate webhook | — | `UNIQUE (provider, provider_event_id)` | insert-first `ON CONFLICT DO NOTHING`; zero rows ⇒ already processed |
 | Approval attempted with unauthorized payment | rejected outright | `tw_guard_join_approval` trigger | seat is never consumed in the first place |
 
 The last row is a schema change made during this pass: a database trigger now refuses to move a join request to `APPROVED` for an event with `deposit_minor > 0` unless the linked payment is `AUTHORIZED` or `CAPTURED`. It spans three tables so a CHECK cannot express it, and it belongs in the database because "seat granted without secured funds" only manifests under partial failure — precisely when service code is least trustworthy.
 
 **Why no `PAYMENT_PENDING` reservation state was added.** It was considered and rejected as redundant. `payments.status = 'INITIATED'` already means "intent recorded, provider outcome unknown", and the approval trigger already prevents a seat being consumed before funds are secured. Adding a parallel reservation state would create a second source of truth for the same fact. The one genuinely missing distinction — *"capture asked for, outcome unknown"* versus *"authorized, host has not decided"* — is now carried by the single nullable column `capture_requested_at`.
+
+**Paid-join retry correction.** `PAYMENT_FAILED` is a terminal `join_request_status` distinct from traveller cancellation. The compensation path transitions the original request `APPROVED → PAYMENT_FAILED`, marks its participant row `attendance_status = 'CANCELLED'` with `cancelled_at`, and preserves both rows as audit history. Because `event_join_requests_active_uk` covers only `PENDING`/`APPROVED` requests and `event_participants_active_uk` covers only rows whose `cancelled_at IS NULL`, the traveller may create a new request and participation for the same event without weakening the one-live-request/one-active-participation rules. The migration permits this transition and the invariant suite exercises it; there is no separate general-purpose join-request transition trigger.
 
 ### 4.3 Mutual match
 
@@ -569,15 +571,15 @@ Conventions: UUID PKs (`BIGINT` identity only for append-only high-volume logs);
 **`event_status_history`** — append-only audit: `from_status`, `to_status`, `actor_user_id` (NULL = system job), `reason`. Written by trigger, so an untracked transition is impossible. `tw_forbid_mutation` blocks UPDATE/DELETE. Index `(event_id, created_at DESC)`.
 
 **`event_join_requests`**
-*Columns:* `status`, `payment_id` (unique — one request per payment), `message`, `requested_at`, `expires_at`, decision timestamps, `decided_by_user_id`.
-*Constraints:* `expires_at > requested_at`; message ≤ 500; status/timestamp pairing for each terminal state.
-*Indexes:* **partial unique `(event_id, user_id) WHERE status IN ('PENDING','APPROVED')`** — one live request, while rejected/expired rows persist for audit and permit re-requesting; `(event_id, status)`; `(user_id, created_at DESC)`; `expires_at WHERE PENDING` for the 24h job.
+*Columns:* `status` (`PENDING`, `APPROVED`, `REJECTED`, `EXPIRED`, `CANCELLED`, `PAYMENT_FAILED`), `payment_id` (unique — one request per payment), `message`, `requested_at`, `expires_at`, decision timestamps, `decided_by_user_id`.
+*Constraints:* `expires_at > requested_at`; message ≤ 500; the corresponding timestamp is required for `APPROVED`, `REJECTED`, `CANCELLED`, and `EXPIRED`. `PAYMENT_FAILED` records the compensated `APPROVED → PAYMENT_FAILED` outcome while retaining the original `approved_at`; the schema has no separate payment-failure timestamp.
+*Indexes:* **`event_join_requests_active_uk UNIQUE (event_id, user_id) WHERE status IN ('PENDING','APPROVED')`** — one live request, while rejected/expired/cancelled/payment-failed rows persist for audit and permit re-requesting; `(event_id, status)`; `(user_id, created_at DESC)`; `expires_at WHERE PENDING` for the 24h job.
 *Triggers:* `tw_guard_join_approval` — refuses `APPROVED` for a paid event unless the linked payment is `AUTHORIZED`/`CAPTURED`.
 
 **`event_participants`**
 *Columns:* `join_request_id` (unique), `payment_id`, `is_host`, `joined_at`, `attendance_status`, `checked_in_at`, `cancelled_at`.
-*Constraints:* **`UNIQUE (event_id, user_id)`**; cancellation/timestamp pairing.
-*Indexes:* `(user_id, joined_at DESC)`; `(event_id) WHERE NOT cancelled`.
+*Constraints:* `UNIQUE (join_request_id)`; cancellation/timestamp pairing.
+*Indexes:* **`event_participants_active_uk UNIQUE (event_id, user_id) WHERE cancelled_at IS NULL`** — at most one active participation while cancelled attempts remain as audit history and do not bar a legitimate retry; `(user_id, joined_at DESC)`; `(event_id) WHERE cancelled_at IS NULL`.
 *Trigger:* `tw_sync_participant_count` — the mechanism that resolves the last-slot race (§12).
 
 ### 11.6 Payments
@@ -737,11 +739,11 @@ Against a live PostgreSQL 17.11 / PostGIS 3.6.4 instance, on the final migration
 
 ```
 migration up/down/up   clean (only PostGIS spatial_ref_sys survives down, by design)
-invariant suite        89 passed, 0 failed
+invariant suite        100 passed, 0 failed
 concurrency race       24 joiners, capacity 5 -> exactly 5 committed, 19 rejected
                        by events_capacity_not_exceeded_chk, counter consistent
 TS unit + PG parity    18 passed, 0 failed (7 cases compared against live SQL)
-enum parity            23 ENUM types, 88 values, 0 drift
+enum parity            23 ENUM types, 89 values, 0 drift
 schema objects         35 app tables, 134 indexes, 95 CHECK, 67 FK, 28 triggers,
                        23 ENUM types, 3 GIST indexes, 11 trigger functions
 ```
@@ -766,7 +768,7 @@ trust: projection identical to full ledger replay     ✓
 | Question | Answer | Verified by |
 |---|---|---|
 | Prevent duplicate matches? | Canonical `CHECK (a < b)` + `UNIQUE (a,b)` | reversed-pair test |
-| Prevent duplicate participation? | `UNIQUE (event_id, user_id)` | duplicate insert test |
+| Prevent duplicate active participation while allowing a retry after cancellation? | `event_participants_active_uk UNIQUE (event_id, user_id) WHERE cancelled_at IS NULL` | second active insert rejected; cancelled-attempt retry and audit-history tests |
 | Concurrent final slot? | Trigger `UPDATE` serialises on the event row; `CHECK` rejects the loser | 24-way race, exactly 5 winners |
 | Trust auditable? | Append-only ledger; trigger-only projection | UPDATE/DELETE rejected |
 | Payments idempotent? | `UNIQUE (provider, provider_event_id)` + insert-first | replay inserts 0 rows |
@@ -792,7 +794,7 @@ trust: projection identical to full ledger replay     ✓
 3. **`interest_ids` denormalisation** is a second copy of `user_interests`. Trigger-maintained and tested, but a bulk operation bypassing row triggers would drift it. Reconciliation job needed in Phase 4.
 4. **Matching `N` uncalibrated.** The proof and recall guard are complete; the numbers need Phase 4's scoring implementation.
 5. **`payment_events.payload`** stores raw webhooks — justified as dispute evidence, but may contain personal data and needs a retention policy in Phase 10.
-6. **Outbox relay is not yet implemented.** The schema and semantics are specified and tested; the relay process itself is Phase 2/10 work. Until it exists, nothing publishes outbox rows.
+6. **Resolved in Phase 2 — outbox relay operations.** The dedicated worker deployable now runs the relay continuously, publishes with deterministic BullMQ job IDs, re-drives expired leases, records retry diagnostics/backoff, and shuts down without claiming new work. Payment-provider business logic remains deferred.
 7. **Scale is uncharacterised.** No sharding or read replicas are modelled. The only measured figures are the §13 single-query latencies — 0.276 ms for the matching predicate, 0.073 ms for Explorer — taken single-connection, warm-cache, with parallelism disabled. **These are latency measurements, not throughput results.** No concurrent-load or QPS benchmark has been run, so this document makes no claim about supported user counts. Capacity planning requires a mixed read/write workload benchmark at target concurrency, which is Phase 13 work.
 8. **PostGIS/PG major version is pinned** in `infra/docker-compose.yml`; benchmarks are version-specific and must be re-run on upgrade.
 
@@ -811,7 +813,7 @@ apps/api/src/database/migrations/1787184000000-InitialSchema.ts            TypeO
 apps/api/src/database/migrations/sql/1787184000000-InitialSchema.up.sql    canonical schema
 apps/api/src/database/migrations/sql/1787184000000-InitialSchema.down.sql  reversal
 apps/api/src/database/data-source.ts                                       env-only config
-apps/api/src/database/scripts/verify-invariants.sql                        89 assertions
+apps/api/src/database/scripts/verify-invariants.sql                        100 assertions
 apps/api/src/database/scripts/verify-concurrency.sh                        capacity race
 apps/api/src/database/scripts/seed-benchmark-data.sql                      benchmark fixture
 apps/api/src/database/scripts/benchmark-indexes.sql                        index comparison
@@ -822,4 +824,73 @@ scripts/check-enum-parity.mjs                                              drift
 infra/docker-compose.yml                                                   pinned PG/PostGIS + Redis
 ```
 
-**Phase 1 ends here.** Phase 2 does not begin without explicit instruction.
+**Phase 1 ends here.** The text above records the Phase 1 gate; the implemented Phase 2 foundation is recorded in the addendum below.
+
+---
+
+## 19. Phase 2 Backend Foundation addendum
+
+**Completed:** 2026-08-21
+
+**Approval state:** Phase 2 fully closed; Phase 3 approved to begin, but not started in this synchronization step.
+
+Phase 2 implements the approved foundation without adding PaymentProvider business behavior:
+
+- TypeORM entities mapped against the hand-written PostgreSQL/PostGIS schema, with live mapping and round-trip parity tests.
+- Validated NestJS configuration, structured logging, security middleware, liveness/readiness endpoints, and bounded dependency probes.
+- Independent Redis queue and cache clients. Queue producers/readiness use bounded command retries; BullMQ consumers own a dedicated persistent-retry connection.
+- BullMQ queue registry with mandatory deterministic job IDs and a dedicated worker deployable.
+- Transactional outbox enqueue, atomic `FOR UPDATE SKIP LOCKED` claiming, at-least-once publication, lease-based redrive, bounded retry backoff/diagnostics, dead-lettering, idempotent acknowledgement, and continuous polling.
+- Socket.IO infrastructure with Redis-backed fan-out and fail-closed authentication defaults.
+- Ordered graceful shutdown: stop relay claims, settle the in-flight relay pass within the shutdown budget, drain/cancel workers within their budget, then close Redis and PostgreSQL resources.
+
+### Operational outbox path
+
+The production worker entrypoint is `apps/api/src/worker.ts`, booting `WorkerModule`. `OutboxRelay.onModuleInit()` starts a non-overlapping timer loop using `OUTBOX_POLL_INTERVAL_MS`; an empty pass sleeps, while a productive pass immediately drains the next batch. Multiple processes remain safe because the database claim is atomic and uses `FOR UPDATE SKIP LOCKED`.
+
+The automatic integration proof boots that same module and never calls `tick()`:
+
+```text
+committed PostgreSQL job_outbox intent
+  -> running relay timer
+  -> BullMQ infra.echo queue
+  -> WorkerHost consumer
+  -> PostgreSQL completed_at acknowledgement
+```
+
+### Final code-review findings
+
+1. **Finding (High):** BullMQ workers and producers shared `maxRetriesPerRequest=null`. **Impact:** Redis loss could hang relay publication and readiness indefinitely. **Fix:** split dedicated worker Redis from bounded producer/readiness Redis and add explicit dependency deadlines. **Verification:** Redis loss/recovery and timeout integration tests; automatic relay retry test.
+2. **Finding (High):** worker shutdown ran after imported Redis teardown, and BullMQ close escalation reused a cached promise. **Impact:** graceful shutdown could leak the blocking Redis socket and never finish. **Fix:** root shutdown coordinator plus pause-intake, blocking-fetch interruption, bounded drain/cancellation, and a single close call. **Verification:** application-context shutdown ordering, forced-timeout worker test with open-handle detection, and real SIGINT worker boot.
+3. **Finding (Medium, correctness):** the 24-way race script ignored cleanup/worker failures and could pass stale fixtures. **Impact:** a false-green capacity invariant gate. **Fix:** fail-fast execution, transactionally scoped trigger disable/restore, complete per-worker result capture, exact rejection assertions, and reliable fixture cleanup. **Verification:** two consecutive clean 24-way runs each produced exactly 5 commits and 19 capacity-check rejections.
+4. **Finding (Medium, reliability):** publish failures/redrives lacked durable diagnostics/backoff, and repeated hung database probes could accumulate. **Impact:** noisy retries, weak operability, and possible pool pressure during a network stall. **Fix:** persist truncated `last_error` plus bounded exponential retry availability, log retry/redrive details, coalesce database probes, and bound caller wait time. **Verification:** relay failure/recovery tests and the coalesced hung-probe test.
+
+No Critical findings remained. The security dependency audit reported no known production dependency vulnerabilities; no credential or payload logging issue was found.
+
+### Final verification snapshot
+
+```text
+strict workspace TypeScript         PASS (API + shared)
+Nest build                           PASS
+API boot + /health/live              PASS (HTTP 200)
+API /health/ready                    PASS (HTTP 200; database + Redis healthy)
+dependency loss/recovery             PASS
+API and worker graceful SIGINT       PASS
+API Jest                             29 suites, 165 tests passed, 0 failed
+shared TS + live PostgreSQL parity   18 passed, 0 failed (7 live SQL cases)
+enum parity                          23 ENUM types, 89 values, 0 drift
+Phase 1 invariant suite              100 passed, 0 failed
+24-way concurrency race              5 committed, 19 rejected, 0 overbooked
+migration up -> down -> up            PASS (37 -> 2 infrastructure -> 37 tables)
+automatic outbox worker process      PASS (published + acknowledged once)
+production dependency audit          PASS (no known vulnerabilities)
+```
+
+### Remaining non-blocking risks
+
+- `closeWorkerGracefully` uses a narrow adapter to BullMQ's private blocking connection because BullMQ exposes no public per-worker interrupt that is both intake-safe and escalation-safe. The lockfile pins the tested BullMQ implementation and integration coverage will flag upgrade drift.
+- The infra-only `infra.echo` processor proves delivery and acknowledgement; it is not business logic. Future business consumers must apply their side effect and acknowledgement in one PostgreSQL transaction and remain idempotent under concurrent redelivery.
+- The Jest/Node toolchain reports non-failing deprecation/module-format warnings (`ts-jest` isolatedModules configuration and the shared package's implicit ESM parsing). These are cosmetic/tooling follow-ups, not runtime defects.
+- The Phase 1 product risks above (deposit legal characterisation, calibration, retention and scale/load characterization) remain open in their assigned later phases.
+
+**Phase 2 Backend Foundation ends here and is fully closed. Phase 3 is approved to begin in a subsequent step; no Phase 3 work is included here.**

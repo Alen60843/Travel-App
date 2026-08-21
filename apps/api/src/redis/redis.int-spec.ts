@@ -1,7 +1,11 @@
 import Redis from 'ioredis';
 import { loadConfig } from '../config/configuration';
 import { CacheService } from './cache.service';
-import { createCacheRedisConnection, createQueueRedisConnection } from './redis-connection.factory';
+import {
+  createCacheRedisConnection,
+  createQueueRedisConnection,
+  createWorkerRedisConnection,
+} from './redis-connection.factory';
 import { RedisLifecycleService } from './redis-lifecycle.service';
 import { RedisReadinessCheck } from './redis-readiness.check';
 
@@ -43,8 +47,15 @@ describe('redis infrastructure (integration)', () => {
     expect(cacheRedis).not.toBe(queueRedis);
   });
 
-  it('sets maxRetriesPerRequest=null on the queue connection (hard BullMQ requirement)', () => {
-    expect(queueRedis.options.maxRetriesPerRequest).toBeNull();
+  it('bounds producer retries so queue publishing and readiness fail promptly', () => {
+    expect(queueRedis.options.maxRetriesPerRequest).toBe(1);
+  });
+
+  it('uses maxRetriesPerRequest=null only on the dedicated BullMQ worker connection', async () => {
+    const workerRedis = createWorkerRedisConnection(config);
+    expect(workerRedis.options.maxRetriesPerRequest).toBeNull();
+    expect(await workerRedis.ping()).toBe('PONG');
+    await workerRedis.quit();
   });
 
   it('bounds retries on the cache connection (best-effort, must not hang forever)', () => {
@@ -53,13 +64,13 @@ describe('redis infrastructure (integration)', () => {
 
   describe('RedisReadinessCheck', () => {
     it('reports healthy when both connections are reachable', async () => {
-      const check = new RedisReadinessCheck(queueRedis, cacheRedis);
+      const check = new RedisReadinessCheck(queueRedis, cacheRedis, config);
       await expect(check.check()).resolves.toEqual({ healthy: true });
     });
 
     it('reports which side failed when one connection is down', async () => {
       const deadCache = createUnreachableRedis();
-      const check = new RedisReadinessCheck(queueRedis, deadCache);
+      const check = new RedisReadinessCheck(queueRedis, deadCache, config);
 
       const result = await check.check();
 
@@ -73,7 +84,7 @@ describe('redis infrastructure (integration)', () => {
     it('reports both sides when both connections are down', async () => {
       const deadQueue = createUnreachableRedis();
       const deadCache = createUnreachableRedis();
-      const check = new RedisReadinessCheck(deadQueue, deadCache);
+      const check = new RedisReadinessCheck(deadQueue, deadCache, config);
 
       const result = await check.check();
 
@@ -82,6 +93,45 @@ describe('redis infrastructure (integration)', () => {
       expect(result.detail).toContain('cache');
       deadQueue.disconnect();
       deadCache.disconnect();
+    });
+
+    it('returns unhealthy within the configured deadline even if a client promise never settles', async () => {
+      const hangingQueue = {
+        ping: () => new Promise<string>(() => undefined),
+      } as Redis;
+      const fastConfig = {
+        ...config,
+        app: { ...config.app, dependencyCheckTimeoutMs: 50 },
+      };
+      const check = new RedisReadinessCheck(hangingQueue, cacheRedis, fastConfig);
+
+      const startedAt = Date.now();
+      const result = await check.check();
+
+      expect(result.healthy).toBe(false);
+      expect(result.detail).toContain('queue Redis ping timed out');
+      expect(Date.now() - startedAt).toBeLessThan(1_000);
+    });
+
+    it('detects a real connection loss and reports healthy again after reconnect', async () => {
+      const q = createQueueRedisConnection(config);
+      const c = createCacheRedisConnection(config);
+      const check = new RedisReadinessCheck(q, c, config);
+
+      try {
+        await expect(check.check()).resolves.toEqual({ healthy: true });
+
+        q.disconnect();
+        const lost = await check.check();
+        expect(lost.healthy).toBe(false);
+        expect(lost.detail).toContain('queue');
+
+        await q.connect();
+        await expect(check.check()).resolves.toEqual({ healthy: true });
+      } finally {
+        if (q.status !== 'end') await q.quit();
+        if (c.status !== 'end') await c.quit();
+      }
     });
   });
 

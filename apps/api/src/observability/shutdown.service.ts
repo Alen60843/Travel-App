@@ -15,12 +15,11 @@ import { LOGGER } from './tokens';
  * `onApplicationShutdown` hooks so other agents' modules (DB pool, Redis,
  * queue workers) can release their own resources.
  *
- * `beforeApplicationShutdown` fires right as that sequence starts (server +
- * resources still closing) — the right moment to log "shutdown starting" and
- * arm a watchdog. `onApplicationShutdown` fires once everything has finished
- * closing — the right moment to log completion and disarm the watchdog. If
- * draining takes longer than `shutdownTimeoutMs`, we force-exit rather than
- * hang forever on a stuck connection or a wedged downstream dependency.
+ * `beforeApplicationShutdown` fires after `onModuleDestroy` hooks and before
+ * transport disposal / `onApplicationShutdown`. Every module-destroy hook in
+ * this codebase therefore has its own bounded close; this watchdog covers the
+ * remaining transport/application-shutdown phases. `onApplicationShutdown`
+ * logs completion and disarms it.
  *
  * Deliberately NOT a second `process.on('SIGTERM', ...)` handler: Nest's
  * `enableShutdownHooks()` already owns that signal, and installing a second,

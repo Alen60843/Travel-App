@@ -1,7 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import type { Job } from 'bullmq';
 import { loadConfig } from '../config/configuration';
-import { createQueueRedisConnection } from '../redis/redis-connection.factory';
+import {
+  createQueueRedisConnection,
+  createWorkerRedisConnection,
+} from '../redis/redis-connection.factory';
+import { closeRedisGracefully } from '../redis/redis-lifecycle.service';
 import { QueueRegistry } from './queue-registry.service';
 import { closeWorkerGracefully, createWorker } from './worker.factory';
 
@@ -74,7 +78,8 @@ describe('queue infrastructure (integration)', () => {
     const jobId = `agentb.test.worker.${randomUUID()}`;
     let processedPayload: { n: number } | null = null;
 
-    const worker = createWorker<{ n: number }>(connection, config, {
+    const workerConnection = createWorkerRedisConnection(config);
+    const worker = createWorker<{ n: number }>(workerConnection, config, {
       name: queueName,
       processor: async (job: Job<{ n: number }>) => {
         processedPayload = job.data;
@@ -95,19 +100,27 @@ describe('queue infrastructure (integration)', () => {
       expect(processedPayload).toEqual({ n: 7 });
     } finally {
       await closeWorkerGracefully(worker, 5_000);
+      await closeRedisGracefully(workerConnection, 'test worker', 2_000);
     }
   }, 20_000);
 
   it('closeWorkerGracefully resolves promptly even under a tight timeout, without throwing', async () => {
     const queueName = testQueueName('shutdown-timeout');
-    const worker = createWorker<{ n: number }>(connection, config, {
+    const workerConnection = createWorkerRedisConnection(config);
+    let signalStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      signalStarted = resolve;
+    });
+    const worker = createWorker<{ n: number }>(workerConnection, config, {
       name: queueName,
       processor: async () => {
+        signalStarted();
         await new Promise((resolve) => setTimeout(resolve, 300));
       },
     });
     await worker.waitUntilReady();
     await registry.addJob(queueName, 'noop', { n: 1 }, `agentb.test.shutdown.${randomUUID()}`);
+    await started;
 
     // Deliberately shorter than the job's own processing time — proves the
     // shutdown budget is respected instead of blocking indefinitely on the
@@ -115,14 +128,6 @@ describe('queue infrastructure (integration)', () => {
     const start = Date.now();
     await closeWorkerGracefully(worker, 50);
     expect(Date.now() - start).toBeLessThan(2_000);
-
-    // closeWorkerGracefully deliberately does not await the backgrounded
-    // close once its timeout wins (see its own doc comment) — that's the
-    // correct behaviour for a real shutdown path. But a TEST must not leave
-    // that background operation still in flight when the file's afterAll
-    // starts tearing down the shared connection out from under it, so drain
-    // it here. worker.close() is idempotent (returns the same in-flight
-    // promise), so this just waits for the SAME close this test triggered.
-    await worker.close();
+    await closeRedisGracefully(workerConnection, 'timeout test worker', 2_000);
   }, 10_000);
 });

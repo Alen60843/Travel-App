@@ -2,8 +2,11 @@ import { randomUUID } from 'node:crypto';
 
 import { NestFactory } from '@nestjs/core';
 import type { INestApplicationContext } from '@nestjs/common';
+import type Redis from 'ioredis';
 import { DataSource } from 'typeorm';
 
+import { WorkerHost } from '../queue/worker-host.service';
+import { QUEUE_REDIS } from '../redis/redis.tokens';
 import { WorkerModule } from '../worker.module';
 
 /**
@@ -79,7 +82,11 @@ describe('outbox relay runner (operational, no manual tick)', () => {
     await dataSource.transaction(async (manager) => {
       await manager.query(
         `INSERT INTO job_outbox (topic, payload, dedupe_key) VALUES ($1, $2::jsonb, $3)`,
-        ['infra.echo', JSON.stringify({ probe: 'runner' }), dedupeKey],
+        [
+          'infra.echo',
+          JSON.stringify({ message: 'runner', effectKey: `runner.${dedupeKey}` }),
+          dedupeKey,
+        ],
       );
     });
 
@@ -98,7 +105,11 @@ describe('outbox relay runner (operational, no manual tick)', () => {
       for (const key of keys) {
         await manager.query(
           `INSERT INTO job_outbox (topic, payload, dedupe_key) VALUES ($1, $2::jsonb, $3)`,
-          ['infra.echo', JSON.stringify({ probe: 'backlog' }), key],
+          [
+            'infra.echo',
+            JSON.stringify({ message: 'backlog', effectKey: `backlog.${key}` }),
+            key,
+          ],
         );
       }
     });
@@ -114,7 +125,11 @@ describe('outbox relay runner (operational, no manual tick)', () => {
     await dataSource.transaction(async (manager) => {
       await manager.query(
         `INSERT INTO job_outbox (topic, payload, dedupe_key) VALUES ($1, $2::jsonb, $3)`,
-        ['infra.echo', JSON.stringify({ probe: 'once' }), dedupeKey],
+        [
+          'infra.echo',
+          JSON.stringify({ message: 'once', effectKey: `once.${dedupeKey}` }),
+          dedupeKey,
+        ],
       );
     });
 
@@ -155,7 +170,18 @@ describe('outbox relay runner shutdown', () => {
 
     const context = await NestFactory.createApplicationContext(WorkerModule, { logger: false });
     const dataSource = context.get(DataSource);
+    const queueRedis = context.get<Redis>(QUEUE_REDIS);
+    const workerHost = context.get(WorkerHost);
     expect(dataSource.isInitialized).toBe(true);
+
+    const originalShutdown = workerHost.shutdown.bind(workerHost);
+    const shutdownSpy = jest.spyOn(workerHost, 'shutdown').mockImplementation(async () => {
+      // The root coordinator must drain workers before imported RedisModule
+      // destroys the producer connection. This assertion caught the previous
+      // lifecycle ordering bug where WorkerHost ran one phase too late.
+      expect(queueRedis.status).not.toBe('end');
+      await originalShutdown();
+    });
 
     // Let the loop run a few cycles so shutdown is exercised against a live
     // relay rather than one that never started.
@@ -166,5 +192,7 @@ describe('outbox relay runner shutdown', () => {
     // Closing must have torn down the pool; a relay still polling after
     // shutdown would keep this true and leak a connection per instance.
     expect(dataSource.isInitialized).toBe(false);
+    expect(queueRedis.status).toBe('end');
+    expect(shutdownSpy).toHaveBeenCalledTimes(1);
   }, 60_000);
 });

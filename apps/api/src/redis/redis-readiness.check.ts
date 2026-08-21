@@ -1,5 +1,7 @@
 import { Inject, Injectable } from '@nestjs/common';
 import type { Redis } from 'ioredis';
+import { withTimeout } from '../common/with-timeout';
+import { APP_CONFIG, type AppConfig } from '../config/configuration';
 import { CACHE_REDIS, QUEUE_REDIS } from './redis.tokens';
 import type { ReadinessCheck } from './readiness-check.interface';
 
@@ -18,12 +20,14 @@ export class RedisReadinessCheck implements ReadinessCheck {
   constructor(
     @Inject(QUEUE_REDIS) private readonly queueRedis: Redis,
     @Inject(CACHE_REDIS) private readonly cacheRedis: Redis,
+    @Inject(APP_CONFIG) private readonly config: AppConfig,
   ) {}
 
   async check(): Promise<{ healthy: boolean; detail?: string }> {
+    const timeoutMs = this.config.app.dependencyCheckTimeoutMs;
     const [queueResult, cacheResult] = await Promise.allSettled([
-      this.queueRedis.ping(),
-      this.cacheRedis.ping(),
+      withTimeout(this.queueRedis.ping(), timeoutMs, `queue Redis ping timed out after ${timeoutMs}ms`),
+      withTimeout(this.cacheRedis.ping(), timeoutMs, `cache Redis ping timed out after ${timeoutMs}ms`),
     ]);
 
     const failures: string[] = [];

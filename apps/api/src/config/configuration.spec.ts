@@ -7,6 +7,7 @@ const VALID_ENV: NodeJS.ProcessEnv = {
   API_PREFIX: 'api',
   API_DEFAULT_VERSION: '1',
   SHUTDOWN_TIMEOUT_MS: '15000',
+  DEPENDENCY_CHECK_TIMEOUT_MS: '2000',
   BODY_LIMIT: '1mb',
 
   DB_HOST: 'db.internal',
@@ -59,6 +60,7 @@ describe('loadConfig — valid input', () => {
       apiPrefix: 'api',
       defaultVersion: '1',
       shutdownTimeoutMs: 15000,
+      dependencyCheckTimeoutMs: 2000,
       bodyLimit: '1mb',
     });
     expect(config.database.host).toBe('db.internal');

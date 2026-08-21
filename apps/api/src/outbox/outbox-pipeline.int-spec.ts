@@ -2,7 +2,11 @@ import { randomUUID } from 'node:crypto';
 import type { Job } from 'bullmq';
 import { DataSource } from 'typeorm';
 import { loadConfig, type AppConfig } from '../config/configuration';
-import { createQueueRedisConnection } from '../redis/redis-connection.factory';
+import {
+  createQueueRedisConnection,
+  createWorkerRedisConnection,
+} from '../redis/redis-connection.factory';
+import { closeRedisGracefully } from '../redis/redis-lifecycle.service';
 import { QueueRegistry } from '../queue/queue-registry.service';
 import { closeWorkerGracefully, createWorker } from '../queue/worker.factory';
 import { INFRA_ECHO_TOPIC, type InfraEchoPayload } from '../queue/jobs/infra-echo.job';
@@ -102,7 +106,8 @@ describe('outbox pipeline end to end (integration)', () => {
     const dedupeKey = `${topic}.${randomUUID()}`;
     const effectKey = `effect.${randomUUID()}`;
 
-    const worker = createWorker<InfraEchoPayload, void>(connection, baseConfig, {
+    const workerConnection = createWorkerRedisConnection(baseConfig);
+    const worker = createWorker<InfraEchoPayload, void>(workerConnection, baseConfig, {
       name: topic,
       processor: createInfraEchoProcessor(dataSource, acknowledger, effects),
     });
@@ -129,6 +134,7 @@ describe('outbox pipeline end to end (integration)', () => {
       expect(effects.get(effectKey)).toBe(1);
     } finally {
       await closeWorkerGracefully(worker, 5_000);
+      await closeRedisGracefully(workerConnection, 'full-path test worker', 2_000);
     }
   }, 20_000);
 
@@ -205,7 +211,8 @@ describe('outbox pipeline end to end (integration)', () => {
     // Let the lease lapse, then start the worker that will actually process
     // the re-drive.
     await sleep(300);
-    const worker = createWorker<InfraEchoPayload, void>(connection, baseConfig, {
+    const workerConnection = createWorkerRedisConnection(baseConfig);
+    const worker = createWorker<InfraEchoPayload, void>(workerConnection, baseConfig, {
       name: topic,
       processor: createInfraEchoProcessor(dataSource, acknowledger, effects),
     });
@@ -221,16 +228,18 @@ describe('outbox pipeline end to end (integration)', () => {
       expect(effects.get(effectKey)).toBe(1); // ran exactly once despite the redrive
     } finally {
       await closeWorkerGracefully(worker, 5_000);
+      await closeRedisGracefully(workerConnection, 'redrive test worker', 2_000);
     }
   }, 20_000);
 
   it('graceful shutdown: relay loop, worker, queue and redis connections all close cleanly with no leaked handles', async () => {
     const topic = testTopic('shutdown');
     const localConnection = createQueueRedisConnection(baseConfig);
+    const localWorkerConnection = createWorkerRedisConnection(baseConfig);
     const localRegistry = new QueueRegistry(localConnection, baseConfig);
     const localMetrics = new OutboxMetrics();
     const relay = new OutboxRelay(dataSource, localRegistry, localMetrics, withLease(60_000));
-    const worker = createWorker<InfraEchoPayload, void>(localConnection, baseConfig, {
+    const worker = createWorker<InfraEchoPayload, void>(localWorkerConnection, baseConfig, {
       name: topic,
       processor: createInfraEchoProcessor(dataSource, acknowledger, effects),
     });
@@ -257,6 +266,7 @@ describe('outbox pipeline end to end (integration)', () => {
       // case is covered in redis.int-spec.ts).
       await relay.onModuleDestroy();
       await closeWorkerGracefully(worker, 5_000);
+      await closeRedisGracefully(localWorkerConnection, 'shutdown test worker', 2_000);
       await localRegistry.onModuleDestroy();
 
       // ioredis's `quit()` promise resolves once the QUIT reply is read, but
@@ -270,6 +280,9 @@ describe('outbox pipeline end to end (integration)', () => {
     } finally {
       if (localConnection.status !== 'end') {
         localConnection.disconnect();
+      }
+      if (localWorkerConnection.status !== 'end') {
+        localWorkerConnection.disconnect();
       }
     }
   }, 20_000);
