@@ -1,4 +1,8 @@
-import { ConfigValidationError, loadConfig } from './configuration';
+import {
+  ConfigValidationError,
+  loadConfig,
+  loadDatabaseConfig,
+} from './configuration';
 
 /** A complete, valid environment — every test starts from a copy of this and mutates it. */
 const VALID_ENV: NodeJS.ProcessEnv = {
@@ -16,8 +20,13 @@ const VALID_ENV: NodeJS.ProcessEnv = {
   DB_PASSWORD: 'super-secret',
   DB_NAME: 'tripwith',
   DB_SSL: 'true',
+  DB_SSL_CA: '-----BEGIN CERTIFICATE-----\\ntrusted-ca\\n-----END CERTIFICATE-----',
+  DB_SSL_INSECURE_LOCAL: 'false',
   DB_LOGGING: 'false',
   DB_POOL_MAX: '10',
+
+  CURRENT_TOS_VERSION: 'tos-2026-08-21',
+  CURRENT_PRIVACY_POLICY_VERSION: 'privacy-2026-08-21',
 
   REDIS_QUEUE_URL: 'redis://queue.internal:6379',
   REDIS_CACHE_URL: 'redis://cache.internal:6379',
@@ -64,13 +73,31 @@ describe('loadConfig — valid input', () => {
       bodyLimit: '1mb',
     });
     expect(config.database.host).toBe('db.internal');
-    expect(config.database.ssl).toBe(true);
+    expect(config.database.ssl).toEqual({
+      rejectUnauthorized: true,
+      ca: '-----BEGIN CERTIFICATE-----\ntrusted-ca\n-----END CERTIFICATE-----',
+    });
+    expect(config.database.connectionOptions).toBe('-c timezone=UTC');
+    expect(config.consentPolicy).toEqual({
+      currentTermsOfServiceVersion: 'tos-2026-08-21',
+      currentPrivacyPolicyVersion: 'privacy-2026-08-21',
+    });
     expect(config.redisQueue.url).toBe('redis://queue.internal:6379');
     expect(config.observability.level).toBe('info');
   });
 
   it('applies documented defaults when optional fields are omitted', () => {
-    const env = envWithout('PORT', 'API_PREFIX', 'DB_SSL', 'LOG_LEVEL', 'LOG_PRETTY');
+    const env = {
+      ...envWithout(
+        'PORT',
+        'API_PREFIX',
+        'DB_SSL',
+        'DB_SSL_CA',
+        'LOG_LEVEL',
+        'LOG_PRETTY',
+      ),
+      NODE_ENV: 'test',
+    };
 
     const config = loadConfig(env);
 
@@ -92,8 +119,16 @@ describe('loadConfig — valid input', () => {
   it('accepts "1"/"0" as valid booleans in addition to "true"/"false"', () => {
     const config = loadConfig({ ...VALID_ENV, DB_SSL: '1', OUTBOX_ENABLED: '0' });
 
-    expect(config.database.ssl).toBe(true);
+    expect(config.database.ssl).toMatchObject({ rejectUnauthorized: true });
     expect(config.outbox.enabled).toBe(false);
+  });
+
+  it('gives Nest and the migration DataSource identical TLS and UTC session settings', () => {
+    const appConfig = loadConfig(VALID_ENV);
+    const databaseConfig = loadDatabaseConfig(VALID_ENV);
+
+    expect(databaseConfig).toEqual(appConfig.database);
+    expect(databaseConfig.connectionOptions).toBe('-c timezone=UTC');
   });
 
   it('omits optional Firebase fields entirely rather than setting them to undefined', () => {
@@ -194,5 +229,46 @@ describe('loadConfig — malformed values are rejected', () => {
 
   it('rejects a negative duration', () => {
     expect(() => loadConfig({ ...VALID_ENV, OUTBOX_POLL_INTERVAL_MS: '-100' })).toThrow(ConfigValidationError);
+  });
+
+  it('requires a trusted CA for PostgreSQL TLS in production', () => {
+    expect(() => loadConfig(envWithout('DB_SSL_CA'))).toThrow(ConfigValidationError);
+  });
+
+  it('allows insecure PostgreSQL TLS only through an explicit non-production opt-in', () => {
+    const local = {
+      ...envWithout('DB_SSL_CA'),
+      NODE_ENV: 'development',
+      DB_SSL_INSECURE_LOCAL: 'true',
+    };
+    expect(loadConfig(local).database.ssl).toEqual({ rejectUnauthorized: false });
+
+    expect(() =>
+      loadConfig({ ...local, NODE_ENV: 'production' }),
+    ).toThrow(ConfigValidationError);
+  });
+
+  it('rejects TLS-only options when database TLS is disabled', () => {
+    expect(() => loadConfig({ ...VALID_ENV, DB_SSL: 'false' })).toThrow(
+      ConfigValidationError,
+    );
+    expect(() =>
+      loadConfig({
+        ...VALID_ENV,
+        NODE_ENV: 'test',
+        DB_SSL: 'false',
+        DB_SSL_CA: '',
+        DB_SSL_INSECURE_LOCAL: 'true',
+      }),
+    ).toThrow(ConfigValidationError);
+  });
+
+  it('requires nonempty server-owned current Terms and Privacy versions', () => {
+    expect(() => loadConfig(envWithout('CURRENT_TOS_VERSION'))).toThrow(
+      ConfigValidationError,
+    );
+    expect(() =>
+      loadConfig({ ...VALID_ENV, CURRENT_PRIVACY_POLICY_VERSION: '   ' }),
+    ).toThrow(ConfigValidationError);
   });
 });

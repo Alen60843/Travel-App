@@ -115,7 +115,10 @@ export class UserProfileEntity {
   travelStyle!: number;
 
   /**
-   * Trigger-maintained projection of user_interests (tw_sync_interest_ids),
+   * Trigger-maintained projection of active user_interests
+   * (tw_sync_interest_ids/tw_sync_interest_activity). Historical inactive
+   * selections remain in user_interests but never appear in this matching
+   * projection.
    * kept only so candidate generation can use an indexed array-overlap
    * predicate. user_interests remains the source of truth — never write
    * this column directly.

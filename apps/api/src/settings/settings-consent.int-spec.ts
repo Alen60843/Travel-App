@@ -7,6 +7,8 @@ import {
 } from '@tripwith/shared';
 
 import { ValidationError } from '../common/errors/app-error';
+import { loadConfig } from '../config/configuration';
+import { ConsentPolicyService } from '../consent/consent-policy.service';
 import { AppDataSource } from '../database/data-source';
 import { UserEntity, UserSettingsEntity } from '../database/entities';
 import { ConsentService } from '../consent/consent.service';
@@ -55,8 +57,9 @@ describe('settings, privacy, and consent (real PostgreSQL)', () => {
 
   beforeAll(async () => {
     await AppDataSource.initialize();
-    settings = new SettingsService(AppDataSource);
-    consents = new ConsentService(AppDataSource);
+    const policy = new ConsentPolicyService(loadConfig());
+    settings = new SettingsService(AppDataSource, policy);
+    consents = new ConsentService(AppDataSource, policy);
   });
 
   afterAll(async () => {
@@ -186,7 +189,7 @@ describe('settings, privacy, and consent (real PostgreSQL)', () => {
       {
         consentType: ConsentType.PrivacyPolicy,
         granted: true,
-        policyVersion: ' privacy-2026-08 ',
+        policyVersion: ' privacy-test-v1 ',
       },
       source,
     );
@@ -195,7 +198,7 @@ describe('settings, privacy, and consent (real PostgreSQL)', () => {
       {
         consentType: ConsentType.TermsOfService,
         granted: true,
-        policyVersion: 'terms-2026-08',
+        policyVersion: 'tos-test-v1',
       },
       source,
     );
@@ -216,7 +219,7 @@ describe('settings, privacy, and consent (real PostgreSQL)', () => {
       {
         consentType: ConsentType.PrivacyPolicy,
         granted: false,
-        policyVersion: 'privacy-2026-08',
+        policyVersion: 'privacy-test-v1',
       },
       source,
     );
@@ -224,7 +227,7 @@ describe('settings, privacy, and consent (real PostgreSQL)', () => {
     expect(grant).toMatchObject({
       consentType: ConsentType.PrivacyPolicy,
       granted: true,
-      policyVersion: 'privacy-2026-08',
+      policyVersion: 'privacy-test-v1',
       sourceIp: '203.0.113.10',
       userAgent: 'TripWith-Test/1.0',
     });
@@ -301,5 +304,153 @@ describe('settings, privacy, and consent (real PostgreSQL)', () => {
         noSource,
       ),
     ).rejects.toBeInstanceOf(ValidationError);
+    await expect(
+      consents.recordOwn(
+        owner.user.id,
+        {
+          consentType: ConsentType.TermsOfService,
+          granted: true,
+          policyVersion: 'future-client-value',
+        },
+        noSource,
+      ),
+    ).rejects.toBeInstanceOf(ValidationError);
+  });
+
+  it('requires current policy grants after a configured version change and preserves history', async () => {
+    const owner = await createAccount();
+    const source = { sourceIp: null, userAgent: 'policy-version-test' };
+    await consents.recordOwn(
+      owner.user.id,
+      {
+        consentType: ConsentType.TermsOfService,
+        granted: true,
+        policyVersion: 'tos-test-v1',
+      },
+      source,
+    );
+    await consents.recordOwn(
+      owner.user.id,
+      {
+        consentType: ConsentType.PrivacyPolicy,
+        granted: true,
+        policyVersion: 'privacy-test-v1',
+      },
+      source,
+    );
+    await settings.updateOwn(owner.user.id, { discoveryEnabled: true });
+
+    const nextPolicy = new ConsentPolicyService(
+      loadConfig({
+        ...process.env,
+        CURRENT_TOS_VERSION: 'tos-test-v2',
+        CURRENT_PRIVACY_POLICY_VERSION: 'privacy-test-v2',
+      }),
+    );
+    const nextSettings = new SettingsService(AppDataSource, nextPolicy);
+    const nextConsents = new ConsentService(AppDataSource, nextPolicy);
+
+    await expect(
+      nextSettings.updateOwn(owner.user.id, { discoveryEnabled: true }),
+    ).rejects.toBeInstanceOf(ValidationError);
+    await expect(
+      nextConsents.recordOwn(
+        owner.user.id,
+        {
+          consentType: ConsentType.TermsOfService,
+          granted: true,
+          policyVersion: 'tos-test-v1',
+        },
+        source,
+      ),
+    ).rejects.toBeInstanceOf(ValidationError);
+
+    await nextConsents.recordOwn(
+      owner.user.id,
+      {
+        consentType: ConsentType.TermsOfService,
+        granted: true,
+        policyVersion: 'tos-test-v2',
+      },
+      source,
+    );
+    await nextConsents.recordOwn(
+      owner.user.id,
+      {
+        consentType: ConsentType.PrivacyPolicy,
+        granted: true,
+        policyVersion: 'privacy-test-v2',
+      },
+      source,
+    );
+    await nextSettings.updateOwn(owner.user.id, { discoveryEnabled: false });
+    await expect(
+      nextSettings.updateOwn(owner.user.id, { discoveryEnabled: true }),
+    ).resolves.toMatchObject({ discoveryEnabled: true });
+
+    const history = await nextConsents.getHistoryOwn(owner.user.id);
+    expect(history).toHaveLength(4);
+    expect(history.map((event) => event.policyVersion)).toEqual(
+      expect.arrayContaining([
+        'tos-test-v1',
+        'privacy-test-v1',
+        'tos-test-v2',
+        'privacy-test-v2',
+      ]),
+    );
+  });
+
+  it('cannot race a required-consent withdrawal with discovery re-enable', async () => {
+    const owner = await createAccount();
+    const source = { sourceIp: null, userAgent: 'consent-race-test' };
+    await consents.recordOwn(
+      owner.user.id,
+      {
+        consentType: ConsentType.TermsOfService,
+        granted: true,
+        policyVersion: 'tos-test-v1',
+      },
+      source,
+    );
+    await consents.recordOwn(
+      owner.user.id,
+      {
+        consentType: ConsentType.PrivacyPolicy,
+        granted: true,
+        policyVersion: 'privacy-test-v1',
+      },
+      source,
+    );
+
+    const [enableResult, withdrawalResult] = await Promise.allSettled([
+      settings.updateOwn(owner.user.id, { discoveryEnabled: true }),
+      consents.recordOwn(
+        owner.user.id,
+        {
+          consentType: ConsentType.PrivacyPolicy,
+          granted: false,
+          policyVersion: 'privacy-test-v1',
+        },
+        source,
+      ),
+    ]);
+
+    expect(withdrawalResult.status).toBe('fulfilled');
+    expect(['fulfilled', 'rejected']).toContain(enableResult.status);
+    await expect(settings.getOwn(owner.user.id)).resolves.toMatchObject({
+      discoveryEnabled: false,
+    });
+    await expect(
+      settings.updateOwn(owner.user.id, { discoveryEnabled: true }),
+    ).rejects.toBeInstanceOf(ValidationError);
+    await expect(consents.getCurrentOwn(owner.user.id)).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          consentType: ConsentType.PrivacyPolicy,
+          granted: false,
+          policyVersion: 'privacy-test-v1',
+        }),
+      ]),
+    );
   });
 });

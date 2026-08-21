@@ -1,7 +1,7 @@
 # TripWith — Phase 1 Architecture and Database + Phase 2/3 Addenda
 
-**Date:** 2026-08-20 (revised through the Phase 3 close-out on 2026-08-21)
-**Status:** Phases 1–3 implemented and verified; Phase 3 closed; Phase 4 not started
+**Date:** 2026-08-20 (revised through the Phase 3 post-review gate on 2026-08-21)
+**Status:** Phases 1–3 implemented, corrected and verified; Phase 3 closed; Phase 4 not started
 **Scope:** Architecture, complete relational model, initial migration, Phase 2 backend/infrastructure, and Phase 3 Authentication & Users. No frontend and no payment-provider business implementation.
 
 ---
@@ -487,7 +487,7 @@ Cross-validated: `packages/shared/src/dates.test.ts` runs 7 of its cases against
 
 ## 11. Database model
 
-35 application tables. Canonical DDL: [`1787184000000-InitialSchema.up.sql`](../../../apps/api/src/database/migrations/sql/1787184000000-InitialSchema.up.sql).
+35 application tables. Canonical DDL is the ordered migration set: [`1787184000000-InitialSchema.up.sql`](../../../apps/api/src/database/migrations/sql/1787184000000-InitialSchema.up.sql), followed by [`1787270400000-Phase3InterestProjection.up.sql`](../../../apps/api/src/database/migrations/sql/1787270400000-Phase3InterestProjection.up.sql).
 
 Conventions: UUID PKs (`BIGINT` identity only for append-only high-volume logs); `timestamptz` throughout; money as integer minor units + ISO-4217; `GEOGRAPHY(POINT,4326)` for anything in metres; soft deletion only where a dependent record must survive.
 
@@ -502,7 +502,7 @@ Conventions: UUID PKs (`BIGINT` identity only for append-only high-volume logs);
 *Soft delete justified:* messages, reviews, payments and the trust ledger reference it. GDPR erasure anonymises rather than deletes — financial retention obligations override the erasure right.
 
 **`user_profiles`** — display and matching inputs.
-*Columns:* `display_name`, `bio`, `home_country_code`, `native_language_code`, `travel_style` (1–5), `interest_ids INT[]` (trigger-maintained projection), `identity_verified_at`.
+*Columns:* `display_name`, `bio`, `avatar_url`, `home_country_code`, `native_language_code`, `languages_spoken TEXT[]`, `travel_style` (1–5), `interest_ids INT[]` (trigger-maintained active-interest projection), `identity_verified_at`.
 *Constraints:* name length 2–50; bio ≤ 1000; ISO country/language patterns; style 1–5.
 *Indexes:* `GIN (interest_ids gin__int_ops)`, home country (partial), travel style.
 *Note:* **no geography column, deliberately.**
@@ -520,7 +520,7 @@ Conventions: UUID PKs (`BIGINT` identity only for append-only high-volume logs);
 
 **`interests`** — lookup. `id INT` identity, `code` unique (`^[a-z0-9_]{2,40}$`), `label`, `grouping`, `is_active`, `sort_order`. A table rather than an ENUM because it is editorially managed and carries display metadata.
 
-**`user_interests`** — join, PK `(user_id, interest_id)`, both FKs cascade. Source of truth for `user_profiles.interest_ids`. Trigger `tw_sync_interest_ids` maintains the projection. Index on `interest_id` for reverse lookup.
+**`user_interests`** — join, PK `(user_id, interest_id)`, both FKs cascade. This is the historical selection source of truth. `user_profiles.interest_ids` contains only selections whose editorial `interests.is_active` is true: `tw_sync_interest_ids` handles selection changes and `tw_sync_interest_activity` handles activation/deactivation. Normal current-profile output likewise hides inactive selections. Deactivation therefore preserves audit/history but contributes nothing to matching Jaccard; reactivation restores the projection without user action. Index on `interest_id` for reverse lookup.
 
 ### 11.3 Trips
 
@@ -744,8 +744,8 @@ concurrency race       24 joiners, capacity 5 -> exactly 5 committed, 19 rejecte
                        by events_capacity_not_exceeded_chk, counter consistent
 TS unit + PG parity    18 passed, 0 failed (7 cases compared against live SQL)
 enum parity            23 ENUM types, 89 values, 0 drift
-schema objects         35 app tables, 134 indexes, 95 CHECK, 67 FK, 28 triggers,
-                       23 ENUM types, 3 GIST indexes, 11 trigger functions
+schema objects         35 app tables, 134 indexes, 95 CHECK, 67 FK, 29 triggers,
+                       23 ENUM types, 3 GIST indexes, 12 trigger functions
 ```
 
 ### The trust-projection correction, proven
@@ -791,7 +791,7 @@ trust: projection identical to full ledger replay     ✓
 
 1. **Deposit legal characterisation** (assumption 1). Highest-consequence open item; must be settled before Phase 10.
 2. **Trigger-heavy design.** Eleven trigger functions carry capacity, seq, trust, audit, rating and approval invariants. Deliberate — they hold regardless of caller — but invisible from application code. Every trigger has a named test; bulk-import paths must be reviewed against them (the benchmark seed already had to disable the audit guard explicitly, which is the intended friction).
-3. **`interest_ids` denormalisation** is a second copy of `user_interests`. Trigger-maintained and tested, but a bulk operation bypassing row triggers would drift it. Reconciliation job needed in Phase 4.
+3. **`interest_ids` denormalisation** is a filtered second copy of active `user_interests`. Selection changes and editorial activation changes are trigger-maintained and tested, but a bulk operation that explicitly bypasses row triggers would still drift it. A later reconciliation remains defence in depth, not the mechanism that makes ordinary deactivation safe.
 4. **Matching `N` uncalibrated.** The proof and recall guard are complete; the numbers need Phase 4's scoring implementation.
 5. **`payment_events.payload`** stores raw webhooks — justified as dispute evidence, but may contain personal data and needs a retention policy in Phase 10.
 6. **Resolved in Phase 2 — outbox relay operations.** The dedicated worker deployable now runs the relay continuously, publishes with deterministic BullMQ job IDs, re-drives expired leases, records retry diagnostics/backoff, and shuts down without claiming new work. Payment-provider business logic remains deferred.
@@ -812,6 +812,8 @@ No controllers, DTOs, or NestJS modules. No frontend. No payment-provider implem
 apps/api/src/database/migrations/1787184000000-InitialSchema.ts            TypeORM wrapper
 apps/api/src/database/migrations/sql/1787184000000-InitialSchema.up.sql    canonical schema
 apps/api/src/database/migrations/sql/1787184000000-InitialSchema.down.sql  reversal
+apps/api/src/database/migrations/1787270400000-Phase3InterestProjection.ts Phase 3 correction wrapper
+apps/api/src/database/migrations/sql/1787270400000-Phase3InterestProjection.*.sql active-interest projection correction
 apps/api/src/database/data-source.ts                                       env-only config
 apps/api/src/database/scripts/verify-invariants.sql                        100 assertions
 apps/api/src/database/scripts/verify-concurrency.sh                        capacity race
@@ -925,7 +927,7 @@ Authorization: Bearer <Firebase ID token>
 
 ### Account provisioning and onboarding
 
-`POST /api/v1/auth/provision` is the only first-account creation path. It requires a revocation-checked Firebase identity with a verified email plus date of birth, display name, and current Terms of Service and Privacy Policy versions. One PostgreSQL transaction creates:
+`POST /api/v1/auth/provision` is the only first-account creation path. It requires a revocation-checked Firebase identity with a verified email plus date of birth, display name, and Terms of Service and Privacy Policy attestations that exactly match the server-owned `CURRENT_TOS_VERSION` and `CURRENT_PRIVACY_POLICY_VERSION`. A client can attest to a configured version but cannot define which version is current. One PostgreSQL transaction creates:
 
 ```text
 users (ACTIVE, verified email, 18+ DOB)
@@ -936,7 +938,7 @@ users (ACTIVE, verified email, 18+ DOB)
 
 The insert uses PostgreSQL uniqueness as the concurrency authority. Concurrent first requests wait on the unique conflict and resolve the winner; tests prove one user, one profile, one settings row and exactly two required consent rows. Repeated provisioning is idempotent for the active account and re-enters the normal account-status/restriction boundary before returning owner data.
 
-No onboarding boolean was added. Completeness is derived from active status, verified email, profile/settings presence, display name and the latest required-consent states. Discoverability additionally requires `discovery_enabled` and an inactive/effectively expired Ghost Mode. A partially complete account is therefore never reported as discoverable.
+No onboarding boolean was added. Completeness is derived from active status, verified email, profile/settings presence, display name and latest grants for both **currently configured** required-policy versions. A policy rollout leaves the account valid but makes old grants outdated until append-only current-version grants are recorded. `onboarding.discoverable` means effective discoverability now: it additionally requires `discovery_enabled`, inactive/effectively expired Ghost Mode, and no effective `MATCHING_SUSPENDED` or `FULL_SUSPENSION`. Matching restrictions do not make onboarding incomplete; they independently suppress effective discovery. A partially complete or currently restricted account is never reported as discoverable.
 
 The API age validator parses an exact `YYYY-MM-DD` calendar date in UTC and uses the shared `MINIMUM_ACCOUNT_AGE_YEARS`; PostgreSQL's existing `tw_enforce_minimum_age()` trigger remains authoritative. Below-18, exact-18, older, impossible-date and future-date cases are covered.
 
@@ -946,7 +948,7 @@ All paths below include the configured default `/api` prefix and URI version. Ow
 
 | Method and path | Purpose and major request fields | Major response fields | Important stable failures |
 |---|---|---|---|
-| `POST /api/v1/auth/provision` | Create/idempotently resolve the account; `dateOfBirth`, `displayName`, exact TOS/privacy `requiredConsents[].policyVersion` | Safe current-user representation | missing/invalid/expired/revoked/wrong-project token; verified email required; underage/invalid DOB; invalid required consent; identity conflict; unusable account |
+| `POST /api/v1/auth/provision` | Create/idempotently resolve the account; `dateOfBirth`, `displayName`, TOS/privacy `requiredConsents[].policyVersion` matching server configuration | Safe current-user representation | missing/invalid/expired/revoked/wrong-project token; verified email required; underage/invalid DOB; stale/fake required-policy version; identity conflict; unusable account |
 | `GET /api/v1/me` | Read the authenticated owner | internal `id`, email verification/status, DOB, profile, effective settings, derived onboarding/discoverability | auth/account boundary failures |
 | `GET /api/v1/me/profile` | Read the owner's private Phase 3 profile | display name, bio, avatar URL, country/languages, travel style and selected active interests | auth/account boundary failures |
 | `PATCH /api/v1/me/profile` | Update display name, bio, home country, native/spoken languages and travel style | Updated private profile | invalid lengths/codes/style; unknown fields rejected |
@@ -954,7 +956,7 @@ All paths below include the configured default `/api` prefix and URI version. Ow
 | `PUT /api/v1/me/interests` | Replace `interestIds` transactionally while serializing concurrent replacements | Updated profile/interests | invalid/duplicate/inactive/unknown interest |
 | `GET /api/v1/me/settings` | Read effective owner settings and durably normalize an elapsed Ghost expiry | Ghost/discovery, visibility, age/trust/distance, notification, locale/timezone settings | auth/account boundary failures |
 | `PATCH /api/v1/me/settings` | Partial settings update using the same fields | Updated settings | empty patch; invalid range/order/enum/locale/timezone; invalid Ghost expiry; missing required consent when enabling discovery |
-| `POST /api/v1/me/consents` | Append grant or withdrawal; `consentType`, `granted`, `policyVersion` only | New timestamped ledger event and transport-derived provenance | unknown consent type; invalid/blank/oversized version |
+| `POST /api/v1/me/consents` | Append grant or withdrawal; `consentType`, `granted`, `policyVersion` only | New timestamped ledger event and transport-derived provenance | unknown consent type; invalid/blank/oversized version; required-policy version not current |
 | `GET /api/v1/me/consents` | Project the latest event per approved consent type | Current consent events | auth/account boundary failures |
 | `GET /api/v1/me/consents/history` | Read the owner's append-only ledger | Reverse-chronological consent events | auth/account boundary failures |
 
@@ -962,9 +964,9 @@ All paths below include the configured default `/api` prefix and URI version. Ow
 
 - `/me` routes structurally eliminate cross-user IDOR: there is no arbitrary user ID route or accepted owner field. DTO whitelisting rejects injected `userId` or source-metadata properties.
 - Profile validation mirrors the migration's country, language, display-name, bio and travel-style constraints. Character limits count Unicode characters consistently with PostgreSQL and reject PostgreSQL-invalid NULs before SQL.
-- `user_interests` is the source of truth. Replacement locks the profile aggregate, validates every selected interest is active, replaces the relationship set transactionally, and relies exclusively on `tw_sync_interest_ids()` for `user_profiles.interest_ids`.
+- `user_interests` preserves the selected relationship set. Replacement locks the profile aggregate, validates every newly selected interest is active, and replaces the relationships transactionally. `user_profiles.interest_ids` is the matching projection of only currently active selections: selection and editorial-status triggers maintain it, while normal profile output hides inactive historical selections.
 - Timed Ghost Mode is active through (but not at) its future expiry instant. A non-null expiry requires enabled Ghost Mode; disabling clears the expiry. Reads conditionally and durably clear elapsed state without overwriting a concurrent extension. Phase 3 stores this state only; Phase 4 will consume it for new discovery.
-- Consent grants and withdrawals are `INSERT` operations only. A per-user/type transaction advisory lock orders competing events, and current projection uses `(created_at DESC, id DESC)`. The database append-only trigger still rejects direct update/delete.
+- Consent grants and withdrawals are `INSERT` operations only. A per-user/type transaction advisory lock orders competing events, and current projection uses `(created_at DESC, id DESC)`. For TOS and Privacy, the supplied version must equal the server-owned current version; an older latest grant remains in history but does not satisfy onboarding or discovery. The database append-only trigger still rejects direct update/delete.
 - Withdrawing current TOS or Privacy consent atomically disables discovery. Re-enabling discovery takes the same ordered consent locks and requires the latest TOS and Privacy entries both to be granted, closing the withdrawal/re-enable race. A later re-grant does not silently opt the user back into discovery.
 - Consent source IP and user-agent values come from sanitized request transport metadata, never request-body claims.
 
@@ -1034,3 +1036,85 @@ There are no changes to migrations, schema SQL, TypeORM entities, shared enums/d
 - The existing non-failing ts-jest isolated-modules and shared implicit-ESM warnings remain tooling cleanup items.
 
 **Phase 3 Authentication & Users ends here and is fully closed. Do not begin Phase 4 without explicit approval.**
+
+---
+
+## 21. Phase 3 Post-Review Correction Gate
+
+**Completed:** 2026-08-21
+
+**Approval state:** The focused post-review corrections are implemented and verified on `phase3/auth-users`. Phase 3 remains closed; this gate did not merge the branch or begin Phase 4.
+
+### Confirmed findings and resolutions
+
+1. **Finding →** `.claude/settings.local.json` was tracked even though it contains machine-local paths and command permissions. **Evidence →** `git ls-files` resolved the file at preflight, and its only committed revision contained local configuration but no common credential, private-key, token or database-URL pattern. **Impact →** local machine state produced repository churn and exposed workstation-specific paths. **Fix →** add the exact path to `.gitignore` and remove only the index entry with `git rm --cached`; the local file remains present. **Verification →** `test -f` succeeds, `git check-ignore` names the exact rule, and `git ls-files --error-unmatch` fails as expected.
+2. **Finding →** current required-consent versions were client-defined. **Evidence →** provisioning and discovery checked grant/format but not a server-owned TOS/Privacy version. **Impact →** an arbitrary or obsolete version could satisfy onboarding and discovery. **Fix →** typed required configuration (`CURRENT_TOS_VERSION`, `CURRENT_PRIVACY_POLICY_VERSION`) and one injected `ConsentPolicyService` shared by provisioning, `/me`, consent recording and discovery-enable checks. Required-version mismatch is rejected; a configuration rollout leaves the account active but makes old grants incomplete/effectively undiscoverable until new append-only grants are recorded. **Verification →** correct/stale/fake provisioning, configuration change, withdrawal, stale/current re-grant, history projection and re-enable tests pass.
+3. **Finding →** PostgreSQL TLS disabled certificate authentication in both connection paths. **Evidence →** Nest and the CLI DataSource each constructed `{ rejectUnauthorized: false }` whenever `DB_SSL=true`. **Impact →** encrypted production connections remained vulnerable to a server-impersonation attack. **Fix →** one shared parser builds verified TLS from `DB_SSL_CA`; `DB_SSL_INSECURE_LOCAL=true` is an explicit development/test-only escape hatch and is rejected in production. Nest and migration connections consume the same options. **Verification →** production missing-CA/insecure-mode failures, non-production opt-in, CA newline normalization and Nest/CLI equivalence tests pass; no CA material was committed.
+4. **Finding →** an editorially deactivated interest remained in the Jaccard projection. **Evidence →** the original selection trigger aggregated all `user_interests`, and profile reads did not filter `is_active`. **Impact →** inactive taxonomy values could affect future matching and appear as current choices. **Fix →** additive migration `1787270400000-Phase3InterestProjection` filters `user_profiles.interest_ids` to active selections and reprojects affected users on status changes; relationship rows remain historical. Normal profile output hides inactive selections; reactivation restores the projection. **Verification →** select → deactivate → hidden profile/filtered projection with preserved relationship → reactivate regression passes, as does migration `37 → 2 → 37`.
+5. **Finding →** the API used UTC age arithmetic while PostgreSQL `CURRENT_DATE` depended on an unenforced session timezone. **Evidence →** neither runtime nor migration connections set a timezone. **Impact →** nodes near a calendar boundary could disagree with the database. **Fix →** both connection paths set PostgreSQL session `timezone=UTC`; the age algorithm remains date-only. The explicit leap-day rule is: a 29 February birthday occurs on 1 March in a non-leap eighteenth year. **Verification →** live TypeScript/PostgreSQL cases cover exact/below/above 18, New Year and UTC-midnight boundaries, and leap/non-leap February dates; the real trigger accepts exact/older and rejects below-age input.
+6. **Finding →** `onboarding.discoverable` represented settings-level eligibility but was named as an effective state. **Evidence →** it omitted live `MATCHING_SUSPENDED` restrictions while Phase 4's approved elimination rules include them. **Impact →** two incompatible meanings of “discoverable” could reach clients and future matching code. **Fix →** retain the field with effective semantics: current onboarding/policies, enabled discovery, inactive Ghost Mode, and no effective matching/full suspension. Restrictions suppress discoverability without making onboarding incomplete. **Verification →** an otherwise complete matching-suspended account reports `complete=true`, `discoverable=false`.
+7. **Finding →** the canonical profile summary omitted implemented `avatar_url` and `languages_spoken`. **Evidence →** both exist in the initial migration and entity. **Impact →** the engineering record understated the Phase 3 contract. **Fix →** correct §11.1 only. **Verification →** no schema/entity change was made for this documentation mismatch.
+8. **Finding →** the initial migration comment repeated the disproven claim that PostgreSQL requires immutable CHECK expressions. **Evidence →** it contradicted §11.11's already-correct explanation. **Impact →** maintainers were given a false database rationale. **Fix →** replace the comment with the approved write-time/business-policy/error-semantics rationale and the UTC session rule. **Verification →** DDL behavior is unchanged by this comment correction.
+9. **Finding →** lock ordering protected consent withdrawal versus discovery enable, but no direct race regression proved it. **Evidence →** the focused suite had sequential withdrawal/re-enable coverage only. **Impact →** a later change could reintroduce discoverability without current consent. **Fix →** add a live simultaneous withdrawal/re-enable test. **Verification →** under either interleaving the withdrawal is appended, discovery ends disabled, and a subsequent enable fails until current consent is present.
+
+### Rejected adjacent concerns / false positives
+
+- No ownership, IDOR or client-controlled identity regression was found: owner routes still take only the internal UUID installed by the verified-token guard, DTO whitelisting rejects injected owner/provenance fields, and provisioning remains the only exceptional pre-account path.
+- Auth and Socket.IO do not consume `onboarding.discoverable`; matching suspension correctly suppresses discovery without becoming an authentication, socket-room or chat ban. No socket change was required.
+- No Firebase token/private key, consent payload or PostgreSQL CA was added to logs or tracked configuration. Existing redaction and stable error envelopes remain in force.
+- A live February-29 discrepancy was not found. The real defect was deployment-dependent session timezone state; enforcing UTC makes the already-matching API/PostgreSQL 1-March rule deterministic.
+
+### Final correction-gate verification
+
+```text
+strict workspace TypeScript                 PASS (API + shared)
+Nest build                                  PASS (new migration SQL copied to dist)
+actual API boot + graceful SIGINT           PASS
+actual worker/relay boot + graceful SIGINT  PASS
+GET /health/live                            PASS (HTTP 200)
+GET /health/ready                           PASS (HTTP 200; PostgreSQL + both Redis healthy)
+unauthenticated GET /api/v1/me              PASS (HTTP 401, AUTH_TOKEN_MISSING)
+API Jest, open-handle detection             40 suites, 247 tests passed, 0 failed
+Phase 3 focused gate                        13 suites, 103 tests passed, 0 failed
+post-review correction focus                 5 suites, 56 tests passed, 0 failed
+Firebase authentication focus                5 suites, 38 tests passed, 0 failed
+settings/consent live concurrency             1 suite, 6 tests passed, 0 failed
+automatic outbox process                      1 suite, 4 tests passed, 0 failed
+readiness/loss/recovery/outbox focus           4 suites, 33 tests passed, 0 failed
+shared TS + live PostgreSQL parity            18 passed, 0 failed (7 live SQL cases)
+minimum-age live PostgreSQL parity             9 cases passed, 0 failed
+enum parity                                   23 ENUM types, 89 values, 0 drift
+Phase 1 invariant suite                       100 passed, 0 failed
+24-way capacity race                           5 committed, 19 rejected, 0 overbooked
+migration up -> down -> up                     PASS (37 -> 2 -> 37 base tables; both migrations reapplied)
+production dependency audit                   PASS (no known vulnerabilities)
+```
+
+The dependency-loss/recovery, queue timeout, automatic outbox acknowledgement/redelivery and lifecycle shutdown proofs are included in the 247-test API gate and the named focused reruns. The expected non-failing ts-jest isolated-modules, shared implicit-ESM and pnpm audit `url.parse()` deprecation warnings remain tooling/dependency diagnostics, not discovered application vulnerabilities.
+
+### Files changed by this gate
+
+```text
+.gitignore; .claude/settings.local.json (index removal only)
+apps/api/.env.example; apps/api/test/setup-env.ts
+apps/api/src/config/configuration.ts; configuration.spec.ts
+apps/api/src/consent/{consent-policy.service,consent.service,consent.module,index}.ts
+apps/api/src/users/{users.service,users.module,users.int-spec,age,age.spec,age.int-spec}.ts
+apps/api/src/settings/{settings.service,settings.module,settings-consent.int-spec}.ts
+apps/api/src/database/{data-source,database.module,database.module.int-spec}.ts
+apps/api/src/database/entities/identity.entity.ts
+apps/api/src/database/migrations/1787270400000-Phase3InterestProjection.ts
+apps/api/src/database/migrations/sql/1787270400000-Phase3InterestProjection.{up,down}.sql
+apps/api/src/database/migrations/sql/1787184000000-InitialSchema.up.sql (comment only)
+apps/api/src/database/scripts/{harden-app-role,verify-app-role-hardening}.sql
+docs/superpowers/specs/2026-08-20-tripwith-phase-1-design.md
+```
+
+### Remaining non-blocking risks
+
+- A required-policy version deployment takes effect immediately. Product/legal publication and client display of the exact new text/version must be coordinated with the configuration rollout; existing accounts remain usable but effectively undiscoverable until they re-grant.
+- Deployment owns trusted PostgreSQL CA distribution and rotation. The application validates configured CA material but cannot verify the external secret-management/rotation process in this repository.
+- The active-interest projection is safe for ordinary row-level selection and editorial-status writes. An operator explicitly disabling triggers for a bulk load can still cause drift and must reconcile before re-enabling traffic.
+- The ignored local Claude file remains in earlier Git history with machine-local paths (no credential pattern found). Removing it from future snapshots does not rewrite history; a history rewrite was neither necessary nor requested.
+
+**Phase 3 is fully closed after the post-review correction gate. Phase 4 was not started and still requires explicit approval.**

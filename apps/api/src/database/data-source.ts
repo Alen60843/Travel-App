@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { DataSource } from 'typeorm';
 
+import { loadDatabaseConfig } from '../config/configuration';
 import { entities } from './entities';
 
 /**
@@ -22,33 +23,21 @@ import { entities } from './entities';
  * (`pnpm migration:run`), never implicitly on connect, so a process boot
  * can never race a schema change.
  */
-function required(name: string): string {
-  const value = process.env[name];
-  // Deliberately checking for `undefined`, not falsiness: DB_PASSWORD is
-  // legitimately '' for local trust-auth Postgres, and an empty string is a
-  // valid (if unusual) value for several of these — only "never set" is an
-  // error.
-  if (value === undefined) {
-    throw new Error(
-      `Missing required environment variable ${name}. ` +
-        `Copy .env.example to .env and fill it in.`,
-    );
-  }
-  return value;
-}
+const database = loadDatabaseConfig();
 
 export const AppDataSource = new DataSource({
   type: 'postgres',
-  host: required('DB_HOST'),
-  port: Number.parseInt(required('DB_PORT'), 10),
-  username: required('DB_USER'),
-  password: required('DB_PASSWORD'),
-  database: required('DB_NAME'),
-  ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false,
+  host: database.host,
+  port: database.port,
+  username: database.username,
+  password: database.password,
+  database: database.database,
+  ssl: database.ssl,
+  extra: { options: database.connectionOptions },
 
   synchronize: false,
   migrationsRun: false,
-  logging: process.env.DB_LOGGING === 'true',
+  logging: database.logging,
 
   entities: [...entities],
   migrations: [`${__dirname}/migrations/*.{ts,js}`],

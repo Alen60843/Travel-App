@@ -72,6 +72,7 @@ ALTER FUNCTION tw_apply_trust_delta()      SECURITY DEFINER SET search_path = pg
 ALTER FUNCTION tw_sync_participant_count() SECURITY DEFINER SET search_path = pg_catalog, public;
 ALTER FUNCTION tw_sync_provider_rating()   SECURITY DEFINER SET search_path = pg_catalog, public;
 ALTER FUNCTION tw_sync_interest_ids()      SECURITY DEFINER SET search_path = pg_catalog, public;
+ALTER FUNCTION tw_sync_interest_activity() SECURITY DEFINER SET search_path = pg_catalog, public;
 ALTER FUNCTION tw_assign_message_seq()     SECURITY DEFINER SET search_path = pg_catalog, public;
 
 -- ---------------------------------------------------------------------------

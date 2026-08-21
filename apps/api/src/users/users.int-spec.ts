@@ -3,6 +3,8 @@ import { randomUUID } from 'node:crypto';
 import { ConsentType, UserAccountStatus } from '@tripwith/shared';
 
 import { AccountAccessError, TripWithUserResolver, type VerifiedFirebaseIdentity } from '../auth';
+import { ConsentPolicyService } from '../consent/consent-policy.service';
+import { loadConfig } from '../config/configuration';
 import { AppDataSource } from '../database/data-source';
 import { AccountRestrictionEntity, UserEntity } from '../database/entities';
 import { MinimumAgeError, InvalidDateOfBirthError } from './age';
@@ -51,15 +53,20 @@ function utcDateAtAge(years: number, dayOffset = 0): string {
 
 describe('UsersService (real PostgreSQL)', () => {
   let service: UsersService;
+  let resolver: TripWithUserResolver;
+  let consentPolicy: ConsentPolicyService;
 
   beforeAll(async () => {
     await AppDataSource.initialize();
+    resolver = new TripWithUserResolver(
+      AppDataSource.getRepository(UserEntity),
+      AppDataSource.getRepository(AccountRestrictionEntity),
+    );
+    consentPolicy = new ConsentPolicyService(loadConfig());
     service = new UsersService(
       AppDataSource,
-      new TripWithUserResolver(
-        AppDataSource.getRepository(UserEntity),
-        AppDataSource.getRepository(AccountRestrictionEntity),
-      ),
+      resolver,
+      consentPolicy,
     );
   });
 
@@ -163,6 +170,46 @@ describe('UsersService (real PostgreSQL)', () => {
         { sourceIp: null, userAgent: null },
       ),
     ).rejects.toBeInstanceOf(InvalidProvisioningConsentError);
+
+    await expect(
+      service.provision(
+        identity('fake-policy-version'),
+        provisionDto({
+          requiredConsents: [
+            { consentType: ConsentType.TermsOfService, policyVersion: 'future-client-value' },
+            { consentType: ConsentType.PrivacyPolicy, policyVersion: 'privacy-test-v1' },
+          ],
+        }),
+        { sourceIp: null, userAgent: null },
+      ),
+    ).rejects.toBeInstanceOf(InvalidProvisioningConsentError);
+  });
+
+  it('keeps the account valid but makes old policy grants incomplete after a version change', async () => {
+    const created = await service.provision(identity('policy-change'), provisionDto(), {
+      sourceIp: null,
+      userAgent: null,
+    });
+    const changedPolicy = new ConsentPolicyService(
+      loadConfig({
+        ...process.env,
+        CURRENT_TOS_VERSION: 'tos-test-v2',
+        CURRENT_PRIVACY_POLICY_VERSION: 'privacy-test-v2',
+      }),
+    );
+    const changedService = new UsersService(AppDataSource, resolver, changedPolicy);
+
+    await expect(changedService.getCurrentUser(created.id)).resolves.toMatchObject({
+      accountStatus: UserAccountStatus.Active,
+      onboarding: {
+        complete: false,
+        discoverable: false,
+        missingRequirements: expect.arrayContaining([
+          `consent:${ConsentType.TermsOfService}`,
+          `consent:${ConsentType.PrivacyPolicy}`,
+        ]),
+      },
+    });
   });
 
   it('applies the normal account-usability boundary on repeated provisioning', async () => {
@@ -200,6 +247,26 @@ describe('UsersService (real PostgreSQL)', () => {
       ghostModeUntil: null,
     });
     expect(current.onboarding.discoverable).toBe(true);
+  });
+
+  it('reports effective discoverability as false during a matching suspension', async () => {
+    const created = await service.provision(identity('matching-restricted'), provisionDto(), {
+      sourceIp: null,
+      userAgent: null,
+    });
+    await AppDataSource.query(
+      `INSERT INTO account_restrictions (user_id, type, reason)
+       VALUES ($1, 'MATCHING_SUSPENDED', 'integration test')`,
+      [created.id],
+    );
+
+    await expect(service.getCurrentUser(created.id)).resolves.toMatchObject({
+      onboarding: {
+        complete: true,
+        discoverable: false,
+        missingRequirements: [],
+      },
+    });
   });
 
   it('uses database uniqueness to create exactly one account under concurrent first requests', async () => {
@@ -372,6 +439,35 @@ describe('UsersService (real PostgreSQL)', () => {
       [user.id],
     );
     expect(projection.interest_ids).toEqual(projection.relational_ids);
+
+    // Editorial deactivation preserves the historical relationship but
+    // removes the interest from both normal profile output and the Phase 4
+    // matching projection. Reactivation restores it without user action.
+    await AppDataSource.query(`UPDATE interests SET is_active = FALSE WHERE id = $1`, [ids[0]]);
+    const [afterDeactivation] = await AppDataSource.query(
+      `SELECT p.interest_ids,
+              EXISTS (
+                SELECT 1 FROM user_interests ui
+                 WHERE ui.user_id = p.user_id AND ui.interest_id = $2
+              ) AS historical_selection_preserved
+         FROM user_profiles p
+        WHERE p.user_id = $1`,
+      [user.id, ids[0]],
+    );
+    expect(afterDeactivation).toEqual({
+      interest_ids: [ids[1]],
+      historical_selection_preserved: true,
+    });
+    await expect(service.getProfile(user.id)).resolves.toMatchObject({
+      interests: [expect.objectContaining({ id: ids[1] })],
+    });
+
+    await AppDataSource.query(`UPDATE interests SET is_active = TRUE WHERE id = $1`, [ids[0]]);
+    const [afterReactivation] = await AppDataSource.query(
+      `SELECT interest_ids FROM user_profiles WHERE user_id = $1`,
+      [user.id],
+    );
+    expect(afterReactivation.interest_ids).toEqual([...ids].sort((a, b) => a - b));
 
     await expect(
       service.replaceInterests(user.id, { interestIds: [inactive[0].id as number] }),

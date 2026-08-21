@@ -35,7 +35,7 @@ DECLARE
   fn TEXT;
   definers CONSTANT TEXT[] := ARRAY[
     'tw_apply_trust_delta', 'tw_sync_participant_count', 'tw_sync_provider_rating',
-    'tw_sync_interest_ids', 'tw_assign_message_seq'
+    'tw_sync_interest_ids', 'tw_sync_interest_activity', 'tw_assign_message_seq'
   ];
 BEGIN
   -- 1. No table-level UPDATE anywhere: this is the grant that would silently

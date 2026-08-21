@@ -23,6 +23,88 @@ const booleanSchema = z
 
 const durationMsSchema = z.coerce.number().int().positive();
 
+const optionalNonemptyStringSchema = z.preprocess(
+  (value) => (value === '' ? undefined : value),
+  z.string().min(1).optional(),
+);
+
+const policyVersionSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(100)
+  .refine((value) => !value.includes('\0'), 'must not contain a NUL character');
+
+const databaseEnvironmentShape = {
+  DB_HOST: z.string().min(1),
+  DB_PORT: portSchema,
+  DB_USER: z.string().min(1),
+  DB_PASSWORD: z.string(),
+  DB_NAME: z.string().min(1),
+  DB_SSL: booleanSchema.default('false'),
+  DB_SSL_CA: optionalNonemptyStringSchema,
+  DB_SSL_INSECURE_LOCAL: booleanSchema.default('false'),
+  DB_LOGGING: booleanSchema.default('false'),
+  DB_POOL_MAX: z.coerce.number().int().positive().default(10),
+} as const;
+
+interface DatabaseTlsEnvironment {
+  readonly NODE_ENV: 'development' | 'test' | 'production';
+  readonly DB_SSL: boolean;
+  readonly DB_SSL_CA?: string | undefined;
+  readonly DB_SSL_INSECURE_LOCAL: boolean;
+}
+
+function validateDatabaseTls(
+  config: DatabaseTlsEnvironment,
+  context: z.RefinementCtx,
+): void {
+  if (!config.DB_SSL) {
+    if (config.DB_SSL_CA !== undefined) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['DB_SSL_CA'],
+        message: 'DB_SSL_CA requires DB_SSL=true',
+      });
+    }
+    if (config.DB_SSL_INSECURE_LOCAL) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['DB_SSL_INSECURE_LOCAL'],
+        message: 'DB_SSL_INSECURE_LOCAL requires DB_SSL=true',
+      });
+    }
+    return;
+  }
+
+  if (config.NODE_ENV === 'production') {
+    if (config.DB_SSL_INSECURE_LOCAL) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['DB_SSL_INSECURE_LOCAL'],
+        message: 'insecure PostgreSQL TLS is forbidden in production',
+      });
+    }
+    if (config.DB_SSL_CA === undefined) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['DB_SSL_CA'],
+        message: 'a trusted PostgreSQL CA is required when DB_SSL=true in production',
+      });
+    }
+    return;
+  }
+
+  if (config.DB_SSL_CA === undefined && !config.DB_SSL_INSECURE_LOCAL) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['DB_SSL_CA'],
+      message:
+        'DB_SSL=true requires DB_SSL_CA or the explicit DB_SSL_INSECURE_LOCAL=true local opt-in',
+    });
+  }
+}
+
 export const configSchema = z.object({
   // ---- application ------------------------------------------------------
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
@@ -34,14 +116,13 @@ export const configSchema = z.object({
   BODY_LIMIT: z.string().default('1mb'),
 
   // ---- PostgreSQL -------------------------------------------------------
-  DB_HOST: z.string().min(1),
-  DB_PORT: portSchema,
-  DB_USER: z.string().min(1),
-  DB_PASSWORD: z.string(),
-  DB_NAME: z.string().min(1),
-  DB_SSL: booleanSchema.default('false'),
-  DB_LOGGING: booleanSchema.default('false'),
-  DB_POOL_MAX: z.coerce.number().int().positive().default(10),
+  ...databaseEnvironmentShape,
+
+  // ---- current required policy versions --------------------------------
+  // Clients attest to these server-owned versions; they never define which
+  // Terms or Privacy policy is current.
+  CURRENT_TOS_VERSION: policyVersionSchema,
+  CURRENT_PRIVACY_POLICY_VERSION: policyVersionSchema,
 
   // ---- Redis ------------------------------------------------------------
   //
@@ -65,8 +146,8 @@ export const configSchema = z.object({
   // Verification is local JWT validation against Google's cached signing keys;
   // these identify the project the token must be issued for.
   FIREBASE_PROJECT_ID: z.string().min(1),
-  FIREBASE_CLIENT_EMAIL: z.string().email().optional(),
-  FIREBASE_PRIVATE_KEY: z.string().optional(),
+  FIREBASE_CLIENT_EMAIL: optionalNonemptyStringSchema.pipe(z.string().email().optional()),
+  FIREBASE_PRIVATE_KEY: optionalNonemptyStringSchema,
 
   // ---- object storage ---------------------------------------------------
   S3_ENDPOINT: z.string().url(),
@@ -80,6 +161,7 @@ export const configSchema = z.object({
   LOG_PRETTY: booleanSchema.default('false'),
   SERVICE_NAME: z.string().default('tripwith-api'),
 }).superRefine((config, context) => {
+  validateDatabaseTls(config, context);
   const hasClientEmail = config.FIREBASE_CLIENT_EMAIL !== undefined;
   const hasPrivateKey = config.FIREBASE_PRIVATE_KEY !== undefined;
   if (hasClientEmail !== hasPrivateKey) {
@@ -94,6 +176,24 @@ export const configSchema = z.object({
 
 export type RawConfig = z.infer<typeof configSchema>;
 
+export type PostgresSslOptions =
+  | false
+  | { readonly rejectUnauthorized: true; readonly ca: string }
+  | { readonly rejectUnauthorized: false };
+
+export interface DatabaseConfig {
+  readonly host: string;
+  readonly port: number;
+  readonly username: string;
+  readonly password: string;
+  readonly database: string;
+  readonly ssl: PostgresSslOptions;
+  readonly logging: boolean;
+  readonly poolMax: number;
+  /** Forces CURRENT_DATE and every other session calendar operation to UTC. */
+  readonly connectionOptions: '-c timezone=UTC';
+}
+
 /** Grouped, immutable view of configuration handed to the rest of the app. */
 export interface AppConfig {
   readonly app: {
@@ -106,15 +206,10 @@ export interface AppConfig {
     readonly dependencyCheckTimeoutMs: number;
     readonly bodyLimit: string;
   };
-  readonly database: {
-    readonly host: string;
-    readonly port: number;
-    readonly username: string;
-    readonly password: string;
-    readonly database: string;
-    readonly ssl: boolean;
-    readonly logging: boolean;
-    readonly poolMax: number;
+  readonly database: DatabaseConfig;
+  readonly consentPolicy: {
+    readonly currentTermsOfServiceVersion: string;
+    readonly currentPrivacyPolicyVersion: string;
   };
   readonly redisQueue: { readonly url: string; readonly prefix: string };
   readonly redisCache: { readonly url: string };
@@ -153,6 +248,60 @@ export class ConfigValidationError extends Error {
   }
 }
 
+const databaseConfigSchema = z
+  .object({
+    NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+    ...databaseEnvironmentShape,
+  })
+  .superRefine(validateDatabaseTls);
+
+type ParsedDatabaseEnvironment = z.infer<typeof databaseConfigSchema>;
+
+function groupDatabaseConfig(config: ParsedDatabaseEnvironment): DatabaseConfig {
+  let ssl: PostgresSslOptions = false;
+  if (config.DB_SSL_CA !== undefined) {
+    ssl = Object.freeze({
+      rejectUnauthorized: true as const,
+      ca: config.DB_SSL_CA.replace(/\\n/g, '\n'),
+    });
+  } else if (config.DB_SSL) {
+    // Validation permits this branch only for the explicitly opted-in local
+    // development/test mode. Production can never reach it.
+    ssl = Object.freeze({ rejectUnauthorized: false as const });
+  }
+
+  return Object.freeze({
+    host: config.DB_HOST,
+    port: config.DB_PORT,
+    username: config.DB_USER,
+    password: config.DB_PASSWORD,
+    database: config.DB_NAME,
+    ssl,
+    logging: config.DB_LOGGING,
+    poolMax: config.DB_POOL_MAX,
+    connectionOptions: '-c timezone=UTC' as const,
+  });
+}
+
+/**
+ * Database-only parser for the TypeORM migration/script DataSource. Keeping
+ * this separate means migrations do not need Redis/Firebase/S3 credentials,
+ * while sharing the exact TLS and UTC-session rules used by Nest runtime.
+ */
+export function loadDatabaseConfig(
+  env: NodeJS.ProcessEnv = process.env,
+): DatabaseConfig {
+  const parsed = databaseConfigSchema.safeParse(env);
+  if (!parsed.success) {
+    throw new ConfigValidationError(
+      parsed.error.issues.map(
+        (issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`,
+      ),
+    );
+  }
+  return groupDatabaseConfig(parsed.data);
+}
+
 /**
  * Parses and groups configuration. Throws ConfigValidationError listing EVERY
  * problem at once — reporting one missing variable per restart wastes time.
@@ -180,15 +329,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       dependencyCheckTimeoutMs: c.DEPENDENCY_CHECK_TIMEOUT_MS,
       bodyLimit: c.BODY_LIMIT,
     }),
-    database: Object.freeze({
-      host: c.DB_HOST,
-      port: c.DB_PORT,
-      username: c.DB_USER,
-      password: c.DB_PASSWORD,
-      database: c.DB_NAME,
-      ssl: c.DB_SSL,
-      logging: c.DB_LOGGING,
-      poolMax: c.DB_POOL_MAX,
+    database: groupDatabaseConfig(c),
+    consentPolicy: Object.freeze({
+      currentTermsOfServiceVersion: c.CURRENT_TOS_VERSION,
+      currentPrivacyPolicyVersion: c.CURRENT_PRIVACY_POLICY_VERSION,
     }),
     redisQueue: Object.freeze({ url: c.REDIS_QUEUE_URL, prefix: c.QUEUE_PREFIX }),
     redisCache: Object.freeze({ url: c.REDIS_CACHE_URL }),

@@ -5,6 +5,7 @@ import { DataSource } from 'typeorm';
 
 import { ValidationError } from '../common/errors/app-error';
 import { consentLockKey } from './consent-lock';
+import { ConsentPolicyService } from './consent-policy.service';
 import type { RecordConsentDto } from './record-consent.dto';
 
 export interface ConsentSourceMetadata {
@@ -41,7 +42,10 @@ const MAX_POLICY_VERSION_LENGTH = 100;
 
 @Injectable()
 export class ConsentService {
-  constructor(@InjectDataSource() private readonly dataSource: DataSource) {}
+  constructor(
+    @InjectDataSource() private readonly dataSource: DataSource,
+    private readonly consentPolicy: ConsentPolicyService,
+  ) {}
 
   /**
    * Records both grants and withdrawals by INSERT only.
@@ -58,6 +62,7 @@ export class ConsentService {
   ): Promise<ConsentEventView> {
     this.assertInput(input);
     const policyVersion = input.policyVersion.trim();
+    this.consentPolicy.assertCurrentRequiredVersion(input.consentType, policyVersion);
 
     return this.dataSource.transaction(async (manager) => {
       await manager.query(

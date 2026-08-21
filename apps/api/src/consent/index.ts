@@ -1,5 +1,6 @@
 export * from './consent.controller';
 export * from './consent-lock';
 export * from './consent.module';
+export * from './consent-policy.service';
 export * from './consent.service';
 export * from './record-consent.dto';

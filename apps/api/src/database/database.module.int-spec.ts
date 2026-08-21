@@ -30,6 +30,10 @@ describe('DatabaseModule (real database, real Nest DI)', () => {
       expect(dataSource.isInitialized).toBe(true);
       expect(dataSource.options.synchronize).toBe(false);
       expect(dataSource.options.migrationsRun).toBe(false);
+      const timezone: { timezone: string }[] = await dataSource.query(
+        `SELECT current_setting('timezone') AS timezone`,
+      );
+      expect(timezone[0]?.timezone).toBe('UTC');
 
       // The registered entity set actually round-trips a query.
       await dataSource.getRepository(UserEntity).count();

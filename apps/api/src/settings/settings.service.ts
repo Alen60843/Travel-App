@@ -9,6 +9,10 @@ import { DataSource, type EntityManager } from 'typeorm';
 
 import { NotFoundError, ValidationError } from '../common/errors/app-error';
 import { consentLockKey } from '../consent/consent-lock';
+import {
+  ConsentPolicyService,
+  REQUIRED_CONSENT_TYPES,
+} from '../consent/consent-policy.service';
 import { UserSettingsEntity } from '../database/entities';
 import type { UpdateSettingsDto } from './update-settings.dto';
 
@@ -50,7 +54,10 @@ const SETTINGS_FIELDS: readonly (keyof UpdateSettingsDto)[] = [
 
 @Injectable()
 export class SettingsService {
-  constructor(@InjectDataSource() private readonly dataSource: DataSource) {}
+  constructor(
+    @InjectDataSource() private readonly dataSource: DataSource,
+    private readonly consentPolicy: ConsentPolicyService,
+  ) {}
 
   /**
    * Reads effective settings and durably expires timed Ghost Mode.
@@ -245,23 +252,31 @@ export class SettingsService {
     manager: EntityManager,
     userId: string,
   ): Promise<void> {
-    const required = [ConsentType.TermsOfService, ConsentType.PrivacyPolicy] as const;
-    for (const type of required) {
+    for (const type of REQUIRED_CONSENT_TYPES) {
       await manager.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
         consentLockKey(userId, type),
       ]);
     }
 
     const rows = (await manager.query(
-      `SELECT DISTINCT ON (consent_type) consent_type AS "consentType", granted
+      `SELECT DISTINCT ON (consent_type)
+              consent_type AS "consentType",
+              granted,
+              policy_version AS "policyVersion"
          FROM user_consents
         WHERE user_id = $1
           AND consent_type = ANY($2::consent_type[])
         ORDER BY consent_type, created_at DESC, id DESC`,
-      [userId, required],
-    )) as { consentType: ConsentType; granted: boolean }[];
-    const granted = new Map(rows.map((row) => [row.consentType, row.granted]));
-    const missing = required.filter((type) => granted.get(type) !== true);
+      [userId, REQUIRED_CONSENT_TYPES],
+    )) as { consentType: ConsentType; granted: boolean; policyVersion: string }[];
+    const latest = new Map(rows.map((row) => [row.consentType, row]));
+    const missing = REQUIRED_CONSENT_TYPES.filter((type) => {
+      const row = latest.get(type);
+      return (
+        row?.granted !== true ||
+        !this.consentPolicy.isCurrent(type, row.policyVersion)
+      );
+    });
     if (missing.length > 0) {
       throw new ValidationError('Discovery requires current Terms and Privacy consent', {
         field: 'discoveryEnabled',

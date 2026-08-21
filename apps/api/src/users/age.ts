@@ -61,6 +61,9 @@ export function assertEligibleDateOfBirth(dateOfBirth: string, now = new Date())
     throw new InvalidDateOfBirthError();
   }
 
+  // Date.UTC normalises 29 February in a non-leap eighteenth year to 1 March.
+  // That is the explicit product rule and matches PostgreSQL's
+  // `reference_date - interval '18 years'` threshold.
   const eighteenthBirthday = Date.UTC(
     year + MINIMUM_ACCOUNT_AGE_YEARS,
     month - 1,

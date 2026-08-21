@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 
 import { AuthModule } from '../auth';
+import { ConsentModule } from '../consent';
 import {
   InterestEntity,
   UserEntity,
@@ -15,6 +16,7 @@ import { UsersService } from './users.service';
 @Module({
   imports: [
     AuthModule,
+    ConsentModule,
     TypeOrmModule.forFeature([
       UserEntity,
       UserProfileEntity,
@@ -28,4 +30,3 @@ import { UsersService } from './users.service';
   exports: [UsersService],
 })
 export class UsersModule {}
-

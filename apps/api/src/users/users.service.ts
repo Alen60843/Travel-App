@@ -1,8 +1,16 @@
 import { Injectable } from '@nestjs/common';
-import { ConsentType, UserAccountStatus } from '@tripwith/shared';
+import {
+  ConsentType,
+  RestrictionType,
+  UserAccountStatus,
+} from '@tripwith/shared';
 import { DataSource, EntityManager } from 'typeorm';
 
 import { TripWithUserResolver, type VerifiedFirebaseIdentity } from '../auth';
+import {
+  ConsentPolicyService,
+  REQUIRED_CONSENT_TYPES,
+} from '../consent/consent-policy.service';
 import {
   InterestEntity,
   UserEntity,
@@ -29,7 +37,6 @@ import type {
   ProvisionAuditContext,
 } from './users.types';
 
-const REQUIRED_CONSENT_TYPES = [ConsentType.TermsOfService, ConsentType.PrivacyPolicy] as const;
 const EMAIL_PATTERN = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 const LANGUAGE_PATTERN = /^[a-z]{2,3}$/;
 const COUNTRY_PATTERN = /^[A-Z]{2}$/;
@@ -41,6 +48,7 @@ interface InsertedUserRow {
 interface CurrentConsentRow {
   readonly consent_type: string;
   readonly granted: boolean;
+  readonly policy_version: string;
 }
 
 interface PgErrorLike {
@@ -53,6 +61,7 @@ export class UsersService {
   constructor(
     private readonly dataSource: DataSource,
     private readonly userResolver: TripWithUserResolver,
+    private readonly consentPolicy: ConsentPolicyService,
   ) {}
 
   async provision(
@@ -139,14 +148,24 @@ export class UsersService {
       throw new AccountNotProvisionedError();
     }
 
-    const [profile, settings, consentRows] = await Promise.all([
+    const [profile, settings, consentRows, discoveryRestricted] = await Promise.all([
       this.getProfileWithManager(manager, userId),
       manager.getRepository(UserSettingsEntity).findOneBy({ userId }),
       this.getCurrentRequiredConsents(manager, userId),
+      this.hasActiveDiscoveryRestriction(manager, userId),
     ]);
 
     const grantedTypes = new Set(
-      consentRows.filter((row) => row.granted).map((row) => row.consent_type),
+      consentRows
+        .filter(
+          (row) =>
+            row.granted &&
+            this.consentPolicy.isCurrent(
+              row.consent_type as ConsentType,
+              row.policy_version,
+            ),
+        )
+        .map((row) => row.consent_type),
     );
     const missingRequirements: string[] = [];
     if (user.accountStatus !== UserAccountStatus.Active) missingRequirements.push('active_account');
@@ -188,7 +207,12 @@ export class UsersService {
         : null,
       onboarding: {
         complete,
-        discoverable: Boolean(complete && settings?.discoveryEnabled && !ghostModeActive),
+        discoverable: Boolean(
+          complete &&
+            settings?.discoveryEnabled &&
+            !ghostModeActive &&
+            !discoveryRestricted,
+        ),
         missingRequirements,
       },
       createdAt: user.createdAt.toISOString(),
@@ -304,7 +328,11 @@ export class UsersService {
           typeof value.policyVersion !== 'string' ||
           value.policyVersion.includes('\0') ||
           [...value.policyVersion.trim()].length < 1 ||
-          [...value.policyVersion.trim()].length > 100,
+          [...value.policyVersion.trim()].length > 100 ||
+          !this.consentPolicy.isCurrent(
+            value.consentType,
+            value.policyVersion.trim(),
+          ),
       )
     ) {
       throw new InvalidProvisioningConsentError();
@@ -341,7 +369,10 @@ export class UsersService {
     userId: string,
   ): Promise<CurrentConsentRow[]> {
     return manager.query(
-      `SELECT DISTINCT ON (consent_type) consent_type::text, granted
+      `SELECT DISTINCT ON (consent_type)
+              consent_type::text,
+              granted,
+              policy_version
          FROM user_consents
         WHERE user_id = $1
           AND consent_type = ANY($2::consent_type[])
@@ -360,6 +391,7 @@ export class UsersService {
       .createQueryBuilder('interest')
       .innerJoin(UserInterestEntity, 'selected', 'selected.interest_id = interest.id')
       .where('selected.user_id = :userId', { userId })
+      .andWhere('interest.is_active = TRUE')
       .orderBy('interest.sort_order', 'ASC')
       .addOrderBy('interest.label', 'ASC')
       .addOrderBy('interest.id', 'ASC')
@@ -377,6 +409,25 @@ export class UsersService {
       interests: interests.map((interest) => this.toInterestView(interest)),
       identityVerifiedAt: profile.identityVerifiedAt?.toISOString() ?? null,
     };
+  }
+
+  private async hasActiveDiscoveryRestriction(
+    manager: EntityManager,
+    userId: string,
+  ): Promise<boolean> {
+    const rows: { restricted: boolean }[] = await manager.query(
+      `SELECT EXISTS (
+         SELECT 1
+           FROM account_restrictions
+          WHERE user_id = $1
+            AND type = ANY($2::restriction_type[])
+            AND starts_at <= clock_timestamp()
+            AND lifted_at IS NULL
+            AND (ends_at IS NULL OR ends_at > clock_timestamp())
+       ) AS restricted`,
+      [userId, [RestrictionType.MatchingSuspended, RestrictionType.FullSuspension]],
+    );
+    return rows[0]?.restricted === true;
   }
 
   private normaliseProfileUpdate(dto: UpdateProfileDto): Partial<UserProfileEntity> {

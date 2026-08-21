@@ -28,7 +28,8 @@ import { entities } from './entities';
         username: config.database.username,
         password: config.database.password,
         database: config.database.database,
-        ssl: config.database.ssl ? { rejectUnauthorized: false } : false,
+        ssl: config.database.ssl,
+        extra: { options: config.database.connectionOptions },
 
         synchronize: false,
         migrationsRun: false,

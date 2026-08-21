@@ -18,5 +18,28 @@ describe('assertEligibleDateOfBirth', () => {
       expect(() => assertEligibleDateOfBirth(value, NOW)).toThrow(InvalidDateOfBirthError);
     },
   );
-});
 
+  it('uses UTC date boundaries consistently across New Year midnight', () => {
+    expect(() =>
+      assertEligibleDateOfBirth(
+        '2008-01-01',
+        new Date('2025-12-31T23:59:59.999Z'),
+      ),
+    ).toThrow(MinimumAgeError);
+    expect(() =>
+      assertEligibleDateOfBirth(
+        '2008-01-01',
+        new Date('2026-01-01T00:00:00.000Z'),
+      ),
+    ).not.toThrow();
+  });
+
+  it('treats a 29 February birthday as occurring on 1 March in non-leap years', () => {
+    expect(() =>
+      assertEligibleDateOfBirth('2004-02-29', new Date('2022-02-28T23:59:59.999Z')),
+    ).toThrow(MinimumAgeError);
+    expect(() =>
+      assertEligibleDateOfBirth('2004-02-29', new Date('2022-03-01T00:00:00.000Z')),
+    ).not.toThrow();
+  });
+});

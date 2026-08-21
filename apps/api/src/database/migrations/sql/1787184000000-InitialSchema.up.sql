@@ -192,10 +192,12 @@ CREATE TRIGGER users_set_updated_at
   BEFORE UPDATE ON users
   FOR EACH ROW EXECUTE FUNCTION tw_set_updated_at();
 
--- 18+ cannot be a CHECK constraint: PostgreSQL requires CHECK expressions to be
--- IMMUTABLE, and CURRENT_DATE is STABLE. A CHECK would also be re-evaluated at
--- restore time against the *restore* date, silently rejecting valid rows.
--- A trigger is the correct enforcement point.
+-- PostgreSQL accepts time-dependent CHECK expressions, but evaluates them only
+-- when a row is written and re-evaluates them at restore time. Minimum age is
+-- an evolving business policy that also needs a stable, policy-specific error;
+-- the trigger is the explicit write-time enforcement point. Application and
+-- migration connections set the session timezone to UTC, making CURRENT_DATE
+-- agree with the API's UTC calendar calculation.
 CREATE OR REPLACE FUNCTION tw_enforce_minimum_age() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
