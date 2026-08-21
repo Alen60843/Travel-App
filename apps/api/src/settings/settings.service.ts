@@ -14,6 +14,7 @@ import {
   REQUIRED_CONSENT_TYPES,
 } from '../consent/consent-policy.service';
 import { UserSettingsEntity } from '../database/entities';
+import { FeedGenerationService } from '../matching/feed-generation.service';
 import type { UpdateSettingsDto } from './update-settings.dto';
 
 export interface UserSettingsView {
@@ -51,12 +52,22 @@ const SETTINGS_FIELDS: readonly (keyof UpdateSettingsDto)[] = [
   'locale',
   'timezone',
 ];
+const MATCHING_SETTINGS_FIELDS = new Set<keyof UpdateSettingsDto>([
+  'ghostModeEnabled',
+  'ghostModeUntil',
+  'discoveryEnabled',
+  'minAgePreference',
+  'maxAgePreference',
+  'minTrustScorePreference',
+  'maxDistanceKm',
+]);
 
 @Injectable()
 export class SettingsService {
   constructor(
     @InjectDataSource() private readonly dataSource: DataSource,
     private readonly consentPolicy: ConsentPolicyService,
+    private readonly feedGeneration?: FeedGenerationService,
   ) {}
 
   /**
@@ -97,7 +108,7 @@ export class SettingsService {
       throw new ValidationError('At least one settings field is required');
     }
 
-    return this.dataSource.transaction(async (manager) => {
+    const view = await this.dataSource.transaction(async (manager) => {
       if (patch.discoveryEnabled === true) {
         await this.assertRequiredConsentsGranted(manager, userId);
       }
@@ -114,6 +125,10 @@ export class SettingsService {
       await manager.save(settings);
       return this.toView(settings);
     });
+    if (Object.keys(patch).some((field) => MATCHING_SETTINGS_FIELDS.has(field as keyof UpdateSettingsDto))) {
+      await this.feedGeneration?.bump(userId);
+    }
+    return view;
   }
 
   private applyPatch(

@@ -23,6 +23,8 @@ const booleanSchema = z
 
 const durationMsSchema = z.coerce.number().int().positive();
 
+const unitIntervalSchema = z.coerce.number().finite().min(0).max(1);
+
 const optionalNonemptyStringSchema = z.preprocess(
   (value) => (value === '' ? undefined : value),
   z.string().min(1).optional(),
@@ -141,6 +143,21 @@ export const configSchema = z.object({
   OUTBOX_LEASE_MS: durationMsSchema.default(300_000),
   OUTBOX_ENABLED: booleanSchema.default('true'),
 
+  // ---- traveler matching ------------------------------------------------
+  // The final match weights are fixed by the approved architecture. These
+  // parameters govern the itinerary pair/breadth implementation and the
+  // measured SQL-to-TypeScript hand-off, so they remain explicit and
+  // independently deployable without becoming request-controlled inputs.
+  MATCHING_ANCHOR_RADIUS_KM: z.coerce.number().finite().min(1).max(20_000).default(100),
+  MATCHING_PAIR_DESTINATION_WEIGHT: unitIntervalSchema.default(0.2),
+  MATCHING_PAIR_TEMPORAL_WEIGHT: unitIntervalSchema.default(0.5),
+  MATCHING_PAIR_GEOGRAPHIC_WEIGHT: unitIntervalSchema.default(0.3),
+  MATCHING_BREADTH_BETA: unitIntervalSchema.default(0.25),
+  MATCHING_CANDIDATE_CAP: z.coerce.number().int().min(10).max(1_000).default(50),
+  MATCHING_MAX_PAGE_SIZE: z.coerce.number().int().min(1).max(100).default(50),
+  MATCHING_FEED_TTL_SECONDS: z.coerce.number().int().min(1).max(900).default(90),
+  MATCHING_CURSOR_SECRET: optionalNonemptyStringSchema.pipe(z.string().min(32).optional()),
+
   // ---- Firebase ---------------------------------------------------------
   //
   // Verification is local JWT validation against Google's cached signing keys;
@@ -170,6 +187,32 @@ export const configSchema = z.object({
       path: ['FIREBASE_CLIENT_EMAIL'],
       message:
         'FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY must either both be set or both be omitted',
+    });
+  }
+
+  const pairWeightSum =
+    config.MATCHING_PAIR_DESTINATION_WEIGHT +
+    config.MATCHING_PAIR_TEMPORAL_WEIGHT +
+    config.MATCHING_PAIR_GEOGRAPHIC_WEIGHT;
+  if (Math.abs(pairWeightSum - 1) > 1e-9) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['MATCHING_PAIR_DESTINATION_WEIGHT'],
+      message: 'matching pair weights must sum to exactly 1',
+    });
+  }
+  if (config.MATCHING_CANDIDATE_CAP < config.MATCHING_MAX_PAGE_SIZE) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['MATCHING_CANDIDATE_CAP'],
+      message: 'matching candidate cap must be at least the maximum page size',
+    });
+  }
+  if (config.NODE_ENV === 'production' && config.MATCHING_CURSOR_SECRET === undefined) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['MATCHING_CURSOR_SECRET'],
+      message: 'a secret of at least 32 characters is required in production',
     });
   }
 });
@@ -218,6 +261,19 @@ export interface AppConfig {
     readonly pollIntervalMs: number;
     readonly batchSize: number;
     readonly leaseMs: number;
+  };
+  readonly matching: {
+    readonly anchorRadiusKm: number;
+    readonly pairWeights: {
+      readonly destination: number;
+      readonly temporal: number;
+      readonly geographic: number;
+    };
+    readonly breadthBeta: number;
+    readonly candidateCap: number;
+    readonly maxPageSize: number;
+    readonly feedTtlSeconds: number;
+    readonly cursorSecret: string;
   };
   readonly firebase: {
     readonly projectId: string;
@@ -341,6 +397,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       pollIntervalMs: c.OUTBOX_POLL_INTERVAL_MS,
       batchSize: c.OUTBOX_BATCH_SIZE,
       leaseMs: c.OUTBOX_LEASE_MS,
+    }),
+    matching: Object.freeze({
+      anchorRadiusKm: c.MATCHING_ANCHOR_RADIUS_KM,
+      pairWeights: Object.freeze({
+        destination: c.MATCHING_PAIR_DESTINATION_WEIGHT,
+        temporal: c.MATCHING_PAIR_TEMPORAL_WEIGHT,
+        geographic: c.MATCHING_PAIR_GEOGRAPHIC_WEIGHT,
+      }),
+      breadthBeta: c.MATCHING_BREADTH_BETA,
+      candidateCap: c.MATCHING_CANDIDATE_CAP,
+      maxPageSize: c.MATCHING_MAX_PAGE_SIZE,
+      feedTtlSeconds: c.MATCHING_FEED_TTL_SECONDS,
+      cursorSecret:
+        c.MATCHING_CURSOR_SECRET ?? 'tripwith-local-only-matching-cursor-secret',
     }),
     firebase: Object.freeze({
       projectId: c.FIREBASE_PROJECT_ID,

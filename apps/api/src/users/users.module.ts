@@ -10,6 +10,7 @@ import {
   UserProfileEntity,
   UserSettingsEntity,
 } from '../database/entities';
+import { FeedCacheModule } from '../matching/feed-cache.module';
 import { CurrentUserController, ProvisioningController } from './users.controller';
 import { UsersService } from './users.service';
 
@@ -17,6 +18,7 @@ import { UsersService } from './users.service';
   imports: [
     AuthModule,
     ConsentModule,
+    FeedCacheModule,
     TypeOrmModule.forFeature([
       UserEntity,
       UserProfileEntity,

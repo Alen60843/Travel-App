@@ -7,6 +7,7 @@ import { ConsentPolicyService } from '../consent/consent-policy.service';
 import { loadConfig } from '../config/configuration';
 import { AppDataSource } from '../database/data-source';
 import { AccountRestrictionEntity, UserEntity } from '../database/entities';
+import type { FeedGenerationService } from '../matching/feed-generation.service';
 import { MinimumAgeError, InvalidDateOfBirthError } from './age';
 import type { ProvisionAccountDto } from './dto/provision-account.dto';
 import {
@@ -55,6 +56,7 @@ describe('UsersService (real PostgreSQL)', () => {
   let service: UsersService;
   let resolver: TripWithUserResolver;
   let consentPolicy: ConsentPolicyService;
+  const feedGeneration = { bump: jest.fn().mockResolvedValue(1) };
 
   beforeAll(async () => {
     await AppDataSource.initialize();
@@ -67,6 +69,7 @@ describe('UsersService (real PostgreSQL)', () => {
       AppDataSource,
       resolver,
       consentPolicy,
+      feedGeneration as unknown as FeedGenerationService,
     );
   });
 
@@ -368,6 +371,7 @@ describe('UsersService (real PostgreSQL)', () => {
       languagesSpoken: ['he', 'en'],
       travelStyle: 4,
     });
+    expect(feedGeneration.bump).toHaveBeenCalledWith(owner.id);
     await expect(service.getProfile(other.id)).resolves.toMatchObject({
       userId: other.id,
       displayName: 'Owner B',
@@ -428,6 +432,7 @@ describe('UsersService (real PostgreSQL)', () => {
     expect(profile.interests.map((interest) => interest.id).sort((a, b) => a - b)).toEqual(
       [...ids].sort((a, b) => a - b),
     );
+    expect(feedGeneration.bump).toHaveBeenCalledWith(user.id);
     const [projection] = await AppDataSource.query(
       `SELECT p.interest_ids,
               COALESCE(array_agg(ui.interest_id ORDER BY ui.interest_id)

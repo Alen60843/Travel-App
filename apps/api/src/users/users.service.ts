@@ -18,6 +18,7 @@ import {
   UserProfileEntity,
   UserSettingsEntity,
 } from '../database/entities';
+import { FeedGenerationService } from '../matching/feed-generation.service';
 import { assertEligibleDateOfBirth, MinimumAgeError } from './age';
 import type { ProvisionAccountDto, ProvisioningConsentDto } from './dto/provision-account.dto';
 import type { ReplaceInterestsDto } from './dto/replace-interests.dto';
@@ -62,6 +63,7 @@ export class UsersService {
     private readonly dataSource: DataSource,
     private readonly userResolver: TripWithUserResolver,
     private readonly consentPolicy: ConsentPolicyService,
+    private readonly feedGeneration?: FeedGenerationService,
   ) {}
 
   async provision(
@@ -235,6 +237,9 @@ export class UsersService {
     if (result.affected !== 1) {
       throw new AccountNotProvisionedError();
     }
+    if (dto.travelStyle !== undefined) {
+      await this.feedGeneration?.bump(userId);
+    }
     return this.getProfile(userId);
   }
 
@@ -284,6 +289,8 @@ export class UsersService {
         );
       }
     });
+
+    await this.feedGeneration?.bump(userId);
 
     return this.getProfile(userId);
   }

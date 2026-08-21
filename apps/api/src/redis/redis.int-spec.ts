@@ -161,6 +161,14 @@ describe('redis infrastructure (integration)', () => {
       await expect(svc.get(testKey)).resolves.toBeNull();
     });
 
+    it('atomically increments a cache generation', async () => {
+      const svc = cache();
+      await svc.del(testKey);
+      await expect(svc.increment(testKey)).resolves.toBe(1);
+      await expect(svc.increment(testKey)).resolves.toBe(2);
+      await expect(svc.get<number>(testKey)).resolves.toBe(2);
+    });
+
     it('get() NEVER throws and returns null when the connection is broken — the structural guarantee', async () => {
       const brokenRedis = createUnreachableRedis();
       const brokenCache = new CacheService(brokenRedis);
@@ -172,6 +180,13 @@ describe('redis infrastructure (integration)', () => {
       const brokenRedis = createUnreachableRedis();
       const brokenCache = new CacheService(brokenRedis);
       await expect(brokenCache.set('anything', { a: 1 })).resolves.toBeUndefined();
+      brokenRedis.disconnect();
+    });
+
+    it('increment() returns null when Redis is unavailable', async () => {
+      const brokenRedis = createUnreachableRedis();
+      const brokenCache = new CacheService(brokenRedis);
+      await expect(brokenCache.increment('anything')).resolves.toBeNull();
       brokenRedis.disconnect();
     });
   });

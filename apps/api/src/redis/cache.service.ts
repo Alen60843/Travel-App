@@ -63,4 +63,20 @@ export class CacheService {
       this.logger.warn(`cache del failed, ignoring: key=${key} error=${(err as Error).message}`);
     }
   }
+
+  /**
+   * Best-effort atomic generation bump. `null` means Redis was unavailable;
+   * callers must continue without caching rather than making a cache write a
+   * prerequisite for a successful PostgreSQL mutation.
+   */
+  async increment(key: string): Promise<number | null> {
+    try {
+      return await this.redis.incr(key);
+    } catch (err) {
+      this.logger.warn(
+        `cache increment failed, disabling cache for this operation: key=${key} error=${(err as Error).message}`,
+      );
+      return null;
+    }
+  }
 }

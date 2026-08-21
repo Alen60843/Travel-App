@@ -17,6 +17,10 @@
     "db:verify": "psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f src/database/scripts/verify-invariants.sql && bash src/database/scripts/verify-concurrency.sh",
     "db:seed:bench": "psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f src/database/scripts/seed-benchmark-data.sql",
     "db:benchmark": "psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f src/database/scripts/benchmark-indexes.sql",
+    "matching:reconcile-interests": "psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f src/database/scripts/reconcile-interest-projection.sql",
+    "matching:seed-benchmark": "psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f src/database/scripts/seed-matching-benchmark.sql",
+    "matching:benchmark": "ts-node src/matching/benchmark/run-matching-benchmark.ts",
+    "matching:cleanup-benchmark": "psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f src/database/scripts/cleanup-matching-benchmark.sql",
     "start:worker": "node dist/worker.js",
     "start:worker:dev": "nest start --watch --entryFile worker"
   },

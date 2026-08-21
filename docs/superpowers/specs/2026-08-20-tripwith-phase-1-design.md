@@ -1,8 +1,8 @@
-# TripWith — Phase 1 Architecture and Database + Phase 2/3 Addenda
+# TripWith — Phase 1 Architecture and Database + Phase 2/3/4 Addenda
 
-**Date:** 2026-08-20 (revised through the Phase 3 post-review gate on 2026-08-21)
-**Status:** Phases 1–3 implemented, corrected and verified; Phase 3 closed; Phase 4 not started
-**Scope:** Architecture, complete relational model, initial migration, Phase 2 backend/infrastructure, and Phase 3 Authentication & Users. No frontend and no payment-provider business implementation.
+**Date:** 2026-08-20 (revised through the Phase 4 close-out on 2026-08-21)
+**Status:** Phases 1–4 implemented, corrected and verified; Phase 4 closed; Phase 5 not started
+**Scope:** Architecture, complete relational model, initial migration, Phase 2 backend/infrastructure, Phase 3 Authentication & Users, and Phase 4 Trips & Matching. No frontend and no payment-provider business implementation.
 
 ---
 
@@ -792,7 +792,7 @@ trust: projection identical to full ledger replay     ✓
 1. **Deposit legal characterisation** (assumption 1). Highest-consequence open item; must be settled before Phase 10.
 2. **Trigger-heavy design.** Eleven trigger functions carry capacity, seq, trust, audit, rating and approval invariants. Deliberate — they hold regardless of caller — but invisible from application code. Every trigger has a named test; bulk-import paths must be reviewed against them (the benchmark seed already had to disable the audit guard explicitly, which is the intended friction).
 3. **`interest_ids` denormalisation** is a filtered second copy of active `user_interests`. Selection changes and editorial activation changes are trigger-maintained and tested, but a bulk operation that explicitly bypasses row triggers would still drift it. A later reconciliation remains defence in depth, not the mechanism that makes ordinary deactivation safe.
-4. **Matching `N` uncalibrated.** The proof and recall guard are complete; the numbers need Phase 4's scoring implementation.
+4. **Resolved in Phase 4 — matching `N` calibration.** The initial configurable cap is 50, selected from the reproducible 50/100/200/500 sweep recorded in §22. The synthetic, warm-cache, single-connection measurement is an initial calibration rather than a throughput claim.
 5. **`payment_events.payload`** stores raw webhooks — justified as dispute evidence, but may contain personal data and needs a retention policy in Phase 10.
 6. **Resolved in Phase 2 — outbox relay operations.** The dedicated worker deployable now runs the relay continuously, publishes with deterministic BullMQ job IDs, re-drives expired leases, records retry diagnostics/backoff, and shuts down without claiming new work. Payment-provider business logic remains deferred.
 7. **Scale is uncharacterised.** No sharding or read replicas are modelled. The only measured figures are the §13 single-query latencies — 0.276 ms for the matching predicate, 0.073 ms for Explorer — taken single-connection, warm-cache, with parallelism disabled. **These are latency measurements, not throughput results.** No concurrent-load or QPS benchmark has been run, so this document makes no claim about supported user counts. Capacity planning requires a mixed read/write workload benchmark at target concurrency, which is Phase 13 work.
@@ -1118,3 +1118,164 @@ docs/superpowers/specs/2026-08-20-tripwith-phase-1-design.md
 - The ignored local Claude file remains in earlier Git history with machine-local paths (no credential pattern found). Removing it from future snapshots does not rewrite history; a history rewrite was neither necessary nor requested.
 
 **Phase 3 is fully closed after the post-review correction gate. Phase 4 was not started and still requires explicit approval.**
+
+---
+
+## 22. Phase 4 — Trips & Matching Addendum
+
+**Completed:** 2026-08-21
+
+**Approval state:** Phase 4 is implemented, integrated and verified on `phase4/trips-matching`. Phase 4 is closed; no merge or Phase 5 work was performed.
+
+Phase 4 used three bounded implementation workstreams—Trips, Candidate Generation/Scoring, and Swipes/Matches—with the Lead owning integration, cache/privacy behavior, benchmarking, review, regression gates and this canonical close-out. It adds no Explorer, event lifecycle, payment-provider, messaging, Trust Score mutation, Marketplace, SOS or mobile behavior.
+
+### Trips
+
+The authenticated owner API is:
+
+```text
+POST   /api/v1/me/trips
+GET    /api/v1/me/trips
+GET    /api/v1/me/trips/:tripId
+PATCH  /api/v1/me/trips/:tripId
+DELETE /api/v1/me/trips/:tripId
+POST   /api/v1/me/trips/:tripId/segments
+PATCH  /api/v1/me/trips/:tripId/segments/:segmentId
+DELETE /api/v1/me/trips/:tripId/segments/:segmentId
+```
+
+- Ownership comes only from `@CurrentUser`; another user's aggregate is indistinguishable from a missing one. DTO whitelisting rejects a body-supplied owner ID, and UUID path parameters are validated before the service boundary.
+- Dates are exact `YYYY-MM-DD` calendar values with the canonical inclusive semantics. Same-day trips and segments are valid. Segment dates must be fully contained by the parent trip.
+- Segment coordinates remain `GEOGRAPHY(POINT,4326)`. Latitude/longitude, destination fields, bounded JSON metadata and calendar dates are validated before persistence.
+- Parent-row write locks serialize segment changes. Every mutation persists a dense deterministic `sort_order = 0…n-1`; array saves are deliberately issued sequentially on the transaction client.
+- `PRIVATE`, `MATCHES_ONLY` and `PUBLIC` trips are all owner-readable and may supply internal matching facts. Phase 4 exposes none of their titles, destination text, dates or coordinates in the matching feed. Matching considers only non-ended segments at the request's UTC date.
+- Every committed trip/segment mutation bumps the owner's Redis feed generation. Redis failure cannot roll back the PostgreSQL mutation; cached security/privacy predicates are still revalidated from PostgreSQL.
+
+### Candidate generation and exact scoring
+
+`GET /api/v1/matching/feed` is authenticated and uses a validated `limit` plus an opaque signed cursor. PostgreSQL performs the hard-elimination and anchor stages. It excludes self; inactive/deleted, undiscoverable or effectively ghosted accounts; stale required-policy consent; active matching/full restrictions; blocks in either direction; the viewer's previous swipes; mutual age failures; trust-threshold failures; and candidates without a future date-and-distance itinerary anchor. Interests and travel style remain ranking signals rather than hard filters.
+
+The implementation preserves the approved equations:
+
+```text
+p(a,b) = 1[date overlap > 0 and distance <= R]
+         * (0.20 destination + 0.50 temporal + 0.30 geographic)
+
+p*      = max p(a,b)
+breadth = average over viewer segments of their best candidate-segment p
+I       = 0.75 p* + 0.25 breadth
+
+T = candidate trust_score / 10
+S = 1 - abs(viewer_style - candidate_style) / 4
+P = Jaccard(active interest IDs)
+M = 0.40 I + 0.30 T + 0.20 S + 0.10 P
+```
+
+The SQL coarse bound substitutes `p*` for `I`, so `I <= p*` and `M <= M_ub`. SQL orders by `M_ub DESC, user_id ASC`, retrieves `N+1`, and TypeScript exact-scores/sorts the first `N` by `M DESC, user_id ASC`. At runtime the page is marked exact only when the next unscored upper bound `U` satisfies `U <= M_(K)` (or the SQL universe is exhausted). Failure increments `matching.recall_unproven`, emits a structured warning and returns `rankingExact=false`; exactness is never claimed silently. Deterministic coarse keyset continuation allows pagination beyond the first exact-scored batch.
+
+Pure scoring tests cover each component, manually calculable examples, inclusive boundaries, multiple-segment breadth and 2,000 deterministic randomized admissibility cases. Live PostgreSQL/PostGIS tests prove mutual age filtering, all hard exclusions, spherical distance and SQL/TypeScript `M_ub` parity. The existing composite `trip_segments_loc_range_gix` serves the date/distance anchor.
+
+### Performance and initial `N`
+
+The reproducible fixture creates 5,001 users, 10,002 segments, four geographic hubs, three date cohorts, 20 active interests with four selections per user, hard-filter cohorts, and distributed block/swipe rows. Twenty-four eligible viewers were sampled for each cap (96 measured requests). The final warm-cache, single-process/single-connection run produced:
+
+| `N` | Candidate SQL p50/p95 | Exact scoring p50/p95 | Total p50/p95 | Recall unproven | Cache payload p95 |
+|---:|---:|---:|---:|---:|---:|
+| 50 | 863.255 / 1256.479 ms | 0.863 / 1.423 ms | 864.971 / 1258.582 ms | 0/24 | 23,240 B |
+| 100 | 863.048 / 1277.519 ms | 1.617 / 2.035 ms | 865.476 / 1280.041 ms | 0/24 | 46,595 B |
+| 200 | 864.979 / 1270.519 ms | 3.075 / 3.757 ms | 869.543 / 1275.109 ms | 0/24 | 93,068 B |
+| 500 | 868.396 / 1282.876 ms | 7.781 / 8.473 ms | 877.778 / 1292.751 ms | 0/24 | 231,819 B |
+
+The average anchored survivor count was 1,992.8. `N=50` is the configurable initial default because every sampled top-20 proof succeeded at every cap, while 50 minimized exact-scoring work, total median and cache size. Startup rejects `candidateCap < maxPageSize`.
+
+`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` used `trip_segments_loc_range_gix`, `swipes_source_idx`, `user_blocks_blocker_idx`, `user_blocks_blocked_idx`, `user_consents_lookup_idx` and relevant identity indexes. Splitting the bidirectional block predicate into two anti-joins made both existing direction indexes explicit to the planner. No index or schema change was required.
+
+Limitations are material: this is deterministic synthetic data, warm cache, one local PostgreSQL connection, 24 sampled viewers and no concurrent mixed workload. The roughly 0.86 s median candidate SQL is a tuning signal, not a supported-user-count claim. Production capacity and query-shape tuning require a concurrent workload with production-like geographic/date skew.
+
+### Cache, cursors and privacy
+
+- Ranked batches use `feed:v{generation}:{viewerId}:{filterHash}` with a 90-second TTL; continuation batches append a deterministic keyset hash. The cached value contains ranking/safe display state, never authoritative authorization.
+- O(1) `INCR feed:gen:{viewerId}` invalidates on trip/segment, swipe, interest, travel-style, discovery, Ghost, age/trust and distance-preference changes. No Redis `SCAN` or cross-user fan-out is used.
+- HMAC-SHA256 cursors bind the viewer, generation, filter hash, immutable cache snapshot, coarse batch and last exact `(score,user_id)`. Tampering, cross-user replay, generation drift and expired snapshots fail with stable invalid/stale cursor errors instead of mixing feeds.
+- Before every response, PostgreSQL rechecks viewer eligibility and candidate account/discovery/Ghost/consent/restriction/block state. Previous viewer swipes are also rechecked, closing generation-bump failure/race windows. A hidden candidate is removed before serialization; cached profile/ranking data alone may be stale for at most the TTL.
+- Responses contain only internal candidate ID, display name/avatar, country, spoken languages, style, trust, common active-interest IDs, score and score components. Firebase UID, contact data, DOB/age, consent/restriction state and all itinerary descriptions/dates/coordinates are absent.
+
+Required metrics are emitted through the existing abstraction: `matching.candidate_generation_ms`, `matching.candidates_hard_filtered`, `matching.candidates_exact_scored`, `matching.cache_hit`, `matching.cache_miss`, `matching.cache_revalidated_removed`, `matching.recall_unproven`, `matching.request_ms` and `matching.error`. Logs carry diagnostics, never DOB or itinerary coordinates.
+
+### Swipes and mutual matches
+
+`POST /api/v1/matching/swipes` accepts a validated v4 `targetUserId` and `LIKE` or `PASS`. The source is always the authenticated internal user. The first direction is final; an identical retry is idempotent, while an attempt to change it returns `SWIPE_ALREADY_EXISTS`. Self, absent, hidden, blocked, restricted or otherwise ineligible targets share the non-enumerating `SWIPE_TARGET_INVALID` boundary.
+
+The unordered user pair is canonicalized and protected by a transaction-scoped advisory lock. A reciprocal pair of `LIKE` rows creates one canonical `matches` row, one `MATCH` `chat_rooms` row and exactly two `chat_members` rows in one transaction. The existing unique constraints remain the backstop for non-cooperating writers, and a losing writer removes its unused room. The 2-way race and repeated retries converge to 2 swipes, 1 match, 1 room, 2 members and 0 messages. Chat messaging remains Phase 7 work.
+
+### Interest projection operations
+
+Phase 4 consumes Phase 3's active-interest projection and adds an operator-safe drift seam: `matching:reconcile-interests` reports and idempotently repairs `user_profiles.interest_ids` from active `user_interests`. Its live corruption/repair test proves detect → repair → clean convergence. Normal application and editorial writes continue to rely on the existing Phase 3 triggers.
+
+### Integrated code-review findings and fixes
+
+No Critical or High finding remained. Concrete Medium correctness/security/reliability findings were fixed:
+
+1. **Finding →** Trip controller DTOs were imported with `import type`. **Impact →** emitted Nest parameter metadata became `Object`, so global runtime DTO validation could be bypassed on new trip HTTP routes. **Fix →** use value imports at the controller boundary. **Verification →** reflection asserts `CreateTripDto` metadata and whitelist injection tests reject a body `userId`.
+2. **Finding →** the first feed implementation stopped permanently after the first `N` exact-scored candidates. **Impact →** valid deeper candidates were unreachable and cursor pagination was incomplete. **Fix →** add deterministic coarse keyset continuation batches with separately cached snapshots. **Verification →** consuming one batch automatically loads the next without `OFFSET` and preserves deterministic order.
+3. **Finding →** the first cursor shape was not bound to the authenticated viewer and immutable cache snapshot. **Impact →** signed cursor replay across accounts or a regenerated same-generation cache could mix feed state. **Fix →** bind viewer, generation, filters, snapshot and batch under HMAC. **Verification →** tamper, cross-viewer, generation-change and cache-expiry tests all fail closed.
+4. **Finding →** one correlated `OR` expressed both block directions. **Impact →** the realistic benchmark plan used only one directional block index and made the other direction dependent on a less predictable plan. **Fix →** split it into two equivalent `NOT EXISTS` anti-joins in matching, cache revalidation and swipe target validation. **Verification →** final `EXPLAIN ANALYZE` reports both directional block indexes and the live suite excludes both directions.
+5. **Finding →** configuration allowed `candidateCap < maxPageSize`. **Impact →** a valid requested page could exceed the exact-scored batch and return a misleadingly short page. **Fix →** cross-field startup validation requires the candidate cap to cover the maximum page. **Verification →** invalid configuration fails and the calibrated defaults are both 50.
+6. **Finding →** a previous swipe was eliminated during initial generation but not during cached-page revalidation. **Impact →** if the generation bump failed or raced, a decided candidate could reappear until TTL expiry. **Fix →** include the viewer's existing swipe in the PostgreSQL response-time boundary. **Verification →** a post-cache swipe immediately removes the candidate before the next response.
+
+The focused review found no SQL injection path, cross-owner mutation, private itinerary leak, raw geographic response, Redis-as-authorization dependency, duplicate-match race or unbounded cursor payload. Production dependency audit reports no known vulnerabilities.
+
+### Final verification snapshot
+
+```text
+strict workspace TypeScript                  PASS (API + shared)
+Nest build                                    PASS
+actual API boot + graceful SIGINT             PASS (Trips/Matching/Swipes composed)
+actual worker/relay boot + graceful SIGINT    PASS
+GET /health/live                              PASS (HTTP 200)
+GET /health/ready                             PASS (HTTP 200; PostgreSQL + both Redis healthy)
+unauthenticated GET /api/v1/matching/feed     PASS (HTTP 401, AUTH_TOKEN_MISSING)
+API Jest, open-handle detection               53 suites, 317 tests passed, 0 failed
+Phase 4 focused gate                          13 suites, 65 tests passed, 0 failed
+Phase 3 focused regression                    11 suites, 76 tests passed, 0 failed
+Firebase authentication focus                  5 suites, 38 tests passed, 0 failed
+age unit/live PostgreSQL focus                  2 suites, 17 tests passed, 0 failed
+shared TS + live PostgreSQL parity             18 passed, 0 failed (7 live SQL cases)
+enum parity                                    23 ENUM types, 89 values, 0 drift
+Phase 1 invariant suite                        100 passed, 0 failed
+24-way capacity race                            5 committed, 19 rejected, 0 overbooked
+automatic outbox process/redelivery            PASS (included in full API gate)
+dependency loss/recovery readiness             PASS (included in full API gate)
+production dependency audit                    PASS (no known vulnerabilities)
+matching benchmark                             PASS (96 requests; all proof conditions met)
+migration up -> down -> up                     NOT RE-RUN: no schema/entity/migration change
+```
+
+### Files changed in Phase 4
+
+```text
+apps/api/src/trips/**                           owner trip/segment API, validation, locks and tests
+apps/api/src/matching/**                        candidates, scoring, feed/cache/cursors, benchmark and tests
+apps/api/src/swipes/**                          swipe/match transaction, API and race tests
+apps/api/src/database/scripts/
+  reconcile-interest-projection.sql
+  seed-matching-benchmark.sql
+  cleanup-matching-benchmark.sql
+apps/api/src/{app.module,config/**,redis/cache.service}.ts
+apps/api/src/{users,settings}/**                 viewer-generation integration and regressions
+apps/api/{package.json,.env.example,test/setup-env.ts}
+docs/superpowers/specs/2026-08-20-tripwith-phase-1-design.md
+```
+
+There are no changes to migrations, schema SQL, TypeORM entities, shared enums/date logic, infrastructure topology, Phase 1 invariant/concurrency scripts or PaymentProvider behavior. No dependency or machine package was installed. Benchmark fixtures were removed after measurement. The branch still starts at `6236026e2ad22afb16f3ed5760ac1807c7a3d370`; the integrated Phase 4 working tree was intentionally not committed, merged or pushed by this gate.
+
+### Remaining non-blocking risks
+
+- The synthetic benchmark's candidate SQL p50/p95 is approximately 0.86/1.26 seconds with about 1,993 anchored survivors. Before production scale, profile the plan under concurrent production-like data, then tune query shape/data distribution; do not infer capacity from this run.
+- `N=50` achieved 0/96 unproven recalls for the sampled top-20 requests, not a universal recall guarantee. `matching.recall_unproven` and the configurable cap are the operational feedback loop; increase `N` only from observed evidence.
+- Segment containment and dense ordering are transactionally enforced by the owner API but are not new database triggers. Existing composite FKs prevent cross-parent ownership drift, while a privileged direct-SQL writer can still create out-of-parent dates or sparse order and must use controlled import validation.
+- Ranking/profile data can remain stale for the 90-second cache TTL. Security/privacy and previous-swipe state are revalidated at response time; ordinary score/display freshness is deliberately not zero-staleness.
+- Generation bumps are best-effort Redis operations after PostgreSQL commit. Redis loss can therefore retain stale ranking until TTL, but cannot expose a currently blocked, hidden, restricted, unusable, non-consenting or already-swiped account because those predicates are rechecked from PostgreSQL.
+- The existing Phase 2/3 non-failing ts-jest isolated-modules, shared implicit-ESM and pnpm audit `url.parse()` warnings remain tooling/dependency diagnostics.
+
+**Phase 4 Trips & Matching ends here and is fully closed. Do not begin Phase 5 without explicit approval.**

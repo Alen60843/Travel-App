@@ -11,6 +11,7 @@ import { loadConfig } from '../config/configuration';
 import { ConsentPolicyService } from '../consent/consent-policy.service';
 import { AppDataSource } from '../database/data-source';
 import { UserEntity, UserSettingsEntity } from '../database/entities';
+import type { FeedGenerationService } from '../matching/feed-generation.service';
 import { ConsentService } from '../consent/consent.service';
 import { SettingsService } from './settings.service';
 
@@ -54,11 +55,16 @@ async function createAccount(): Promise<SeededAccount> {
 describe('settings, privacy, and consent (real PostgreSQL)', () => {
   let settings: SettingsService;
   let consents: ConsentService;
+  const feedGeneration = { bump: jest.fn().mockResolvedValue(1) };
 
   beforeAll(async () => {
     await AppDataSource.initialize();
     const policy = new ConsentPolicyService(loadConfig());
-    settings = new SettingsService(AppDataSource, policy);
+    settings = new SettingsService(
+      AppDataSource,
+      policy,
+      feedGeneration as unknown as FeedGenerationService,
+    );
     consents = new ConsentService(AppDataSource, policy);
   });
 
@@ -100,6 +106,7 @@ describe('settings, privacy, and consent (real PostgreSQL)', () => {
       locale: 'fr-FR',
       timezone: 'Europe/Paris',
     });
+    expect(feedGeneration.bump).toHaveBeenCalledWith(owner.user.id);
 
     const unchangedOther = await settings.getOwn(other.user.id);
     expect(unchangedOther).toMatchObject({

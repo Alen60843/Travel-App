@@ -19,6 +19,7 @@ const defaults: Record<string, string> = {
   CURRENT_PRIVACY_POLICY_VERSION: 'privacy-test-v1',
   REDIS_QUEUE_URL: process.env.TEST_REDIS_QUEUE_URL ?? 'redis://localhost:6399',
   REDIS_CACHE_URL: process.env.TEST_REDIS_CACHE_URL ?? 'redis://localhost:6398',
+  MATCHING_CURSOR_SECRET: 'test-only-matching-cursor-secret-32-bytes',
   FIREBASE_PROJECT_ID: 'tripwith-test',
   S3_ENDPOINT: 'http://localhost:9000',
   S3_REGION: 'eu-central-1',

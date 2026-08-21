@@ -6,6 +6,7 @@ import { ConsentModule } from './consent';
 import { DatabaseModule } from './database/database.module';
 import { DatabaseReadinessCheck } from './database/database-readiness.check';
 import { HealthModule } from './health/health.module';
+import { MatchingModule } from './matching';
 import { READINESS_CHECK, type ReadinessCheck } from './health/readiness-check.interface';
 import { ObservabilityModule } from './observability/observability.module';
 import { OutboxModule } from './outbox/outbox.module';
@@ -15,6 +16,8 @@ import { RedisReadinessCheck } from './redis/redis-readiness.check';
 import { RealtimeModule } from './realtime/realtime.module';
 import { SOCKET_AUTHENTICATOR } from './realtime/socket-authenticator';
 import { SettingsModule } from './settings';
+import { SwipesModule } from './swipes';
+import { TripsModule } from './trips';
 import { UsersModule } from './users';
 
 /**
@@ -81,6 +84,9 @@ export class ReadinessRegistryModule {}
     UsersModule,
     SettingsModule,
     ConsentModule,
+    TripsModule,
+    MatchingModule,
+    SwipesModule,
 
     // Phase 3 explicitly replaces the infrastructure shell's fail-closed
     // authenticator with Firebase verification plus internal-user resolution.

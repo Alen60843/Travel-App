@@ -37,6 +37,8 @@ const VALID_ENV: NodeJS.ProcessEnv = {
   OUTBOX_LEASE_MS: '300000',
   OUTBOX_ENABLED: 'true',
 
+  MATCHING_CURSOR_SECRET: 'production-matching-cursor-secret-32-bytes',
+
   FIREBASE_PROJECT_ID: 'tripwith-prod',
   FIREBASE_CLIENT_EMAIL: 'svc@tripwith-prod.iam.gserviceaccount.com',
   FIREBASE_PRIVATE_KEY: '-----BEGIN PRIVATE KEY-----\\nabc\\n-----END PRIVATE KEY-----\\n',
@@ -83,6 +85,15 @@ describe('loadConfig — valid input', () => {
       currentPrivacyPolicyVersion: 'privacy-2026-08-21',
     });
     expect(config.redisQueue.url).toBe('redis://queue.internal:6379');
+    expect(config.matching).toEqual({
+      anchorRadiusKm: 100,
+      pairWeights: { destination: 0.2, temporal: 0.5, geographic: 0.3 },
+      breadthBeta: 0.25,
+      candidateCap: 50,
+      maxPageSize: 50,
+      feedTtlSeconds: 90,
+      cursorSecret: 'production-matching-cursor-secret-32-bytes',
+    });
     expect(config.observability.level).toBe('info');
   });
 
@@ -138,6 +149,34 @@ describe('loadConfig — valid input', () => {
 
     expect('clientEmail' in config.firebase).toBe(false);
     expect('privateKey' in config.firebase).toBe(false);
+  });
+
+  it('rejects matching pair weights that do not sum to one', () => {
+    expect(() =>
+      loadConfig({ ...VALID_ENV, MATCHING_PAIR_TEMPORAL_WEIGHT: '0.6' }),
+    ).toThrow(ConfigValidationError);
+  });
+
+  it('rejects a matching candidate cap smaller than a permitted page', () => {
+    expect(() =>
+      loadConfig({
+        ...VALID_ENV,
+        MATCHING_CANDIDATE_CAP: '25',
+        MATCHING_MAX_PAGE_SIZE: '50',
+      }),
+    ).toThrow(ConfigValidationError);
+  });
+
+  it('requires an independent cursor-signing secret in production', () => {
+    expect(() => loadConfig(envWithout('MATCHING_CURSOR_SECRET'))).toThrow(
+      ConfigValidationError,
+    );
+
+    const local = loadConfig({
+      ...envWithout('MATCHING_CURSOR_SECRET', 'DB_SSL', 'DB_SSL_CA'),
+      NODE_ENV: 'test',
+    });
+    expect(local.matching.cursorSecret).toBe('tripwith-local-only-matching-cursor-secret');
   });
 
   it('rejects a partial Firebase service-account credential pair', () => {
