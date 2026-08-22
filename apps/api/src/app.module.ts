@@ -5,6 +5,7 @@ import { ConfigModule } from './config/config.module';
 import { ConsentModule } from './consent';
 import { DatabaseModule } from './database/database.module';
 import { DatabaseReadinessCheck } from './database/database-readiness.check';
+import { ExplorerModule } from './explorer';
 import { HealthModule } from './health/health.module';
 import { MatchingModule } from './matching';
 import { READINESS_CHECK, type ReadinessCheck } from './health/readiness-check.interface';
@@ -54,9 +55,9 @@ export class ReadinessRegistryModule {}
 /**
  * Root module — the composition root, owned by the Lead.
  *
- * Phase 2 wires infrastructure; Phase 3 adds only identity-domain modules.
- * Trips, Explorer, Matching, Events, Chat, Marketplace, Payments, Trust and
- * Safety remain intentionally absent until their approved phases.
+ * Phase 2 wires infrastructure; Phases 3–5 add their approved domain modules.
+ * Events lifecycle, Chat, Marketplace, Payments, Trust and Safety remain
+ * intentionally absent until their approved phases.
  *
  * Import order below follows the dependency direction rather than
  * alphabetical: configuration and observability first because everything
@@ -87,6 +88,7 @@ export class ReadinessRegistryModule {}
     TripsModule,
     MatchingModule,
     SwipesModule,
+    ExplorerModule,
 
     // Phase 3 explicitly replaces the infrastructure shell's fail-closed
     // authenticator with Firebase verification plus internal-user resolution.

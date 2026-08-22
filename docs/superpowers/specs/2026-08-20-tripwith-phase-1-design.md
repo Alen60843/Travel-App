@@ -1398,3 +1398,110 @@ No orchestrator command automatically merges into a phase branch, pushes a remot
 This tooling work did not start Phase 5 Explorer implementation.
 
 **Updated:** 2026-08-22 — a post-review correction pass fixed two confirmed findings without changing the architecture above: (1) the optional Solver/Verifier workflow mode's Fixer/Re-Verifier/Judge tasks are now genuinely conditional (a new `SKIPPED` task state, evaluated against validated review artifacts, never on free-form text) instead of always running as no-ops; (2) Codex/Claude executable discovery now checks `CODEX_EXECUTABLE`/`CLAUDE_EXECUTABLE` overrides and a conservative VS Code extension fallback before failing, and the plan-time resolved path is guaranteed to be the exact path the runtime adapter spawns. Still local, still no automatic merge/push, still did not start Phase 5. Details live in `tools/agent-orchestrator/README.md`.
+
+---
+
+## 25. Phase 5 Explorer addendum
+
+**Completed:** 2026-08-22
+
+Phase 5 adds the authenticated, read-only Explorer event-discovery boundary and composes `ExplorerModule` into the API. It adds no event lifecycle mutation, migration, spatial index, Redis cache, live-user-location lookup or mobile map implementation.
+
+### Endpoint contract and bounds
+
+`GET /api/v1/explorer/events` is protected by `TripWithAuthGuard`. The controller passes only the guard-resolved internal user ID to the service; a client-supplied user ID is rejected by the global whitelist and is never an authorization input. The current result is not personalized, but retaining the authenticated identity seam prevents a future client-selected identity path.
+
+Each request supplies exactly one spatial shape:
+
+- Viewport: `south`, `west`, `north` and `east`. Latitude and longitude must be valid WGS84 coordinates, `south < north`, the area must be non-zero, and spans are capped at 60 degrees latitude and 120 degrees longitude. `west > east` deliberately denotes an antimeridian-crossing viewport.
+- Radius: `centerLatitude`, `centerLongitude` and integer `radiusMeters`, bounded to 100–500,000 metres.
+
+Both forms require integer `zoom` 1–22. `limit` defaults to 100 and is bounded to 1–200. An optional category filter contains at most 20 unique canonical codes and every code must exist in `event_categories`. Time bounds must be supplied as an explicit-offset `windowStart`/`windowEnd` pair, ordered and no longer than 90 days. With no pair, discovery uses now through 30 days; a past start is clamped to now so it cannot expand discovery into elapsed time. Malformed, mixed, incomplete or abusive shapes fail with a non-enumerating 422 response.
+
+The response reports the normalized spatial mode and UTC window, the exact discoverable event count, and at most `limit` markers. An event pin exposes only `id`, `title`, `status`, coordinate, `startsAt`, `endsAt`, optional `meetingPointLabel`, and category `code`/`label`/`icon`. It never serializes an `EventEntity`. A cluster exposes only its deterministic ID, representative coordinate, exact event count and per-category code/count summary.
+
+### Spatial, temporal and privacy semantics
+
+Explorer reads only `events.meeting_point`, the canonical SRID 4326 `geography` point. Radius discovery reuses `GeoService.withinRadius()` and PostGIS `ST_DWithin`, so distance is interpreted in metres with geography semantics. Viewports reuse `GeoService.withinBoundingBox()` and `ST_Intersects` against safe envelopes. Because the shared helper correctly rejects crossing boxes, Explorer composes a crossing viewport as one parameterized SQL predicate containing `[west, 180] OR [-180, east]`. The single query avoids union/merge duplication and retains deterministic output ordering. The equivalent `+180`/`-180` endpoints are canonicalized before this split.
+
+Time relevance is generated-column overlap:
+
+```sql
+event.time_range && tstzrange(:windowStart, :windowEnd, '[)')
+```
+
+Inputs require `Z` or an explicit numeric offset, PostgreSQL sessions use UTC, and the half-open range agrees with the canonical generated `tstzrange`; no deployment-local time interpretation is introduced.
+
+The non-negotiable discoverability predicate is:
+
+```sql
+event.visibility = 'PUBLIC'
+AND event.status IN ('ACTIVE', 'FULL')
+```
+
+That predicate, time overlap, the `meeting_point` spatial predicate and any category filter are applied inside a `MATERIALIZED discoverable` CTE before every bucket, count, centroid, category summary, cluster ID or cluster-existence decision. Consequently DRAFT, IN_PROGRESS, COMPLETED, CANCELLED, PRIVATE and UNLISTED rows cannot appear as pins or influence aggregates. Explorer never reads user live locations, trip segment locations, SOS coordinates or another hidden/private coordinate. Category presentation data comes from `event_categories`, not a hard-coded Explorer list.
+
+### Adaptive clustering and bounded work
+
+Individual event pins are returned only when `zoom > 14` and the complete discoverable population fits within the requested marker limit. Otherwise PostgreSQL aggregates the complete filtered population on a deterministic world grid. The base cell size is `90 / 2^zoom` degrees; a geometry-derived power-of-two scale is selected so the request extent intersects no more than `limit` cells. The limit therefore controls the SQL pin/cluster decision, aggregation granularity and parameterized outer `LIMIT`, rather than only truncating an application-side result.
+
+Cluster IDs encode zoom, scale and grid coordinates. Latitude is the arithmetic mean; longitude uses a circular mean so dateline clusters do not incorrectly centre near zero, and both are rounded to six decimal places. Category summaries are ordered by descending count then code. Marker rows are deterministically ordered by earliest start and marker ID. Aggregation is exact, not sampled. A materialized candidate ceiling stops after 100,001 rows and fails closed with `EXPLORER_QUERY_TOO_BROAD` above 100,000 rather than returning incomplete counts or centroids.
+
+### Caching decision
+
+No Explorer cache was added. Phase 1 anticipated viewport-result caching, but Phase 5 first establishes an uncached, privacy-correct and index-supported baseline. The evidence is warm-cache single-query latency, not production concurrency or a repeated-pan hit-rate measurement, and the invalidation contract for event status, visibility, time, meeting point and category changes has not yet been proven. Adding Redis now would add cache-key and stale-privacy failure modes without measured justification. A later phase may introduce caching only after production-like traffic demonstrates need and must key every normalized spatial, time, zoom, limit and category dimension while preserving the PostgreSQL privacy boundary.
+
+No shared environment configuration was added for Explorer. Its validated contract bounds and benchmark-coupled clustering/candidate constants stay together in the Explorer implementation; making them independent deployment knobs would permit unbenchmarked query shapes. No new index or migration was needed.
+
+### PostGIS benchmark and EXPLAIN evidence
+
+`explorer-postgis-benchmark.sql` builds a deterministic 150,000-event fixture inside one transaction: 120,000 events distributed across 24 travel hubs and 240 days, plus 30,000 events in a dense Paris area. It includes independent combinations of status and visibility, 103,500 total discoverable events, 25,500 discoverable dense-fixture events, active editorial categories, and points on both sides of the antimeridian. It inserts a temporary host, analyzes the in-transaction data, and rolls back every event, user and trigger-written status-history row; post-rollback assertions found zero fixture rows.
+
+The reference run used PostgreSQL 17.11 and PostGIS 3.6.4 with warm cache, 128 MB `shared_buffers`, JIT and parallelism disabled, two warm-ups, then 15 consecutive measured `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` executions per scenario. The harness emits the exact production-shaped query, full dataset metadata and a representative JSON plan rather than selecting a favourable sample.
+
+| Scenario | p50 | p95 | Rows | p50 buffers |
+|---|---:|---:|---:|---:|
+| Small viewport, adaptive | 9.455 ms | 9.496 ms | 62 | 2,242 |
+| Medium viewport, adaptive | 66.475 ms | 72.656 ms | 42 | 26,645 |
+| Large viewport, adaptive | 75.804 ms | 76.742 ms | 5 | 12,697 |
+| 25 km radius, adaptive | 23.111 ms | 24.155 ms | 12 | 35,818 |
+| Antimeridian viewport, adaptive | 5.552 ms | 6.745 ms | 1 | 8,543 |
+| Dense viewport, adaptive | 14.118 ms | 14.818 ms | 2 | 6,689 |
+| Maximum 500 km radius, adaptive | 71.469 ms | 74.874 ms | 3 | 11,879 |
+| Maximum 60 by 120 degree viewport, adaptive | 232.658 ms | 240.456 ms | 18 | 33,607 |
+
+Every representative plan used the existing partial composite GIST index `events_discoverable_geo_time_gix`, including the permitted radius and viewport extremes. The dense privacy proof began with 7,000 spatial/time candidates, excluded 1,500 non-discoverable rows before aggregation, and clustered exactly 5,500 discoverable rows with matching weighted centroids. These measurements validate single-query shape and index selection, not throughput, concurrency or a production latency SLA.
+
+### Material review findings and resolutions
+
+The adversarial review raised three material findings; the correction task confirmed all three and rejected none:
+
+1. **F001 — confirmed:** the original 5,000-candidate application-side path rejected the legitimate 5,500-event dense benchmark instead of clustering it. **Resolution:** move privacy-first clustering into SQL, raise the independent fail-closed ceiling to 100,000, and verify the complete dense population returns bounded exact clusters.
+2. **F002 — confirmed:** the original large/dense benchmark used a different `GROUP BY` shape from the production ordered row fetch, leaving reachable worst cases unproven. **Resolution:** make production use the adaptive aggregation pipeline and benchmark that same SQL structure across eight scenarios, including both permitted extremes; all plans used the canonical index.
+3. **F003 — confirmed:** `limit` originally affected only application-side output after PostgreSQL fetched up to 5,001 events. **Resolution:** make `limit` determine the SQL pin/cluster branch, grid scale and outer bound; repository tests prove `limit=1` and `limit=200` select different scales and SQL limits.
+
+No schema/index escalation was warranted by review or evidence, and there was no remaining high/critical implementation disagreement requiring an architectural A/B choice.
+
+### Verification snapshot
+
+```text
+strict API TypeScript                              PASS
+focused Explorer Jest                              5 suites, 37 tests passed
+API unit regression, excluding integration/realtime 37 suites, 261 tests passed
+AppModule import with Explorer composed             PASS
+exact-shape PostgreSQL/PostGIS benchmark           PASS (8 scenarios; canonical index in every plan)
+dense pre-cluster privacy proof                    PASS (1,500 excluded; 5,500 aggregated)
+benchmark rollback cleanup                         PASS (zero fixture rows remain)
+normal TypeORM Explorer integration suite          ENVIRONMENT-BLOCKED (localhost PostgreSQL unavailable)
+frozen dependency install in integration worktree ENVIRONMENT-BLOCKED (registry DNS unavailable)
+```
+
+The focused suites cover primitive and cross-field validation, explicit-offset time handling, authenticated identity flow, response minimization, canonical discoverability, category metadata, radius geography, exact antimeridian composition, deterministic output, dense clustering, requested-limit propagation and the fail-closed candidate ceiling. The normal TypeORM integration suite could not connect to its local test service, but its final SQL shape executed successfully in the isolated migrated PostgreSQL/PostGIS benchmark environment.
+
+### Remaining non-blocking risks
+
+- The 240.456 ms p95 maximum-viewport result is a local warm-cache, single-connection measurement. Concurrent production-like load, cold-cache behaviour and an explicit latency budget remain unmeasured.
+- Repeated map pans currently reach PostgreSQL because caching and Explorer-specific throttling were not added. Observe request rate, density, latency and database saturation before choosing either control.
+- Legitimate requests above 100,000 discoverable events fail closed with 422. Production density telemetry may justify a different, re-benchmarked strategy; the ceiling must not be raised as an unmeasured configuration tweak.
+- Degree-grid cells have latitude-dependent physical sizes, especially near the poles. Aggregation, IDs and output bounds remain deterministic, and circular longitude averaging handles the dateline, but visual cluster footprints are not equal-area.
+- The standard TypeORM integration test still needs one run against the normal migrated PostgreSQL/PostGIS test service. The benchmark proves the SQL and index path but does not exercise Nest/TypeORM connection configuration.
