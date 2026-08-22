@@ -24,14 +24,17 @@
 -- discoverable). These are single-query latency measurements, not throughput:
 --
 --   scenario                             p50 ms   p95 ms   rows   p50 buffers
---   viewport_small_pins                    1.520    1.567    500          2,049
---   viewport_medium_pins                  36.626   37.120    500         26,127
---   viewport_large_clusters               45.152   45.537      6          5,222
---   radius_25km_pins                        9.668    9.844    500         24,707
---   viewport_antimeridian_split_pins        2.667    2.738    500          2,238
---   dense_viewport_clusters                10.459   10.833     37          6,161
+--   viewport_small_adaptive                9.455    9.496     62          2,242
+--   viewport_medium_adaptive              66.475   72.656     42         26,645
+--   viewport_large_adaptive               75.804   76.742      5         12,697
+--   radius_25km_adaptive                   23.111   24.155     12         35,818
+--   viewport_antimeridian_adaptive          5.552    6.745      1          8,543
+--   dense_viewport_adaptive                14.118   14.818      2          6,689
+--   radius_500km_adaptive                  71.469   74.874      3         11,879
+--   viewport_max_span_adaptive            232.658  240.456     18         33,607
 --
--- Every representative plan used events_discoverable_geo_time_gix. The dense
+-- Every representative plan used events_discoverable_geo_time_gix, including
+-- the permitted 500 km radius and 60 x 120 degree viewport extremes. The dense
 -- privacy proof saw 7,000 spatial/time candidates, excluded 1,500 before any
 -- aggregation, and clustered exactly the remaining 5,500 discoverable rows.
 -- Exact executable queries, full dataset metadata, and representative JSON
@@ -468,216 +471,290 @@ BEGIN
 END
 $benchmark$;
 
--- ---------------------------------------------------------------------------
--- Pin queries: bounded results, deterministic ordering, public/discoverable
--- predicate before category join/projection, generated time_range overlap,
--- and either viewport ST_Intersects or radius ST_DWithin on meeting_point.
--- ---------------------------------------------------------------------------
+-- Build the exact executable SQL shape used by ExplorerRepository. Keeping a
+-- single template here prevents the benchmark scenarios from silently
+-- substituting a cheaper fixed-grid GROUP BY or a different pin LIMIT. The
+-- only interpolated SQL is a code-controlled spatial predicate below; every
+-- runtime request value remains a bound parameter in production. Each call's
+-- power-of-two cluster scale is the exact value from explorerClusterScale();
+-- repository unit tests pin the dense and permitted-extreme values against
+-- this harness so the production calculation cannot drift silently.
+CREATE OR REPLACE FUNCTION pg_temp.explorer_adaptive_query(
+  p_spatial_predicate TEXT,
+  p_window_start TIMESTAMPTZ,
+  p_window_end TIMESTAMPTZ,
+  p_zoom INT,
+  p_marker_limit INT,
+  p_cluster_scale INT
+) RETURNS TEXT
+LANGUAGE plpgsql
+AS $adaptive_query$
+BEGIN
+  IF p_zoom < 1 OR p_zoom > 22
+     OR p_marker_limit < 1 OR p_marker_limit > 200
+     OR p_cluster_scale < 1
+     OR (p_cluster_scale & (p_cluster_scale - 1)) <> 0 THEN
+    RAISE EXCEPTION 'invalid benchmark zoom/limit/scale: %/%/%',
+      p_zoom, p_marker_limit, p_cluster_scale;
+  END IF;
 
-SELECT pg_temp.run_explorer_benchmark(
-  'viewport_small_pins',
-  'Paris street-scale viewport (~4 x 4 km), 7-day UTC window, LIMIT 500',
-  $query$
-    SELECT e.id,
-           e.starts_at,
-           ST_X(e.meeting_point::geometry) AS longitude,
-           ST_Y(e.meeting_point::geometry) AS latitude,
-           c.code AS category_code,
-           c.icon AS category_icon
-      FROM events e
-      JOIN event_categories c ON c.id = e.category_id
-     WHERE e.visibility = 'PUBLIC'
-       AND e.status IN ('ACTIVE', 'FULL')
-       AND e.time_range && tstzrange(
-             TIMESTAMPTZ '2030-06-01 00:00:00+00',
-             TIMESTAMPTZ '2030-06-08 00:00:00+00',
-             '[)'
-           )
-       AND ST_Intersects(
-             e.meeting_point,
-             ST_MakeEnvelope(2.3322, 48.8366, 2.3722, 48.8766, 4326)::geography
-           )
-     ORDER BY e.starts_at, e.id
-     LIMIT 500
-  $query$
-);
-
-SELECT pg_temp.run_explorer_benchmark(
-  'viewport_medium_pins',
-  'Paris metro viewport (~22 x 26 km), 30-day UTC window, LIMIT 500',
-  $query$
-    SELECT e.id,
-           e.starts_at,
-           ST_X(e.meeting_point::geometry) AS longitude,
-           ST_Y(e.meeting_point::geometry) AS latitude,
-           c.code AS category_code,
-           c.icon AS category_icon
-      FROM events e
-      JOIN event_categories c ON c.id = e.category_id
-     WHERE e.visibility = 'PUBLIC'
-       AND e.status IN ('ACTIVE', 'FULL')
-       AND e.time_range && tstzrange(
-             TIMESTAMPTZ '2030-06-01 00:00:00+00',
-             TIMESTAMPTZ '2030-07-01 00:00:00+00',
-             '[)'
-           )
-       AND ST_Intersects(
-             e.meeting_point,
-             ST_MakeEnvelope(2.2522, 48.7366, 2.4522, 48.9766, 4326)::geography
-           )
-     ORDER BY e.starts_at, e.id
-     LIMIT 500
-  $query$
-);
-
-SELECT pg_temp.run_explorer_benchmark(
-  'viewport_large_clusters',
-  'Western/Central Europe viewport (45 x 25 degrees), 30-day UTC window, 2-degree grid clusters',
-  $query$
+  RETURN format($query$
     WITH discoverable AS MATERIALIZED (
-      SELECT e.meeting_point
-        FROM events e
-       WHERE e.visibility = 'PUBLIC'
-         AND e.status IN ('ACTIVE', 'FULL')
-         AND e.time_range && tstzrange(
-               TIMESTAMPTZ '2030-06-01 00:00:00+00',
-               TIMESTAMPTZ '2030-07-01 00:00:00+00',
-               '[)'
-             )
-         AND ST_Intersects(
-               e.meeting_point,
-               ST_MakeEnvelope(-10.0, 35.0, 35.0, 60.0, 4326)::geography
-             )
-    ), bucketed AS (
-      SELECT floor((ST_X(meeting_point::geometry) + 10.0) / 2.0)::INT AS bucket_x,
-             floor((ST_Y(meeting_point::geometry) - 35.0) / 2.0)::INT AS bucket_y,
-             ST_X(meeting_point::geometry) AS longitude,
-             ST_Y(meeting_point::geometry) AS latitude
+      SELECT event.id AS event_id,
+             event.title,
+             event.status,
+             ST_Y(event.meeting_point::geometry) AS latitude,
+             ST_X(event.meeting_point::geometry) AS longitude,
+             category.code AS category_code,
+             category.label AS category_label,
+             category.icon AS category_icon,
+             event.starts_at,
+             event.ends_at,
+             event.meeting_point_label
+        FROM events event
+        JOIN event_categories category ON category.id = event.category_id
+       WHERE event.visibility = 'PUBLIC'
+         AND event.status IN ('ACTIVE', 'FULL')
+         AND event.time_range && tstzrange(%1$L::TIMESTAMPTZ, %2$L::TIMESTAMPTZ, '[)')
+         AND %3$s
+       LIMIT 100001
+    ), discovery_stats AS (
+      SELECT count(*)::INT AS event_count,
+             count(*) <= %5$s AND %4$s > 14 AS return_pins,
+             count(*) <= 100000 AS within_candidate_limit
         FROM discoverable
-    )
-    SELECT md5('grid-v1:2.0:' || bucket_x || ':' || bucket_y) AS cluster_id,
-           avg(longitude) AS longitude,
-           avg(latitude) AS latitude,
-           count(*)::INT AS event_count
-      FROM bucketed
-     GROUP BY bucket_x, bucket_y
-     ORDER BY bucket_y, bucket_x
-  $query$
-);
-
-SELECT pg_temp.run_explorer_benchmark(
-  'radius_25km_pins',
-  '25 km around Paris center, 14-day UTC window, LIMIT 500',
-  $query$
-    SELECT e.id,
-           e.starts_at,
-           ST_X(e.meeting_point::geometry) AS longitude,
-           ST_Y(e.meeting_point::geometry) AS latitude,
-           c.code AS category_code,
-           c.icon AS category_icon
-      FROM events e
-      JOIN event_categories c ON c.id = e.category_id
-     WHERE e.visibility = 'PUBLIC'
-       AND e.status IN ('ACTIVE', 'FULL')
-       AND e.time_range && tstzrange(
-             TIMESTAMPTZ '2030-06-01 00:00:00+00',
-             TIMESTAMPTZ '2030-06-15 00:00:00+00',
-             '[)'
-           )
-       AND ST_DWithin(
-             e.meeting_point,
-             ST_SetSRID(ST_MakePoint(2.3522, 48.8566), 4326)::geography,
-             25000
-           )
-     ORDER BY e.starts_at, e.id
-     LIMIT 500
-  $query$
-);
-
--- Explorer splits an antimeridian-crossing viewport into two ordinary safe
--- envelopes, then deterministically merges/deduplicates the bounded result.
-SELECT pg_temp.run_explorer_benchmark(
-  'viewport_antimeridian_split_pins',
-  'Dateline-crossing Pacific viewport split into [170,180] and [-180,-170], 30-day UTC window',
-  $query$
-    SELECT split.id,
-           split.starts_at,
-           ST_X(split.meeting_point::geometry) AS longitude,
-           ST_Y(split.meeting_point::geometry) AS latitude
-      FROM (
-        SELECT e.id, e.starts_at, e.meeting_point
-          FROM events e
-         WHERE e.visibility = 'PUBLIC'
-           AND e.status IN ('ACTIVE', 'FULL')
-           AND e.time_range && tstzrange(
-                 TIMESTAMPTZ '2030-06-01 00:00:00+00',
-                 TIMESTAMPTZ '2030-07-01 00:00:00+00',
-                 '[)'
+    ), bucketed AS MATERIALIZED (
+      SELECT LEAST(
+               ceil(360.0 / ((90.0 / power(2, %4$s)) * %6$s))::INT - 1,
+               GREATEST(
+                 0,
+                 floor((discoverable.longitude + 180.0) /
+                       ((90.0 / power(2, %4$s)) * %6$s))::INT
                )
-           AND ST_Intersects(
-                 e.meeting_point,
-                 ST_MakeEnvelope(170.0, -25.0, 180.0, -5.0, 4326)::geography
+             ) AS bucket_x,
+             LEAST(
+               GREATEST(
+                 0,
+                 ceil(180.0 / ((90.0 / power(2, %4$s)) * %6$s))::INT - 1
+               ),
+               GREATEST(
+                 0,
+                 floor((discoverable.latitude + 90.0) /
+                       ((90.0 / power(2, %4$s)) * %6$s))::INT
                )
-        UNION
-        SELECT e.id, e.starts_at, e.meeting_point
-          FROM events e
-         WHERE e.visibility = 'PUBLIC'
-           AND e.status IN ('ACTIVE', 'FULL')
-           AND e.time_range && tstzrange(
-                 TIMESTAMPTZ '2030-06-01 00:00:00+00',
-                 TIMESTAMPTZ '2030-07-01 00:00:00+00',
-                 '[)'
-               )
-           AND ST_Intersects(
-                 e.meeting_point,
-                 ST_MakeEnvelope(-180.0, -25.0, -170.0, -5.0, 4326)::geography
-               )
-      ) split
-     ORDER BY split.starts_at, split.id
-     LIMIT 500
-  $query$
-);
-
--- ---------------------------------------------------------------------------
--- Dense clustering query. MATERIALIZED makes the security boundary explicit:
--- visibility/status/time/viewport filtering completes before any bucket key,
--- count, or centroid is computed. Cluster IDs are deterministic hashes of the
--- fixed grid version/size and integer bucket coordinates.
--- ---------------------------------------------------------------------------
-
-SELECT pg_temp.run_explorer_benchmark(
-  'dense_viewport_clusters',
-  'Dense Paris viewport, 7-day UTC window, deterministic 0.02-degree grid clusters',
-  $query$
-    WITH discoverable AS MATERIALIZED (
-      SELECT e.id, e.meeting_point
-        FROM events e
-       WHERE e.visibility = 'PUBLIC'
-         AND e.status IN ('ACTIVE', 'FULL')
-         AND e.time_range && tstzrange(
-               TIMESTAMPTZ '2030-06-01 00:00:00+00',
-               TIMESTAMPTZ '2030-06-08 00:00:00+00',
-               '[)'
-             )
-         AND ST_Intersects(
-               e.meeting_point,
-               ST_MakeEnvelope(2.2522, 48.7366, 2.4522, 48.9766, 4326)::geography
-             )
-    ), bucketed AS (
-      SELECT floor((ST_X(meeting_point::geometry) - 2.2522) / 0.02)::INT AS bucket_x,
-             floor((ST_Y(meeting_point::geometry) - 48.7366) / 0.02)::INT AS bucket_y,
-             ST_X(meeting_point::geometry) AS longitude,
-             ST_Y(meeting_point::geometry) AS latitude
+             ) AS bucket_y,
+             discoverable.*
         FROM discoverable
+        CROSS JOIN discovery_stats
+       WHERE NOT discovery_stats.return_pins
+         AND discovery_stats.within_candidate_limit
+    ), category_counts AS (
+      SELECT bucket_x, bucket_y, category_code, count(*)::INT AS event_count
+        FROM bucketed
+       GROUP BY bucket_x, bucket_y, category_code
+    ), category_summaries AS (
+      SELECT bucket_x,
+             bucket_y,
+             jsonb_agg(
+               jsonb_build_object('code', category_code, 'eventCount', event_count)
+               ORDER BY event_count DESC, category_code ASC
+             ) AS categories
+        FROM category_counts
+       GROUP BY bucket_x, bucket_y
+    ), clustered AS (
+      SELECT bucketed.bucket_x,
+             bucketed.bucket_y,
+             round(avg(bucketed.latitude)::NUMERIC, 6)::DOUBLE PRECISION AS latitude,
+             round(
+               degrees(
+                 atan2(
+                   avg(sin(radians(bucketed.longitude))),
+                   avg(cos(radians(bucketed.longitude)))
+                 )
+               )::NUMERIC,
+               6
+             )::DOUBLE PRECISION AS longitude,
+             count(*)::INT AS event_count,
+             min(bucketed.starts_at) AS first_starts_at
+        FROM bucketed
+       GROUP BY bucketed.bucket_x,
+                bucketed.bucket_y
+    ), marker_rows AS (
+      SELECT discoverable.starts_at AS sort_starts_at,
+             discoverable.event_id::TEXT AS sort_id,
+             'event'::TEXT AS kind,
+             discoverable.event_id::TEXT AS marker_id,
+             discoverable.title,
+             discoverable.status::TEXT AS status,
+             discoverable.latitude,
+             discoverable.longitude,
+             discoverable.category_code,
+             discoverable.category_label,
+             discoverable.category_icon,
+             discoverable.starts_at,
+             discoverable.ends_at,
+             discoverable.meeting_point_label,
+             NULL::INT AS cluster_event_count,
+             NULL::JSONB AS categories
+        FROM discoverable
+        CROSS JOIN discovery_stats
+       WHERE discovery_stats.return_pins
+
+      UNION ALL
+
+      SELECT clustered.first_starts_at,
+             'cluster:z' || %4$s || ':s' || %6$s ||
+               ':x' || clustered.bucket_x || ':y' || clustered.bucket_y,
+             'cluster'::TEXT,
+             'cluster:z' || %4$s || ':s' || %6$s ||
+               ':x' || clustered.bucket_x || ':y' || clustered.bucket_y,
+             NULL::TEXT,
+             NULL::TEXT,
+             clustered.latitude,
+             clustered.longitude,
+             NULL::TEXT,
+             NULL::TEXT,
+             NULL::TEXT,
+             NULL::TIMESTAMPTZ,
+             NULL::TIMESTAMPTZ,
+             NULL::TEXT,
+             clustered.event_count,
+             category_summaries.categories
+        FROM clustered
+        JOIN category_summaries USING (bucket_x, bucket_y)
     )
-    SELECT md5('grid-v1:0.02:' || bucket_x || ':' || bucket_y) AS cluster_id,
-           avg(longitude) AS longitude,
-           avg(latitude) AS latitude,
-           count(*)::INT AS event_count
-      FROM bucketed
-     GROUP BY bucket_x, bucket_y
-     ORDER BY bucket_y, bucket_x
-  $query$
+    SELECT discovery_stats.event_count,
+           marker_rows.kind,
+           marker_rows.marker_id,
+           marker_rows.title,
+           marker_rows.status,
+           marker_rows.latitude,
+           marker_rows.longitude,
+           marker_rows.category_code,
+           marker_rows.category_label,
+           marker_rows.category_icon,
+           marker_rows.starts_at,
+           marker_rows.ends_at,
+           marker_rows.meeting_point_label,
+           marker_rows.cluster_event_count,
+           marker_rows.categories
+      FROM discovery_stats
+      LEFT JOIN marker_rows ON TRUE
+     ORDER BY marker_rows.sort_starts_at ASC, marker_rows.sort_id ASC
+     LIMIT %5$s
+  $query$,
+    p_window_start,
+    p_window_end,
+    p_spatial_predicate,
+    p_zoom,
+    p_marker_limit,
+    p_cluster_scale
+  );
+END
+$adaptive_query$;
+
+SELECT pg_temp.run_explorer_benchmark(
+  'viewport_small_adaptive',
+  'Exact production shape: Paris street viewport, 7-day UTC window, zoom 18, limit 200',
+  pg_temp.explorer_adaptive_query(
+    'ST_Intersects(event.meeting_point, ST_MakeEnvelope(2.3322, 48.8366, 2.3722, 48.8766, 4326)::geography)',
+    TIMESTAMPTZ '2030-06-01 00:00:00+00',
+    TIMESTAMPTZ '2030-06-08 00:00:00+00',
+    18,
+    200,
+    16
+  )
+);
+
+SELECT pg_temp.run_explorer_benchmark(
+  'viewport_medium_adaptive',
+  'Exact production shape: Paris metro viewport, 30-day UTC window, zoom 12, limit 200',
+  pg_temp.explorer_adaptive_query(
+    'ST_Intersects(event.meeting_point, ST_MakeEnvelope(2.2522, 48.7366, 2.4522, 48.9766, 4326)::geography)',
+    TIMESTAMPTZ '2030-06-01 00:00:00+00',
+    TIMESTAMPTZ '2030-07-01 00:00:00+00',
+    12,
+    200,
+    1
+  )
+);
+
+SELECT pg_temp.run_explorer_benchmark(
+  'viewport_large_adaptive',
+  'Exact production shape: Western/Central Europe, 30-day UTC window, zoom 5, limit 200',
+  pg_temp.explorer_adaptive_query(
+    'ST_Intersects(event.meeting_point, ST_MakeEnvelope(-10.0, 35.0, 35.0, 60.0, 4326)::geography)',
+    TIMESTAMPTZ '2030-06-01 00:00:00+00',
+    TIMESTAMPTZ '2030-07-01 00:00:00+00',
+    5,
+    200,
+    1
+  )
+);
+
+SELECT pg_temp.run_explorer_benchmark(
+  'radius_25km_adaptive',
+  'Exact production shape: 25 km Paris radius, 14-day UTC window, zoom 18, limit 200',
+  pg_temp.explorer_adaptive_query(
+    'ST_DWithin(event.meeting_point, ST_SetSRID(ST_MakePoint(2.3522, 48.8566), 4326)::geography, 25000)',
+    TIMESTAMPTZ '2030-06-01 00:00:00+00',
+    TIMESTAMPTZ '2030-06-15 00:00:00+00',
+    18,
+    200,
+    128
+  )
+);
+
+SELECT pg_temp.run_explorer_benchmark(
+  'viewport_antimeridian_adaptive',
+  'Exact production shape: dateline viewport composed from two safe envelopes, zoom 8, limit 200',
+  pg_temp.explorer_adaptive_query(
+    '(ST_Intersects(event.meeting_point, ST_MakeEnvelope(170.0, -25.0, 180.0, -5.0, 4326)::geography) OR ST_Intersects(event.meeting_point, ST_MakeEnvelope(-180.0, -25.0, -170.0, -5.0, 4326)::geography))',
+    TIMESTAMPTZ '2030-06-01 00:00:00+00',
+    TIMESTAMPTZ '2030-07-01 00:00:00+00',
+    8,
+    200,
+    8
+  )
+);
+
+SELECT pg_temp.run_explorer_benchmark(
+  'dense_viewport_adaptive',
+  'F001 reproduction: 5,500 discoverable dense events, 7-day UTC window, zoom 8, limit 100',
+  pg_temp.explorer_adaptive_query(
+    'ST_Intersects(event.meeting_point, ST_MakeEnvelope(2.2522, 48.7366, 2.4522, 48.9766, 4326)::geography)',
+    TIMESTAMPTZ '2030-06-01 00:00:00+00',
+    TIMESTAMPTZ '2030-06-08 00:00:00+00',
+    8,
+    100,
+    1
+  )
+);
+
+SELECT pg_temp.run_explorer_benchmark(
+  'radius_500km_adaptive',
+  'F002 permitted extreme: 500 km Paris radius, 90-day UTC window, zoom 8, limit 200',
+  pg_temp.explorer_adaptive_query(
+    'ST_DWithin(event.meeting_point, ST_SetSRID(ST_MakePoint(2.3522, 48.8566), 4326)::geography, 500000)',
+    TIMESTAMPTZ '2030-04-01 00:00:00+00',
+    TIMESTAMPTZ '2030-06-30 00:00:00+00',
+    8,
+    200,
+    4
+  )
+);
+
+SELECT pg_temp.run_explorer_benchmark(
+  'viewport_max_span_adaptive',
+  'F002 permitted extreme: 60x120-degree viewport, 90-day UTC window, zoom 2, limit 200',
+  pg_temp.explorer_adaptive_query(
+    'ST_Intersects(event.meeting_point, ST_MakeEnvelope(-20.0, 0.0, 100.0, 60.0, 4326)::geography)',
+    TIMESTAMPTZ '2030-04-01 00:00:00+00',
+    TIMESTAMPTZ '2030-06-30 00:00:00+00',
+    2,
+    200,
+    1
+  )
 );
 
 -- Independent privacy proof for the clustering query. The raw spatial/time

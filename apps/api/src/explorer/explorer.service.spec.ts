@@ -13,19 +13,22 @@ describe('ExplorerService', () => {
   beforeEach(() => {
     repository = {
       findKnownCategoryCodes: jest.fn().mockResolvedValue(['trek']),
-      findDiscoverableEvents: jest.fn().mockResolvedValue([
-        {
-          kind: 'event',
-          id: '00000000-0000-4000-8000-000000000010',
-          title: 'Map event',
-          status: EventStatus.Active,
-          coordinate: { latitude: 31.76, longitude: 35.21 },
-          category: { code: 'trek', label: 'Trek', icon: 'mountain' },
-          startsAt: '2090-01-01T00:00:00.000Z',
-          endsAt: '2090-01-01T01:00:00.000Z',
-          meetingPointLabel: 'Trail head',
-        },
-      ]),
+      findDiscoverableMarkers: jest.fn().mockResolvedValue({
+        eventCount: 1,
+        markers: [
+          {
+            kind: 'event',
+            id: '00000000-0000-4000-8000-000000000010',
+            title: 'Map event',
+            status: EventStatus.Active,
+            coordinate: { latitude: 31.76, longitude: 35.21 },
+            category: { code: 'trek', label: 'Trek', icon: 'mountain' },
+            startsAt: '2090-01-01T00:00:00.000Z',
+            endsAt: '2090-01-01T01:00:00.000Z',
+            meetingPointLabel: 'Trail head',
+          },
+        ],
+      }),
     } as unknown as jest.Mocked<ExplorerRepository>;
     service = new ExplorerService(repository);
   });
@@ -43,7 +46,7 @@ describe('ExplorerService', () => {
       NOW,
     );
     expect(repository.findKnownCategoryCodes).toHaveBeenCalledWith(['trek']);
-    expect(repository.findDiscoverableEvents).toHaveBeenCalledWith(
+    expect(repository.findDiscoverableMarkers).toHaveBeenCalledWith(
       expect.objectContaining({
         spatial: expect.objectContaining({ kind: 'radius', radiusMeters: 20_000 }),
         windowStart: NOW,
@@ -66,6 +69,6 @@ describe('ExplorerService', () => {
       code: 'EXPLORER_QUERY_INVALID',
       details: { field: 'categoryCodes' },
     });
-    expect(repository.findDiscoverableEvents).not.toHaveBeenCalled();
+    expect(repository.findDiscoverableMarkers).not.toHaveBeenCalled();
   });
 });

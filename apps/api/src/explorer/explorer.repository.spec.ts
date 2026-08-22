@@ -1,33 +1,26 @@
-import { EventStatus, EventVisibility } from '@tripwith/shared';
-import type { DataSource } from 'typeorm';
+import { EventStatus } from '@tripwith/shared';
 
 import { GeoService } from '../database/geo';
-import { ExplorerRepository, EXPLORER_CANDIDATE_LIMIT } from './explorer.repository';
+import {
+  EXPLORER_AGGREGATION_LIMIT,
+  ExplorerRepository,
+  explorerClusterScale,
+} from './explorer.repository';
 import type { NormalizedExplorerQuery } from './explorer.types';
 
-type BuilderDouble = Record<string, jest.Mock>;
+interface DatabaseDouble {
+  readonly query: jest.Mock;
+}
 
-function builder(rows: readonly Record<string, unknown>[]): BuilderDouble {
-  const value: BuilderDouble = {};
-  for (const method of [
-    'innerJoin',
-    'select',
-    'addSelect',
-    'where',
-    'andWhere',
-    'orderBy',
-    'addOrderBy',
-    'take',
-  ]) {
-    value[method] = jest.fn().mockReturnValue(value);
-  }
-  value.getRawMany = jest.fn().mockResolvedValue(rows);
-  return value;
+function databaseWithRows(rows: readonly Record<string, unknown>[]): DatabaseDouble {
+  return { query: jest.fn().mockResolvedValue(rows) };
 }
 
 function rawEvent(id: string, startsAt: string, longitude: number) {
   return {
-    eventId: id,
+    resultEventCount: 1,
+    kind: 'event',
+    markerId: id,
     title: `Event ${id}`,
     status: EventStatus.Active,
     latitude: '0',
@@ -38,30 +31,65 @@ function rawEvent(id: string, startsAt: string, longitude: number) {
     startsAt,
     endsAt: '2090-01-02T01:00:00Z',
     meetingPointLabel: null,
+    clusterEventCount: null,
+    categories: null,
   };
 }
 
-function dataSourceWithBuilders(...builders: BuilderDouble[]): DataSource {
-  const createQueryBuilder = jest.fn();
-  for (const queryBuilder of builders) createQueryBuilder.mockReturnValueOnce(queryBuilder);
+function rawCluster(eventCount = 5_500) {
   return {
-    getRepository: jest.fn().mockReturnValue({ createQueryBuilder }),
-    query: jest.fn(),
-  } as unknown as DataSource;
+    resultEventCount: eventCount,
+    kind: 'cluster',
+    markerId: 'cluster:z8:s1:x518:y394',
+    title: null,
+    status: null,
+    latitude: '48.8566',
+    longitude: '2.3522',
+    categoryCode: null,
+    categoryLabel: null,
+    categoryIcon: null,
+    startsAt: null,
+    endsAt: null,
+    meetingPointLabel: null,
+    clusterEventCount: eventCount,
+    categories: [
+      { code: 'trek', eventCount: 4_000 },
+      { code: 'party', eventCount: 1_500 },
+    ],
+  };
 }
 
 const WINDOW = {
   windowStart: new Date('2090-01-01T00:00:00Z'),
   windowEnd: new Date('2090-02-01T00:00:00Z'),
   categoryCodes: ['trek'],
-  zoom: 12,
+  zoom: 18,
   limit: 100,
 } as const;
 
+function querySql(database: DatabaseDouble): string {
+  return database.query.mock.calls[0]![0] as string;
+}
+
+function queryParameters(database: DatabaseDouble): readonly unknown[] {
+  return database.query.mock.calls[0]![1] as readonly unknown[];
+}
+
+function limitValue(database: DatabaseDouble): unknown {
+  const match = /LIMIT \$(\d+)\s*$/.exec(querySql(database));
+  if (!match) throw new Error('expected a parameterized outer LIMIT');
+  return queryParameters(database)[Number(match[1]) - 1];
+}
+
 describe('ExplorerRepository', () => {
-  it('composes the canonical discoverable/time/category/radius predicates and projects only map fields', async () => {
-    const queryBuilder = builder([rawEvent('00000000-0000-4000-8000-000000000001', '2090-01-02T00:00:00Z', 35)]);
-    const repository = new ExplorerRepository(dataSourceWithBuilders(queryBuilder), new GeoService());
+  it('composes canonical privacy/time/category/radius predicates before adaptive SQL aggregation', async () => {
+    const raw = rawEvent(
+      '00000000-0000-4000-8000-000000000001',
+      '2090-01-02T00:00:00Z',
+      35,
+    );
+    const database = databaseWithRows([raw]);
+    const repository = new ExplorerRepository(database, new GeoService());
     const query: NormalizedExplorerQuery = {
       ...WINDOW,
       spatial: {
@@ -71,71 +99,64 @@ describe('ExplorerRepository', () => {
       },
     };
 
-    const result = await repository.findDiscoverableEvents(query);
+    const result = await repository.findDiscoverableMarkers(query);
 
-    expect(queryBuilder.where).toHaveBeenCalledWith('event.visibility = :publicVisibility', {
-      publicVisibility: EventVisibility.Public,
+    const sql = querySql(database);
+    const privacyBoundary = sql.indexOf("event.visibility = 'PUBLIC'");
+    expect(privacyBoundary).toBeGreaterThan(-1);
+    expect(sql).toContain("event.status IN ('ACTIVE', 'FULL')");
+    expect(sql).toContain("event.time_range && tstzrange(");
+    expect(sql).toContain('ST_DWithin(event.meeting_point');
+    expect(sql).toContain('category.code = ANY(');
+    expect(sql).toContain('WITH discoverable AS MATERIALIZED');
+    expect(sql.indexOf('bucketed AS MATERIALIZED')).toBeGreaterThan(privacyBoundary);
+    expect(sql).not.toContain('generate_series');
+    expect(sql).not.toContain('scale_counts');
+    expect(sql).toContain('LEFT JOIN marker_rows ON TRUE');
+    expect(queryParameters(database)).toEqual(
+      expect.arrayContaining([
+        WINDOW.windowStart,
+        WINDOW.windowEnd,
+        35,
+        31,
+        25_000,
+        ['trek'],
+        EXPLORER_AGGREGATION_LIMIT + 1,
+        EXPLORER_AGGREGATION_LIMIT,
+        100,
+        18,
+      ]),
+    );
+    expect(limitValue(database)).toBe(100);
+    expect(result).toEqual({
+      eventCount: 1,
+      markers: [
+        {
+          kind: 'event',
+          id: '00000000-0000-4000-8000-000000000001',
+          title: 'Event 00000000-0000-4000-8000-000000000001',
+          status: EventStatus.Active,
+          coordinate: { latitude: 0, longitude: 35 },
+          category: { code: 'trek', label: 'Trek', icon: 'mountain' },
+          startsAt: '2090-01-02T00:00:00.000Z',
+          endsAt: '2090-01-02T01:00:00.000Z',
+          meetingPointLabel: null,
+        },
+      ],
     });
-    expect(queryBuilder.andWhere).toHaveBeenCalledWith(
-      'event.status IN (:...discoverableStatuses)',
-      { discoverableStatuses: [EventStatus.Active, EventStatus.Full] },
-    );
-    expect(queryBuilder.andWhere).toHaveBeenCalledWith(
-      "event.time_range && tstzrange(:windowStart, :windowEnd, '[)')",
-      { windowStart: WINDOW.windowStart, windowEnd: WINDOW.windowEnd },
-    );
-    expect(queryBuilder.andWhere).toHaveBeenCalledWith(
-      'category.code IN (:...categoryCodes)',
-      { categoryCodes: ['trek'] },
-    );
-    expect(queryBuilder.andWhere).toHaveBeenCalledWith(
-      expect.stringContaining('ST_DWithin(event.meeting_point'),
-      {
-        explorerRadiusLng: 35,
-        explorerRadiusLat: 31,
-        explorerRadiusMeters: 25_000,
-      },
-    );
-    expect(queryBuilder.take).toHaveBeenCalledWith(EXPLORER_CANDIDATE_LIMIT + 1);
-    expect(queryBuilder.orderBy).toHaveBeenCalledWith('event.starts_at', 'ASC');
-    expect(queryBuilder.addOrderBy).toHaveBeenCalledWith('event.id', 'ASC');
-    expect(result).toEqual([
-      {
-        kind: 'event',
-        id: '00000000-0000-4000-8000-000000000001',
-        title: 'Event 00000000-0000-4000-8000-000000000001',
-        status: EventStatus.Active,
-        coordinate: { latitude: 0, longitude: 35 },
-        category: { code: 'trek', label: 'Trek', icon: 'mountain' },
-        startsAt: '2090-01-02T00:00:00.000Z',
-        endsAt: '2090-01-02T01:00:00.000Z',
-        meetingPointLabel: null,
-      },
-    ]);
-    expect(result[0]).not.toHaveProperty('description');
-    expect(result[0]).not.toHaveProperty('hostUserId');
-    expect(result[0]).not.toHaveProperty('participantCount');
+    expect(result.markers[0]).not.toHaveProperty('description');
+    expect(result.markers[0]).not.toHaveProperty('hostUserId');
+    expect(result.markers[0]).not.toHaveProperty('participantCount');
   });
 
-  it('splits an antimeridian viewport into two safe GeoService queries and merges deterministically', async () => {
-    const later = rawEvent(
-      '00000000-0000-4000-8000-000000000002',
-      '2090-01-03T00:00:00Z',
-      179.5,
-    );
-    const earlier = rawEvent(
-      '00000000-0000-4000-8000-000000000001',
-      '2090-01-02T00:00:00Z',
-      -179.5,
-    );
-    const westBuilder = builder([later, earlier]);
-    const eastBuilder = builder([earlier]);
+  it('composes an antimeridian viewport from two safe GeoService predicates in one query', async () => {
+    const database = databaseWithRows([
+      { ...rawEvent('00000000-0000-4000-8000-000000000001', '2090-01-02T00:00:00Z', -179.5), resultEventCount: 2 },
+      { ...rawEvent('00000000-0000-4000-8000-000000000002', '2090-01-03T00:00:00Z', 179.5), resultEventCount: 2 },
+    ]);
     const geo = new GeoService();
     const bbox = jest.spyOn(geo, 'withinBoundingBox');
-    const repository = new ExplorerRepository(
-      dataSourceWithBuilders(westBuilder, eastBuilder),
-      geo,
-    );
+    const repository = new ExplorerRepository(database, geo);
     const query: NormalizedExplorerQuery = {
       ...WINDOW,
       categoryCodes: [],
@@ -149,7 +170,7 @@ describe('ExplorerRepository', () => {
       },
     };
 
-    const result = await repository.findDiscoverableEvents(query);
+    const result = await repository.findDiscoverableMarkers(query);
 
     expect(bbox).toHaveBeenNthCalledWith(
       1,
@@ -165,33 +186,169 @@ describe('ExplorerRepository', () => {
       { latitude: 10, longitude: -170 },
       'explorerViewportEast',
     );
-    expect(result.map(({ id }) => id)).toEqual([
+    expect(database.query).toHaveBeenCalledTimes(1);
+    expect(querySql(database)).toMatch(/ST_MakeEnvelope[\s\S]+ OR ST_Intersects[\s\S]+ST_MakeEnvelope/);
+    expect(queryParameters(database)).toEqual(
+      expect.arrayContaining([170, 180, -180, -170]),
+    );
+    expect(result.markers.map(({ id }) => id)).toEqual([
       '00000000-0000-4000-8000-000000000001',
       '00000000-0000-4000-8000-000000000002',
     ]);
-    expect(westBuilder.andWhere).toHaveBeenCalledWith(
-      expect.stringContaining('ST_MakeEnvelope'),
-      expect.objectContaining({
-        explorerViewportWestMinLng: 170,
-        explorerViewportWestMaxLng: 180,
-      }),
-    );
-    expect(eastBuilder.andWhere).toHaveBeenCalledWith(
-      expect.stringContaining('ST_MakeEnvelope'),
-      expect.objectContaining({
-        explorerViewportEastMinLng: -180,
-        explorerViewportEastMaxLng: -170,
-      }),
-    );
   });
 
-  it('fails closed rather than returning a partial cluster input above the candidate cap', async () => {
-    const rows = Array.from({ length: EXPLORER_CANDIDATE_LIMIT + 1 }, (_, index) =>
-      rawEvent(String(index).padStart(36, '0'), '2090-01-02T00:00:00Z', 35),
-    );
-    const repository = new ExplorerRepository(dataSourceWithBuilders(builder(rows)), new GeoService());
+  it('returns exact, map-safe clusters for the benchmark-validated 5,500-event dense viewport', async () => {
+    const database = databaseWithRows([rawCluster()]);
+    const repository = new ExplorerRepository(database, new GeoService());
+
+    const result = await repository.findDiscoverableMarkers({
+      ...WINDOW,
+      zoom: 8,
+      categoryCodes: [],
+      spatial: {
+        kind: 'viewport',
+        south: 48.7366,
+        west: 2.2522,
+        north: 48.9766,
+        east: 2.4522,
+        crossesAntimeridian: false,
+      },
+    });
+
+    expect(result).toEqual({
+      eventCount: 5_500,
+      markers: [
+        {
+          kind: 'cluster',
+          id: 'cluster:z8:s1:x518:y394',
+          coordinate: { latitude: 48.8566, longitude: 2.3522 },
+          eventCount: 5_500,
+          categories: [
+            { code: 'trek', eventCount: 4_000 },
+            { code: 'party', eventCount: 1_500 },
+          ],
+        },
+      ],
+    });
+    expect(result.markers[0]).not.toHaveProperty('title');
+    expect(result.markers[0]).not.toHaveProperty('meetingPointLabel');
+  });
+
+  it('passes the requested marker limit into adaptive scale selection and the outer SQL LIMIT', async () => {
+    const oneDatabase = databaseWithRows([{ ...rawCluster(20), resultEventCount: 20 }]);
+    const twoHundredDatabase = databaseWithRows([{ ...rawCluster(20), resultEventCount: 20 }]);
+    const spatial = {
+      kind: 'radius' as const,
+      center: { latitude: 31, longitude: 35 },
+      radiusMeters: 25_000,
+    };
+
+    await new ExplorerRepository(oneDatabase, new GeoService()).findDiscoverableMarkers({
+      ...WINDOW,
+      spatial,
+      zoom: 8,
+      limit: 1,
+      categoryCodes: [],
+    });
+    await new ExplorerRepository(twoHundredDatabase, new GeoService()).findDiscoverableMarkers({
+      ...WINDOW,
+      spatial,
+      zoom: 8,
+      limit: 200,
+      categoryCodes: [],
+    });
+
+    expect(limitValue(oneDatabase)).toBe(1);
+    expect(limitValue(twoHundredDatabase)).toBe(200);
+    expect(queryParameters(oneDatabase)).toContain(1);
+    expect(queryParameters(twoHundredDatabase)).toContain(200);
+    expect(explorerClusterScale({
+      ...WINDOW,
+      spatial,
+      zoom: 8,
+      limit: 1,
+      categoryCodes: [],
+    })).toBeGreaterThan(explorerClusterScale({
+      ...WINDOW,
+      spatial,
+      zoom: 8,
+      limit: 200,
+      categoryCodes: [],
+    }));
+  });
+
+  it('coarsens an antimeridian grid deterministically enough to guarantee the marker limit', () => {
+    expect(explorerClusterScale({
+      ...WINDOW,
+      categoryCodes: [],
+      zoom: 1,
+      limit: 1,
+      spatial: {
+        kind: 'viewport',
+        south: -10,
+        west: 170,
+        north: 10,
+        east: -170,
+        crossesAntimeridian: true,
+      },
+    })).toBe(8);
+  });
+
+  it('matches the production scales recorded by the dense and permitted-extreme benchmarks', () => {
+    expect(explorerClusterScale({
+      ...WINDOW,
+      zoom: 8,
+      limit: 100,
+      categoryCodes: [],
+      spatial: {
+        kind: 'viewport',
+        south: 48.7366,
+        west: 2.2522,
+        north: 48.9766,
+        east: 2.4522,
+        crossesAntimeridian: false,
+      },
+    })).toBe(1);
+    expect(explorerClusterScale({
+      ...WINDOW,
+      zoom: 8,
+      limit: 200,
+      categoryCodes: [],
+      spatial: {
+        kind: 'radius',
+        center: { latitude: 48.8566, longitude: 2.3522 },
+        radiusMeters: 500_000,
+      },
+    })).toBe(4);
+    expect(explorerClusterScale({
+      ...WINDOW,
+      zoom: 2,
+      limit: 200,
+      categoryCodes: [],
+      spatial: {
+        kind: 'viewport',
+        south: 0,
+        west: -20,
+        north: 60,
+        east: 100,
+        crossesAntimeridian: false,
+      },
+    })).toBe(1);
+  });
+
+  it('fails closed above the aggregation safety ceiling without returning partial clusters', async () => {
+    const database = databaseWithRows([
+      {
+        ...rawCluster(),
+        resultEventCount: EXPLORER_AGGREGATION_LIMIT + 1,
+        kind: null,
+        markerId: null,
+      },
+    ]);
+    const repository = new ExplorerRepository(database, new GeoService());
+
     await expect(
-      repository.findDiscoverableEvents({
+      repository.findDiscoverableMarkers({
         ...WINDOW,
         categoryCodes: [],
         spatial: {

@@ -1,7 +1,6 @@
 import { Injectable } from '@nestjs/common';
 
 import type { GetExplorerEventsQueryDto } from './dto/get-explorer-events-query.dto';
-import { clusterExplorerEvents } from './explorer-clustering';
 import { ExplorerQueryInvalidError } from './explorer.errors';
 import { normalizeExplorerQuery } from './explorer-query';
 import { ExplorerRepository } from './explorer.repository';
@@ -31,13 +30,13 @@ export class ExplorerService {
       }
     }
 
-    const events = await this.repository.findDiscoverableEvents(normalized);
+    const discovery = await this.repository.findDiscoverableMarkers(normalized);
     return {
       spatialMode: normalized.spatial.kind,
       windowStart: normalized.windowStart.toISOString(),
       windowEnd: normalized.windowEnd.toISOString(),
-      eventCount: events.length,
-      markers: clusterExplorerEvents(events, normalized.zoom, normalized.limit),
+      eventCount: discovery.eventCount,
+      markers: discovery.markers,
     };
   }
 }

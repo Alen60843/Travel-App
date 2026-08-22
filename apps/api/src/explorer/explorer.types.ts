@@ -40,6 +40,11 @@ export interface ExplorerClusterMarker {
 
 export type ExplorerMarker = ExplorerEventPin | ExplorerClusterMarker;
 
+export interface ExplorerDiscoveryResult {
+  readonly eventCount: number;
+  readonly markers: readonly ExplorerMarker[];
+}
+
 export interface ExplorerEventsView {
   readonly spatialMode: 'viewport' | 'radius';
   readonly windowStart: string;

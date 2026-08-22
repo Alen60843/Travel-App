@@ -130,12 +130,14 @@ describe('ExplorerRepository (live PostgreSQL/PostGIS)', () => {
       limit: 100,
     };
 
-    const events = await repository.findDiscoverableEvents(query);
+    const discovery = await repository.findDiscoverableMarkers(query);
+    const events = discovery.markers;
 
+    expect(discovery.eventCount).toBe(2);
     expect(events.map(({ id }) => id)).toEqual([eastId, westId]);
-    expect(events.map(({ status }) => status)).toEqual(['FULL', 'ACTIVE']);
-    expect(events.every(({ category }) => category.code === 'trek')).toBe(true);
-    expect(events.every(({ startsAt }) => startsAt >= WINDOW_START.toISOString())).toBe(true);
+    expect(events.map((event) => event.kind === 'event' ? event.status : null)).toEqual(['FULL', 'ACTIVE']);
+    expect(events.every((event) => event.kind === 'event' && event.category.code === 'trek')).toBe(true);
+    expect(events.every((event) => event.kind === 'event' && event.startsAt >= WINDOW_START.toISOString())).toBe(true);
     expect(Object.keys(events[0]!).sort()).toEqual([
       'category',
       'coordinate',
@@ -150,7 +152,7 @@ describe('ExplorerRepository (live PostgreSQL/PostGIS)', () => {
   });
 
   it('uses ST_DWithin geography semantics and applies category metadata/filtering', async () => {
-    const events = await repository.findDiscoverableEvents({
+    const discovery = await repository.findDiscoverableMarkers({
       spatial: {
         kind: 'radius',
         center: { latitude: 0, longitude: 179.5 },
@@ -163,8 +165,39 @@ describe('ExplorerRepository (live PostgreSQL/PostGIS)', () => {
       limit: 100,
     });
 
-    expect(new Set(events.map(({ id }) => id))).toEqual(new Set([westId, eastId]));
-    expect(events[0]?.category).toEqual({ code: 'trek', label: 'Trek', icon: 'mountain' });
+    expect(new Set(discovery.markers.map(({ id }) => id))).toEqual(new Set([westId, eastId]));
+    expect(discovery.markers[0]).toMatchObject({
+      kind: 'event',
+      category: { code: 'trek', label: 'Trek', icon: 'mountain' },
+    });
     expect(await repository.findKnownCategoryCodes(['trek', 'not_real'])).toEqual(['trek']);
+  });
+
+  it('clusters the complete discoverable population across the antimeridian at low zoom', async () => {
+    const discovery = await repository.findDiscoverableMarkers({
+      spatial: {
+        kind: 'viewport',
+        south: -10,
+        west: 170,
+        north: 10,
+        east: -170,
+        crossesAntimeridian: true,
+      },
+      windowStart: WINDOW_START,
+      windowEnd: WINDOW_END,
+      categoryCodes: ['trek'],
+      zoom: 1,
+      limit: 1,
+    });
+
+    expect(discovery.eventCount).toBe(2);
+    expect(discovery.markers).toEqual([
+      expect.objectContaining({
+        kind: 'cluster',
+        eventCount: 2,
+        categories: [{ code: 'trek', eventCount: 2 }],
+      }),
+    ]);
+    expect(Math.abs(discovery.markers[0]!.coordinate.longitude)).toBe(180);
   });
 });
