@@ -63,7 +63,8 @@ export interface StructuredHandoff {
   readonly findingResponses?: readonly FindingResponse[];
 }
 
-const HANDOFF_KEYS = new Set([
+/** Exported so handoff/repair.ts can rename a malformed key to the exact bare form the validator below accepts, without duplicating this list. */
+export const HANDOFF_KEYS = new Set([
   'status',
   'summary',
   'filesChanged',
@@ -77,7 +78,8 @@ const HANDOFF_KEYS = new Set([
   'findingResponses',
 ]);
 const TEST_KEYS = new Set(['command', 'result', 'details']);
-const FINDING_RESPONSE_KEYS = new Set([
+/** Exported for the same reason as HANDOFF_KEYS above. */
+export const FINDING_RESPONSE_KEYS = new Set([
   'findingId',
   'decision',
   'evidence',

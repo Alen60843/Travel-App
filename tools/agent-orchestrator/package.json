@@ -15,7 +15,10 @@
     "resume": "pnpm --silent run build && node dist/cli.js resume",
     "status": "pnpm --silent run build && node dist/cli.js status",
     "metrics": "pnpm --silent run build && node dist/cli.js metrics",
-    "cleanup": "pnpm --silent run build && node dist/cli.js cleanup"
+    "cleanup": "pnpm --silent run build && node dist/cli.js cleanup",
+    "recover-handoffs": "pnpm --silent run build && node dist/cli.js recover-handoffs",
+    "retry-integration": "pnpm --silent run build && node dist/cli.js retry-integration",
+    "apply-integration-fix": "pnpm --silent run build && node dist/cli.js apply-integration-fix"
   },
   "dependencies": {
     "yaml": "^2.8.1"

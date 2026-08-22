@@ -50,8 +50,9 @@ export interface StructuredReview {
   readonly findings: readonly ReviewFinding[];
 }
 
-const REVIEW_KEYS = new Set(['status', 'findings']);
-const FINDING_KEYS = new Set([
+/** Exported so tests can assert the real prompt-facing schema uses these exact bare keys, never a description-annotated variant. */
+export const REVIEW_KEYS = new Set(['status', 'findings']);
+export const FINDING_KEYS = new Set([
   'id',
   'severity',
   'category',

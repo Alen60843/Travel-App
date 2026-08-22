@@ -216,7 +216,8 @@ export abstract class ProcessAgent implements Agent {
     await Promise.all([finished(stdoutFile), finished(stderrFile)]);
 
     const classification = classifyCompletion(processResult, terminationCause);
-    const structuredHandoff = await parseStructuredHandoff(stdoutPath);
+    const rawStdout = await readBoundedStdoutText(stdoutPath);
+    const structuredHandoff = parseJsonOrNull(rawStdout);
     const projected = projectHandoff(structuredHandoff);
     const endedAtMs = Date.now();
 
@@ -231,6 +232,7 @@ export abstract class ProcessAgent implements Agent {
       stdoutPath,
       stderrPath,
       structuredHandoff,
+      rawStdout,
       changedFiles: projected.changedFiles,
       gitDiffSummary: projected.gitDiffSummary,
       testsReported: projected.testsReported,
@@ -269,6 +271,7 @@ export abstract class ProcessAgent implements Agent {
       stdoutPath,
       stderrPath,
       structuredHandoff: null,
+      rawStdout: null,
       changedFiles: [],
       gitDiffSummary: null,
       testsReported: [],
@@ -480,7 +483,16 @@ export function collectRedactionSecrets(environment: NodeJS.ProcessEnv): readonl
     .filter((value): value is string => value !== undefined);
 }
 
-async function parseStructuredHandoff(path: string): Promise<unknown | null> {
+/**
+ * Reads the bounded, already-redacted stdout an agent produced (the same
+ * size cap as before: oversized output is treated as absent, not truncated
+ * and guessed at). Exported so both the live agent path above and a
+ * handoff/review-recovery path (orchestrator.ts) can get the exact same raw
+ * text a preserved stdout log would have produced — the framing-extraction
+ * layer (src/protocol/structured-output.ts) needs this raw text, not just
+ * the whole-text-parsed-or-null value parseStructuredHandoff produces.
+ */
+export async function readBoundedStdoutText(path: string): Promise<string | null> {
   const stream = createReadStream(path, {
     encoding: 'utf8',
     start: 0,
@@ -496,15 +508,24 @@ async function parseStructuredHandoff(path: string): Promise<unknown | null> {
   }
 
   const trimmed = text.trim();
-  if (trimmed.length === 0) {
+  return trimmed.length === 0 ? null : trimmed;
+}
+
+/** Parses `text` as one whole JSON value, or null if it isn't valid JSON at all. */
+export function parseJsonOrNull(text: string | null): unknown | null {
+  if (text === null) {
     return null;
   }
-
   try {
-    return JSON.parse(trimmed) as unknown;
+    return JSON.parse(text) as unknown;
   } catch {
     return null;
   }
+}
+
+/** Exported so a handoff-recovery path (orchestrator.ts) can reconstruct the exact same raw structured value from a preserved stdout log that the live run itself would have produced. */
+export async function parseStructuredHandoff(path: string): Promise<unknown | null> {
+  return parseJsonOrNull(await readBoundedStdoutText(path));
 }
 
 function projectHandoff(handoff: unknown): {

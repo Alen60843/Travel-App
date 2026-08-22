@@ -307,6 +307,16 @@ integration:
     - command: pnpm install --frozen-lockfile
       timeoutMs: 600000
     - pnpm --filter @tripwith/shared typecheck
+    # @tripwith/shared exports its runtime/types from dist/ (see its
+    # package.json main/types fields), but `typecheck` above is --noEmit and
+    # produces no dist output. A fresh worktree/checkout has no dist/ at all,
+    # so @tripwith/api's typecheck cannot resolve `@tripwith/shared` without
+    # this explicit build step first — confirmed empirically against the real
+    # run-20260822094645-5b090308 integration worktree: API typecheck failed
+    # with ~50 "Cannot find module '@tripwith/shared'" errors (plus cascading
+    # errors in unrelated Matching code whose types depend on it) before this
+    # command was added, and passed with zero errors immediately after.
+    - pnpm --filter @tripwith/shared build
     - pnpm --filter @tripwith/api typecheck
     - pnpm --filter @tripwith/api build
     - pnpm --filter @tripwith/shared test
