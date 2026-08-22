@@ -2,7 +2,7 @@ import { EventStatus } from '@tripwith/shared';
 import { Injectable } from '@nestjs/common';
 import { InjectDataSource } from '@nestjs/typeorm';
 
-import { GeoService, type SqlFragment } from '../database/geo';
+import { GeoService, type LatLng, type SqlFragment } from '../database/geo';
 import { ExplorerQueryTooBroadError } from './explorer.errors';
 import type {
   ExplorerClusterCategorySummary,
@@ -279,8 +279,7 @@ export class ExplorerRepository {
 
     const { south, west, north, east, crossesAntimeridian } = query.spatial;
     if (!crossesAntimeridian) {
-      return this.geo.withinBoundingBox(
-        'event.meeting_point',
+      return this.viewportPredicate(
         { latitude: south, longitude: west },
         { latitude: north, longitude: east },
         'explorerViewport',
@@ -288,16 +287,16 @@ export class ExplorerRepository {
     }
 
     // GeoService deliberately rejects crossing boxes. Compose its two safe
-    // halves into one OR predicate, avoiding duplicate rows at the shared
-    // meridian while retaining one materialized privacy boundary.
-    const westHalf = this.geo.withinBoundingBox(
-      'event.meeting_point',
+    // halves into one OR predicate. A WHERE clause never duplicates a table
+    // row regardless of how many OR branches it satisfies, so a point
+    // matching both halves (only possible exactly at +/-180, see
+    // viewportPredicate below) still cannot produce a duplicate row here.
+    const westHalf = this.viewportPredicate(
       { latitude: south, longitude: west },
       { latitude: north, longitude: 180 },
       'explorerViewportWest',
     );
-    const eastHalf = this.geo.withinBoundingBox(
-      'event.meeting_point',
+    const eastHalf = this.viewportPredicate(
       { latitude: south, longitude: -180 },
       { latitude: north, longitude: east },
       'explorerViewportEast',
@@ -305,6 +304,65 @@ export class ExplorerRepository {
     return {
       sql: `(${westHalf.sql} OR ${eastHalf.sql})`,
       parameters: { ...westHalf.parameters, ...eastHalf.parameters },
+    };
+  }
+
+  /**
+   * Rectangular SCREEN VIEWPORT membership: south <= latitude <= north AND
+   * west <= longitude <= east — a planar rectangle, deliberately NOT "inside
+   * a spherical polygon with geodesic edges" (what GeoService.withinBoundingBox
+   * alone, cast straight to ::geography, actually means). Two independent,
+   * evidence-backed reasons this repository adds an exact geometry check on
+   * top of it rather than using it alone:
+   *
+   * 1) Semantic mismatch: a mobile map viewport is a planar screen rectangle,
+   *    not a geodesic shape. Confirmed by minimal reproduction: for a point
+   *    resting exactly at the antimeridian, geography's ST_Intersects
+   *    correctly (if surprisingly) reports membership in BOTH the west and
+   *    east half — because longitude 180 and -180 are literally the same
+   *    point on a sphere — whereas the product's own rectangle definition
+   *    (§4) has no such ambiguity.
+   * 2) A real, reproduced PostGIS/GEOS anomaly: with more than one row
+   *    present, plain geography ST_Intersects for these exact antimeridian-
+   *    adjacent envelopes returned true for a point at longitude 0 (nowhere
+   *    near either half) — reproduced independently of this repository's SQL
+   *    (a minimal 9-row temp table, no CTE, no clustering, both as a bare
+   *    per-row boolean column and as a WHERE filter) and reproduced only for
+   *    ::geography, never for the equivalent ::geometry or coordinate-based
+   *    predicate on the identical rows. A single-row-filtered query does not
+   *    reproduce it either, so it cannot be dismissed as ordinary semantics.
+   *
+   * GeoService.withinBoundingBox itself is untouched: it is shared
+   * infrastructure with a documented geography contract, and Explorer is its
+   * only caller (confirmed by inspection) — so the fix stays local to
+   * Explorer rather than redefining shared behavior other callers might rely
+   * on. The existing geography predicate is kept as the GIST-indexed coarse
+   * filter (false positives are fine there); the exact planar rectangle is
+   * the authoritative, correctness-final AND'd condition. Verified by
+   * EXPLAIN (ANALYZE, BUFFERS) against a real indexed dataset: the added
+   * condition changes only the Filter/Recheck Cond, never the chosen index
+   * scan — events_discoverable_geo_time_gix is used identically before and
+   * after.
+   */
+  private viewportPredicate(
+    southWest: LatLng,
+    northEast: LatLng,
+    paramPrefix: string,
+  ): SqlFragment {
+    const coarse = this.geo.withinBoundingBox('event.meeting_point', southWest, northEast, paramPrefix);
+    const minLng = `${paramPrefix}ExactMinLng`;
+    const minLat = `${paramPrefix}ExactMinLat`;
+    const maxLng = `${paramPrefix}ExactMaxLng`;
+    const maxLat = `${paramPrefix}ExactMaxLat`;
+    return {
+      sql: `(${coarse.sql} AND ST_Intersects((event.meeting_point)::geometry, ST_MakeEnvelope(:${minLng}, :${minLat}, :${maxLng}, :${maxLat}, 4326)))`,
+      parameters: {
+        ...coarse.parameters,
+        [minLng]: southWest.longitude,
+        [minLat]: southWest.latitude,
+        [maxLng]: northEast.longitude,
+        [maxLat]: northEast.latitude,
+      },
     };
   }
 }

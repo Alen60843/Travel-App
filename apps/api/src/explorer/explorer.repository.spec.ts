@@ -187,7 +187,17 @@ describe('ExplorerRepository', () => {
       'explorerViewportEast',
     );
     expect(database.query).toHaveBeenCalledTimes(1);
-    expect(querySql(database)).toMatch(/ST_MakeEnvelope[\s\S]+ OR ST_Intersects[\s\S]+ST_MakeEnvelope/);
+    // Each half is (indexed coarse geography check AND exact planar
+    // rectangle check), joined by OR -- the coarse geography predicate keeps
+    // events_discoverable_geo_time_gix in the plan; the exact geometry check
+    // is the authoritative, correctness-final condition (see viewportPredicate's
+    // doc comment for why geography alone is not used as the sole predicate).
+    const sql = querySql(database);
+    expect(sql).toMatch(
+      /\(ST_Intersects\(event\.meeting_point, ST_MakeEnvelope\([^)]+\)::geography\) AND ST_Intersects\(\(event\.meeting_point\)::geometry, ST_MakeEnvelope\([^)]+\)\)\)/,
+    );
+    expect(sql.match(/ST_MakeEnvelope/g)).toHaveLength(4);
+    expect(sql).toMatch(/\)\) OR \(ST_Intersects/);
     expect(queryParameters(database)).toEqual(
       expect.arrayContaining([170, 180, -180, -170]),
     );
