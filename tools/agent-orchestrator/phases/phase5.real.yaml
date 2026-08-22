@@ -1,0 +1,332 @@
+# Phase 5 — Explorer: Geospatial Event Discovery Backend
+#
+# Real, approved phase file. Derived from phases/phase5.example.yaml (kept
+# unmodified) with the same workstream topology, updated to use the
+# conditional Solver/Verifier corrections: Fixer, Re-Verifier, and Judge each
+# carry an explicit `condition` so they are SKIPPED (not run as no-ops) on
+# the clean path. See tools/agent-orchestrator/README.md's "Conditional
+# execution" section for the exact mechanism.
+#
+# Scope (bounded — see the approved Phase 5 preparation instructions):
+# backend geospatial discovery of PUBLIC/discoverable events only. Does NOT
+# build the React Native map UI, event lifecycle, payments, joining, chat,
+# Marketplace, Google Places onboarding, SOS, or Phase 6+.
+#
+# `agents:plan` against this file is read-only. `agents:run` invokes real
+# paid/local agents and starts real Phase 5 implementation work; do not run
+# it until that specific execution is separately, explicitly approved.
+#
+# Model policy (explicit, verified against real installed CLIs, read-only):
+#   - Codex tasks (explorer-query-api, explorer-postgis-evidence,
+#     explorer-query-correction, explorer-lead-integration) deliberately
+#     OMIT `model:`, so the Codex CLI's own configured/default model is
+#     used. The interactive VS Code Codex UI's model/reasoning picker (e.g.
+#     a label like "GPT-5.6 Sol") is a separate setting from headless
+#     `codex exec`'s `-m/--model` flag, and no verified CLI model ID
+#     corresponding to that UI label has been established — inventing one
+#     would violate this project's no-fabrication rule, so it is left unset.
+#   - explorer-query-review / explorer-final-review use `model: sonnet` —
+#     Claude's normal, non-escalation Verifier.
+#   - explorer-judge uses `model: opus` with `effort: extra_high` — the
+#     conditional, expensive Judge, gated by its own `condition` (see below)
+#     to run only on a real unresolved high/critical escalation, never on
+#     the clean path.
+#   - `sonnet` and `opus` are confirmed real, documented `--model` aliases
+#     via `claude --help` ("Provide an alias for the latest model (e.g.
+#     'fable', 'opus', or 'sonnet')") — read-only inspection, no paid model
+#     invocation.
+
+phase: 5
+name: Explorer — Geospatial Event Discovery Backend
+baseBranch: phase5/explorer
+canonicalDesignDocument: docs/superpowers/specs/2026-08-20-tripwith-phase-1-design.md
+concurrency: 2
+agentRetries: 1
+maxReviewRounds: 2
+agentTimeoutMs: 3600000
+
+tasks:
+  # --- Wave 1: two independent Codex implementation tasks ---
+
+  - id: explorer-query-api
+    title: Explorer viewport/radius query and authenticated discovery API
+    owner: codex
+    effort: high
+    mode: implementation
+    files:
+      - apps/api/src/explorer/**
+    dependsOn: []
+    instructions: |
+      Before writing code, inspect the current schema and architecture:
+      apps/api/src/database/entities/events.entity.ts (status/visibility enums,
+      meeting_point geography column, generated time_range tstzrange column,
+      event_categories), apps/api/src/database/geo/geo.service.ts (shared
+      PostGIS primitives), and the canonical design document. Run
+      `pnpm install --frozen-lockfile` in this isolated worktree before
+      repository tests if dependencies are not present.
+
+      Build an authenticated `/api/v1/explorer/...` endpoint using the
+      established Phase 3 authentication boundary. Never trust a
+      client-supplied user id.
+
+      Support the map's geographic discovery use case (viewport bounding box
+      and/or radius around a center point) via one coherent contract; do not
+      create multiple competing endpoints without reason.
+
+      GeoService's withinBoundingBox() deliberately rejects a bounding box
+      that crosses the antimeridian rather than silently returning wrong
+      results. Handle this deliberately in Explorer's own query layer — e.g.
+      split a crossing viewport into two safe predicates/queries and
+      deterministically merge results. Add a test for this exact case.
+
+      Discovery must only ever return events matching the existing canonical
+      predicate: visibility = PUBLIC AND status IN (ACTIVE, FULL) — the same
+      restriction as the events_discoverable_geo_time_gix index. Do not leak
+      DRAFT, IN_PROGRESS, COMPLETED, CANCELLED, PRIVATE, or UNLISTED events.
+
+      Use the existing generated `time_range` (tstzrange) column correctly
+      and consistently; only return events relevant to the requested/current
+      upcoming window. Do not introduce local-time ambiguity.
+
+      Return enough event_categories metadata for the future map UI to
+      distinguish pin types; do not hard-code a visual category list in
+      Explorer service code.
+
+      Response minimization: return only fields the discovery/map UI needs.
+      Do not serialize the full Event entity or leak internal
+      IDs/fields unrelated to Explorer.
+
+      Every query must be bounded (no unbounded world-scale result set) and
+      use deterministic ordering where ordering matters.
+
+      Validate: latitude/longitude, bounding-box geometry, radius, result
+      limits, time window, category filters, and any zoom/cluster
+      parameters. Reject malformed or abusive queries safely.
+
+      Provide backend support for map-marker clustering: individual pins at
+      high zoom, clusters at lower zoom/dense viewports. A cluster record
+      exposes only map-safe aggregate data — deterministic cluster id,
+      representative/centroid coordinate, event count, and optionally a
+      category summary — never full event payloads. PUBLIC/discoverable
+      filtering must happen strictly BEFORE clustering, so a private or
+      non-discoverable event can never influence a cluster's count,
+      centroid, category summary, or existence. Choose a simple,
+      deterministic, explainable clustering approach and document it in
+      code comments; do not add a new PostGIS extension for this.
+
+      Do not add Redis caching in this task. Establish the correct,
+      correctly-indexed uncached query first; a later task/phase can add
+      caching only after measurement justifies it (see the PostGIS evidence
+      task and the phase's caching policy in the canonical design doc).
+
+      Never query user live locations, trip segment locations, SOS
+      locations, or any hidden/private user coordinate for an event pin —
+      only events.meeting_point.
+
+      Reuse GeoService's existing ST_DWithin/bounding-box/validation
+      primitives rather than duplicating raw PostGIS helper logic; keep
+      Explorer-specific SQL in Explorer's own repository/query layer.
+
+      Add tests covering the above, including the antimeridian case.
+
+      The existing events_discoverable_geo_time_gix GIST index and the
+      current Event schema were already built and benchmarked for exactly
+      this query. Do not add another spatial index or migration merely
+      because this phase exists. If implementation genuinely proves a
+      schema/index change is necessary, STOP: do not create a migration or
+      expand this task's file ownership. Report the problem, EXPLAIN ANALYZE
+      evidence, a proposed migration, expected improvement, and risks in
+      your handoff instead, for human review.
+
+  - id: explorer-postgis-evidence
+    title: Explorer PostGIS execution-plan and benchmark evidence
+    owner: codex
+    effort: high
+    mode: implementation
+    files:
+      - apps/api/src/database/scripts/explorer-*.sql
+    dependsOn: []
+    instructions: |
+      Run `pnpm install --frozen-lockfile` in this isolated worktree before
+      repository tests if dependencies are not present.
+
+      Produce reproducible, Explorer-specific performance evidence for the
+      query shapes explorer-query-api implements:
+
+      - Build realistic synthetic event fixtures for benchmarking without
+        leaving permanent data behind (clean up in the same script/session).
+      - Exercise realistic viewport, radius, and time-window predicates.
+      - Use EXPLAIN (ANALYZE, BUFFERS) and verify events_discoverable_geo_time_gix
+        is actually used where the predicate matches its definition
+        (visibility = PUBLIC AND status IN (ACTIVE, FULL)).
+      - Measure representative small/medium/large viewport cases and at
+        least one dense-event scenario.
+      - Verify PUBLIC/discoverable filtering is applied before any
+        clustering aggregation, not after.
+      - Report p50/p95 timings if the harness runs repeated samples.
+      - Record the exact query shape and synthetic dataset size alongside
+        each result so findings are reproducible.
+      - Remove all benchmark fixtures afterward; leave no permanent rows.
+
+      Do not modify the canonical schema merely to make a benchmark look
+      faster, and do not cherry-pick a favorable sample. If the evidence
+      shows the existing index cannot support a real Phase 5 query, STOP and
+      report the problem plus EXPLAIN ANALYZE evidence rather than creating
+      a migration — see explorer-query-api's instructions for the exact
+      required report shape.
+
+  # --- Wave 2: adversarial cross-review of both Wave 1 outputs ---
+
+  - id: explorer-query-review
+    title: Independent adversarial review — query, privacy, cache, clustering
+    owner: claude
+    model: sonnet
+    effort: high
+    mode: review
+    files: []
+    dependsOn:
+      - explorer-query-api
+      - explorer-postgis-evidence
+    instructions: |
+      Act as an adversarial Verifier: attempt to falsify the implementation
+      rather than merely describe it. Concentrate specifically on:
+
+      private-location leakage; event visibility leakage; incorrect
+      ACTIVE/FULL filtering; completed/cancelled/draft/private/unlisted
+      event leakage; bounding-box mistakes; swapped lat/lng; geography vs
+      geometry mistakes; antimeridian behavior; polar/edge coordinates; SQL
+      injection; unbounded world-scale queries; clustering applied before
+      privacy filtering; cache-key collisions/staleness if caching exists;
+      duplicate or missing events when a viewport query is split; lack of
+      deterministic ordering; expensive sequential scans or index misuse
+      against events_discoverable_geo_time_gix; IDOR/auth-boundary bypass;
+      response overexposure beyond what the map/discovery UI needs; and
+      denial-of-service-sized parameters (huge radius, huge bbox, huge
+      limit).
+
+      Every material finding must include concrete evidence or a
+      reproduction strategy. Do not report style-only findings.
+
+  # --- Wave 3: conditional correction — SKIPPED if the review above approved ---
+
+  - id: explorer-query-correction
+    title: Verify and correct Explorer review findings
+    owner: codex
+    effort: high
+    mode: correction
+    files:
+      - apps/api/src/explorer/**
+      - apps/api/src/database/scripts/explorer-*.sql
+    dependsOn:
+      - explorer-query-review
+    condition:
+      reviewOf: explorer-query-review
+      skipIfStatus:
+        - approved
+    instructions: |
+      Run `pnpm install --frozen-lockfile` in this isolated worktree before
+      repository tests if dependencies are not present. Classify every
+      finding from explorer-query-review as CONFIRMED or REJECTED with
+      evidence — never apply a finding blindly, and never reject one without
+      justification.
+
+  # --- Wave 4: conditional re-verification — SKIPPED under the same condition ---
+
+  - id: explorer-final-review
+    title: Final independent Explorer cross-review
+    owner: claude
+    model: sonnet
+    effort: high
+    mode: final_review
+    files: []
+    dependsOn:
+      - explorer-query-correction
+    condition:
+      reviewOf: explorer-query-review
+      skipIfStatus:
+        - approved
+    instructions: |
+      Review the original findings, Codex's CONFIRMED/REJECTED responses and
+      evidence, the corrected diff, and any new/updated tests. Approve only
+      if every material (CONFIRMED) finding was genuinely resolved.
+
+  # --- Wave 5: expensive Judge — only on a real unresolved high/critical escalation ---
+
+  - id: explorer-judge
+    title: Escalation arbitration for an unresolved high/critical disagreement
+    owner: claude
+    model: opus
+    effort: extra_high
+    mode: escalation
+    files: []
+    dependsOn:
+      - explorer-final-review
+    condition:
+      reviewOf: explorer-final-review
+      skipIfStatus:
+        - approved
+      minimumSeverity: high
+    instructions: |
+      Read-only arbitration of one unresolved high/critical disagreement
+      between the Fixer and the final Verifier. Reuses the ordinary handoff
+      path: `status: "complete"` means resolved, `status: "blocked"` means
+      unresolved and stops the run for human review. One attempt only — do
+      not loop, and do not modify code.
+
+  # --- Wave 6: Lead composition and documentation ---
+
+  - id: explorer-lead-integration
+    title: Lead composition and verification preparation
+    owner: codex
+    effort: high
+    mode: integration
+    files:
+      - apps/api/src/app.module.ts
+      - apps/api/src/config/**
+      - docs/superpowers/specs/**
+    dependsOn:
+      - explorer-judge
+    instructions: |
+      Run `pnpm install --frozen-lockfile` in this isolated worktree before
+      repository tests if dependencies are not present. This task only
+      composes what the prior tasks already built — module wiring, bounded
+      shared configuration, and documentation. Do not re-implement or
+      redesign the Explorer feature itself.
+
+      Append a Phase 5 Explorer addendum to
+      docs/superpowers/specs/2026-08-20-tripwith-phase-1-design.md covering:
+      endpoint contract, spatial semantics, privacy boundary, event
+      discoverability predicates, clustering semantics, the caching
+      decision (and why, if none was added), benchmark dataset description,
+      EXPLAIN evidence summary, tests, material review findings and their
+      resolution, and remaining risks. Do not rewrite prior Phase 1–4
+      history in that document.
+
+integration:
+  commands:
+    - command: pnpm install --frozen-lockfile
+      timeoutMs: 600000
+    - pnpm --filter @tripwith/shared typecheck
+    - pnpm --filter @tripwith/api typecheck
+    - pnpm --filter @tripwith/api build
+    - pnpm --filter @tripwith/shared test
+    - command: pnpm --filter @tripwith/api test -- --runInBand --detectOpenHandles
+      timeoutMs: 1800000
+    - pnpm run check:enums
+    - command: pnpm --filter @tripwith/api db:verify
+      timeoutMs: 1800000
+  diagnostics:
+    - pnpm audit --prod
+
+# Deliberately NOT included yet: a required command running
+# explorer-postgis-evidence's own benchmark/verification script. That
+# script does not exist until that task actually runs, and its exact
+# invocation is unknown — inventing one now would violate this project's
+# "never fabricate, only wire a verified real command" rule. Add it as a
+# required integration command once the script exists and its invocation
+# has been confirmed, before the first real run relies on it for benchmark
+# regression protection.
+
+# This is a plan only. Running it invokes paid/local agents and writes
+# Phase 5 code; do not run until execution is separately, explicitly
+# approved.
