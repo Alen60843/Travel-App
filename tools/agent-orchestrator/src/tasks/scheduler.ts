@@ -9,6 +9,7 @@ export const TASK_STATUSES = [
   'FAILED',
   'BLOCKED',
   'CANCELLED',
+  'SKIPPED',
 ] as const;
 export type TaskStatus = (typeof TASK_STATUSES)[number];
 
@@ -17,7 +18,18 @@ const TERMINAL_STATUSES = new Set<TaskStatus>([
   'FAILED',
   'BLOCKED',
   'CANCELLED',
+  'SKIPPED',
 ]);
+
+/**
+ * Statuses that satisfy a dependent's "may this proceed" check. SUCCEEDED and
+ * SKIPPED are deliberately the same bucket: a downstream task must be able to
+ * make progress whether its dependency actually ran or was conditionally
+ * skipped — a task depending on a SKIPPED task is not blocked by that, and is
+ * not silently stuck in PENDING forever either. FAILED/BLOCKED/CANCELLED stay
+ * in the separate, blocking bucket below; SKIPPED is not a failure.
+ */
+const DEPENDENCY_SATISFIED_STATUSES = new Set<TaskStatus>(['SUCCEEDED', 'SKIPPED']);
 
 export class TaskGraph {
   readonly tasks: readonly TaskSpec[];
@@ -195,11 +207,18 @@ export class TaskGraph {
 const TRANSITIONS: Readonly<Record<TaskStatus, ReadonlySet<TaskStatus>>> = {
   PENDING: new Set(['READY', 'BLOCKED', 'CANCELLED']),
   READY: new Set(['RUNNING', 'BLOCKED', 'CANCELLED']),
-  RUNNING: new Set(['SUCCEEDED', 'FAILED', 'BLOCKED', 'CANCELLED']),
+  // RUNNING -> SKIPPED: AgentOrchestrator claims a conditionally-gated task as
+  // RUNNING the same as any other (the scheduler has no visibility into
+  // review artifacts, so it cannot pre-empt the claim), then evaluates the
+  // task's condition before ever creating a worktree or invoking an agent. If
+  // the condition says skip, the task moves straight to the terminal SKIPPED
+  // state from RUNNING without ever passing through SUCCEEDED/FAILED.
+  RUNNING: new Set(['SUCCEEDED', 'FAILED', 'BLOCKED', 'CANCELLED', 'SKIPPED']),
   SUCCEEDED: new Set(),
   FAILED: new Set(['READY', 'BLOCKED', 'CANCELLED']),
   BLOCKED: new Set(),
   CANCELLED: new Set(),
+  SKIPPED: new Set(),
 };
 
 /** In-memory scheduling primitive. Persistence remains the caller's responsibility. */
@@ -281,7 +300,7 @@ export class TaskScheduler {
         if (dependencies.some((status) => ['FAILED', 'BLOCKED', 'CANCELLED'].includes(status))) {
           this.states.set(task.id, 'BLOCKED');
           changed = true;
-        } else if (dependencies.every((status) => status === 'SUCCEEDED')) {
+        } else if (dependencies.every((status) => DEPENDENCY_SATISFIED_STATUSES.has(status))) {
           this.states.set(task.id, 'READY');
           changed = true;
         }

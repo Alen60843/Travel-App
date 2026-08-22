@@ -134,13 +134,35 @@ async function locateRun(
   };
 }
 
+// §15/§14: verified against real --help output before being hard-coded, not
+// guessed or left as an inference from an older, indirect note. Claude Code
+// 2.1.220 documents both --model and --effort. codex-cli 0.149.0-alpha.4.1
+// (`codex exec --help`, discovered via the VS Code extension fallback in
+// executable-resolution.ts) documents `-m, --model <MODEL>` but no
+// --effort/--reasoning flag of any kind.
+const AGENT_CAPABILITY_NOTES: Readonly<Record<'codex' | 'claude', { model: string; effort: string }>> = {
+  codex: { model: 'yes (-m/--model, exec subcommand)', effort: 'no (not present in codex exec --help)' },
+  claude: { model: 'yes (--model)', effort: 'yes (--effort)' },
+};
+
+function describeSource(source: 'override' | 'path' | 'vscode-extension' | undefined): string {
+  if (source === undefined) return '';
+  if (source === 'override') return ' [via CODEX_EXECUTABLE/CLAUDE_EXECUTABLE override]';
+  if (source === 'path') return ' [via PATH]';
+  return ' [via VS Code extension discovery]';
+}
+
 function renderPlan(plan: Awaited<ReturnType<typeof planPhase>>): string {
   const lines = [
     `Phase: ${String(plan.config.phase)} — ${plan.config.name}`,
     `Repository: ${plan.repositoryRoot}`,
     `Base: ${plan.config.baseBranch} @ ${plan.baseSha}`,
-    `Codex: ${plan.agentExecutables.codex}`,
-    `Claude: ${plan.agentExecutables.claude}`,
+    `Codex executable: ${plan.agentExecutables.codex}${describeSource(plan.agentExecutableSources.codex)}`,
+    `  model override support: ${AGENT_CAPABILITY_NOTES.codex.model}`,
+    `  effort override support: ${AGENT_CAPABILITY_NOTES.codex.effort}`,
+    `Claude executable: ${plan.agentExecutables.claude}${describeSource(plan.agentExecutableSources.claude)}`,
+    `  model override support: ${AGENT_CAPABILITY_NOTES.claude.model}`,
+    `  effort override support: ${AGENT_CAPABILITY_NOTES.claude.effort}`,
     `Concurrency: ${plan.config.concurrency}`,
     '',
   ];

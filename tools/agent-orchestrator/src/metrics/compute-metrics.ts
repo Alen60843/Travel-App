@@ -34,6 +34,17 @@ export interface TaskMetrics {
   readonly model: string | null;
   readonly effort: string;
   readonly status: string;
+  /**
+   * True iff an agent was actually invoked for this task — i.e. status is
+   * something other than the still-pending states or SKIPPED. This is the
+   * field that lets analysis distinguish "ran and did nothing" (the old,
+   * incorrect always-run behavior this correction pass replaced) from
+   * "correctly never ran" (SKIPPED): a skipped task is never `executed`,
+   * regardless of what its condition's reason says.
+   */
+  readonly executed: boolean;
+  /** Present only when status is SKIPPED. */
+  readonly skipReason: string | null;
   readonly attempts: number;
   readonly durationMs: number | null;
   readonly findingsProduced: number;
@@ -42,6 +53,8 @@ export interface TaskMetrics {
   readonly tokensUsed: null;
   readonly costUsd: null;
 }
+
+const NOT_YET_EXECUTED_STATUSES = new Set(['PENDING', 'READY', 'RUNNING', 'SKIPPED']);
 
 export interface DeterministicGateCommandMetrics {
   readonly command: string;
@@ -64,6 +77,20 @@ export interface RunMetrics {
   readonly correctionRounds: number;
   readonly escalationOccurred: boolean;
   readonly escalationResolved: boolean | null;
+  /**
+   * §9's named convenience view over `tasks`, for the well-known generated
+   * task ids only (solve/verify/fix/reverify/judge — see
+   * workflow/solver-verifier.ts). `null` when a run doesn't use that
+   * generated shape at all (e.g. a hand-authored generic phase file) rather
+   * than defaulting to false, which would misleadingly claim "did not run"
+   * for a role that was never applicable.
+   */
+  readonly roleExecution: {
+    readonly solverExecuted: boolean | null;
+    readonly verifierExecuted: boolean | null;
+    readonly fixerExecuted: boolean | null;
+    readonly judgeExecuted: boolean | null;
+  };
   readonly deterministicGate: {
     readonly ran: boolean;
     readonly passed: boolean | null;
@@ -199,6 +226,8 @@ export async function computeRunMetrics(
       model: spec?.model ?? null,
       effort: spec?.effort ?? 'unknown',
       status: runState.status,
+      executed: !NOT_YET_EXECUTED_STATUSES.has(runState.status),
+      skipReason: runState.status === 'SKIPPED' ? (runState.skipReason ?? null) : null,
       attempts: runState.agentAttempts.length,
       durationMs: taskDurationMs(runState),
       findingsProduced,
@@ -208,6 +237,14 @@ export async function computeRunMetrics(
       costUsd: null,
     });
   }
+
+  const executedById = new Map(tasks.map((task) => [task.taskId, task.executed]));
+  const roleExecution = {
+    solverExecuted: executedById.get('solve') ?? null,
+    verifierExecuted: executedById.get('verify') ?? null,
+    fixerExecuted: executedById.get('fix') ?? null,
+    judgeExecuted: executedById.get('judge') ?? null,
+  };
 
   const commands = (await readIntegrationCommandEvents(join(runDirectory, 'events.jsonl'))).map(
     (event): DeterministicGateCommandMetrics => ({
@@ -237,6 +274,7 @@ export async function computeRunMetrics(
     correctionRounds,
     escalationOccurred,
     escalationResolved,
+    roleExecution,
     deterministicGate: { ran: gateRan, passed: gatePassed, commands },
   };
 }

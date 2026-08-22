@@ -216,9 +216,29 @@ export function parsePhaseConfig(value: unknown): PhaseConfig {
       }
     }
   }
+  for (const task of tasks) {
+    if (task.condition !== undefined && !ids.has(task.condition.reviewOf)) {
+      invalid(`tasks.${task.id}.condition.reviewOf`, `unknown task ${task.condition.reviewOf}`);
+    }
+  }
 
   // Construction validates the full graph, including cycles.
-  new TaskGraph(tasks);
+  const graph = new TaskGraph(tasks);
+
+  // A condition can only ever be evaluated once its referenced artifact
+  // exists, which requires the referenced task to run (or be terminal)
+  // strictly before this one — i.e. be a genuine ancestor. Not necessarily a
+  // direct `dependsOn` entry: reverify's condition legitimately inspects
+  // verify, two hops back, while its graph dependency (for worktree/commit
+  // ordering) is fix.
+  for (const task of tasks) {
+    if (task.condition !== undefined && !graph.hasDependencyPath(task.id, task.condition.reviewOf)) {
+      invalid(
+        `tasks.${task.id}.condition.reviewOf`,
+        `must be an ancestor of ${task.id} (reachable via dependsOn), so its review is guaranteed to exist before this task's condition is evaluated`,
+      );
+    }
+  }
 
   const baseBranch = nonEmptyString(value.baseBranch, 'baseBranch');
   if (baseBranch.startsWith('-') || /[\u0000-\u001f\u007f]/.test(baseBranch)) {

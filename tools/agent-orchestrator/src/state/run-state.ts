@@ -60,6 +60,8 @@ export interface TaskRunState {
   readonly startedAt?: string;
   readonly finishedAt?: string;
   readonly error?: StoredError;
+  /** Present only when status is SKIPPED: why the task's condition was not satisfied. */
+  readonly skipReason?: string;
 }
 
 export interface IntegrationRunState {
@@ -86,6 +88,17 @@ export interface RunState {
   readonly tasks: Readonly<Record<string, TaskRunState>>;
   readonly integration: IntegrationRunState;
   readonly errors: readonly StoredError[];
+  /**
+   * §13: the EXACT executable path each real (non-injected) agent adapter
+   * was constructed with at `start()` time, persisted so `resume()` uses the
+   * identical binary rather than re-resolving it. Re-resolving on resume
+   * would let PATH, CODEX_EXECUTABLE, or which VS Code extension version is
+   * newest change out from under an in-progress run — the same class of bug
+   * as the immutable base SHA this orchestrator already protects elsewhere.
+   * Absent entries mean that agent was test-injected or genuinely unused by
+   * this phase's tasks.
+   */
+  readonly agentExecutables?: Readonly<Partial<Record<AgentName, string>>>;
 }
 
 export const RUN_EVENT_NAMES = [
@@ -100,6 +113,7 @@ export const RUN_EVENT_NAMES = [
   'FINDING_REPORTED',
   'TASK_COMMITTED',
   'TASK_SUCCEEDED',
+  'TASK_SKIPPED',
   'TASK_FAILED',
   'INTEGRATION_STARTED',
   'INTEGRATION_COMMAND_FINISHED',
@@ -129,6 +143,7 @@ export function createRunState(options: {
   readonly baseSha: string;
   readonly tasks: readonly TaskSpec[];
   readonly clock?: () => Date;
+  readonly agentExecutables?: Readonly<Partial<Record<AgentName, string>>>;
 }): RunState {
   assertSafeRunId(options.runId);
   assertFullSha(options.baseSha, 'baseSha');
@@ -162,6 +177,7 @@ export function createRunState(options: {
       integratedTaskCommits: [],
     },
     errors: [],
+    ...(options.agentExecutables === undefined ? {} : { agentExecutables: options.agentExecutables }),
   };
 }
 
@@ -346,6 +362,9 @@ function parseTask(value: unknown, key: string): TaskRunState {
     ...(value.error === undefined
       ? {}
       : { error: parseStoredError(value.error, `${path}.error`) }),
+    ...(value.skipReason === undefined
+      ? {}
+      : { skipReason: string(value.skipReason, `${path}.skipReason`) }),
   };
 }
 
@@ -436,6 +455,19 @@ export function validateRunState(value: unknown): RunState {
   if (!repositoryRoot.startsWith('/')) {
     throw new OrchestratorError('STATE_CORRUPT', 'repositoryRoot must be absolute');
   }
+  let agentExecutables: Partial<Record<AgentName, string>> | undefined;
+  if (value.agentExecutables !== undefined) {
+    if (!isObject(value.agentExecutables)) {
+      throw new OrchestratorError('STATE_CORRUPT', 'agentExecutables must be an object');
+    }
+    agentExecutables = {};
+    for (const [agentName, path] of Object.entries(value.agentExecutables)) {
+      if (agentName !== 'codex' && agentName !== 'claude') {
+        throw new OrchestratorError('STATE_CORRUPT', `agentExecutables.${agentName} is not a known agent`);
+      }
+      agentExecutables[agentName] = string(path, `agentExecutables.${agentName}`);
+    }
+  }
   return {
     schemaVersion: 1,
     runId,
@@ -449,6 +481,7 @@ export function validateRunState(value: unknown): RunState {
     tasks,
     integration,
     errors: value.errors.map((error, index) => parseStoredError(error, `errors[${index}]`)),
+    ...(agentExecutables === undefined ? {} : { agentExecutables }),
   };
 }
 

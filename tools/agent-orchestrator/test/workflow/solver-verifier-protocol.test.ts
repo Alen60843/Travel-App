@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
 
 import type { Agent, AgentName, AgentRequest, AgentResult } from '../../src/agents';
 import { AgentOrchestrator } from '../../src/orchestrator';
+import type { RunState } from '../../src/state';
 import { createTemporaryRepository } from '../git/helpers';
 
 /**
@@ -159,25 +160,23 @@ async function setUp(): Promise<{
 }
 
 // 1. Clean solution: Solver -> Verifier finds nothing -> gate passes -> APPROVED
-test('scenario 1: clean solution reaches approval with a no-op correction round', async () => {
+// -> Fixer/Re-Verifier/Judge are SKIPPED, not invoked as no-ops. This is the
+// post-correction-pass behavior: conditional execution is actually
+// conditional, not "always run and report nothing to do."
+test('scenario 1: clean solution SKIPS Fixer, Re-Verifier, and Judge entirely', async () => {
   const { fixture, write } = await setUp();
   try {
-    const phaseFile = await write({ maxCorrectionRounds: 1 });
+    const phaseFile = await write({ maxCorrectionRounds: 1, escalation: true });
     const codex = new ScenarioAgent('codex', {
       solve: async (request) => {
         await writeFile(join(request.worktreePath, 'feature.txt'), 'implemented', 'utf8');
         return completeHandoff();
       },
-      // fix always runs structurally once verify succeeds (see the
-      // "DELIBERATE SIMPLIFICATION" note in src/workflow/solver-verifier.ts)
-      // — with nothing to correct, the real Fixer contract is to make an
-      // empty, honest completion rather than invent a change.
-      fix: () => completeHandoff({ findingResponses: [] }),
+      // No `fix` behavior registered at all: if the engine invoked it despite
+      // verify approving, ScenarioAgent would throw "no behavior for task
+      // fix" and this test would fail loudly rather than silently.
     });
-    const claude = new ScenarioAgent('claude', {
-      verify: () => approvedReview(),
-      reverify: () => approvedReview(),
-    });
+    const claude = new ScenarioAgent('claude', { verify: () => approvedReview() });
     const orchestrator = await AgentOrchestrator.start(phaseFile, {
       repositoryPath: fixture.repository,
       runsRoot: join(fixture.container, 'runs'),
@@ -185,9 +184,23 @@ test('scenario 1: clean solution reaches approval with a no-op correction round'
     });
     const completed = await orchestrator.execute();
     assert.equal(completed.status, 'COMPLETED');
-    assert.deepEqual(Object.keys(completed.tasks).sort(), ['fix', 'reverify', 'solve', 'verify']);
-    assert.deepEqual(codex.invocations, ['solve', 'fix']);
-    assert.deepEqual(claude.invocations, ['verify', 'reverify']);
+    assert.equal(completed.tasks.fix?.status, 'SKIPPED');
+    assert.equal(completed.tasks.reverify?.status, 'SKIPPED');
+    assert.equal(completed.tasks.judge?.status, 'SKIPPED');
+    assert.match(completed.tasks.fix?.skipReason ?? '', /verify review status is approved/);
+    assert.match(
+      completed.tasks.judge?.skipReason ?? '',
+      /reverify produced no review artifact/,
+    );
+    // No worktree, no agent invocation, no commit for any skipped task.
+    assert.equal(completed.tasks.fix?.worktreePath, undefined);
+    assert.equal(completed.tasks.fix?.commit, undefined);
+    assert.deepEqual(codex.invocations, ['solve']);
+    assert.deepEqual(claude.invocations, ['verify']);
+    assert.deepEqual(
+      Object.keys(completed.tasks).sort(),
+      ['fix', 'judge', 'reverify', 'solve', 'verify'],
+    );
   } finally {
     await fixture.dispose();
   }
@@ -512,18 +525,19 @@ test('scenario 9: verify/reverify/judge run read-only and any mutation fails the
         sawReadOnlyAccess = true;
         return changesRequestedReview();
       },
+      // reverify does NOT approve here (unlike scenario 1's clean path), so
+      // judge's condition is satisfied and it actually runs — deliberately,
+      // so this test can assert its access default rather than merely
+      // asserting on the generated TaskSpec (already covered separately in
+      // solver-verifier-config.test.ts).
       reverify: (request) => {
         assert.equal(request.access, 'read_only');
-        return approvedReview();
+        return changesRequestedReview();
       },
-      // judge runs structurally even though reverify approved (see the
-      // "DELIBERATE SIMPLIFICATION" note) — asserting its access here is
-      // what actually proves the JUDGE role defaults to read-only, same as
-      // review/final_review.
       judge: (request) => {
         assert.equal(request.access, 'read_only');
         sawJudgeReadOnlyAccess = true;
-        return completeHandoff({ decisions: ['Nothing to arbitrate: the re-review already approved.'] });
+        return completeHandoff({ decisions: ['Resolved: the remaining finding is minor, not blocking.'] });
       },
     });
     const orchestrator = await AgentOrchestrator.start(phaseFile, {
@@ -565,6 +579,162 @@ test('scenario 10: a completed run requires human approval and pushes/merges not
     const branches = (await fixture.git.run(fixture.repository, ['branch', '--list'])).stdout;
     assert.ok(!branches.includes(`* ${fixture.baseBranch}`) || completed.integration.branch !== fixture.baseBranch);
     assert.notEqual(completed.integration.branch, fixture.baseBranch);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+// 5 (resume, clean path). Interrupt after Verifier APPROVED, before the
+// crashed process could persist fix's skip decision. Resume must retry fix
+// from scratch (via the existing RETRY_PROCESS_LOSS reconciliation path — no
+// new resume logic was needed for this) and reach the SAME correct answer:
+// SKIPPED, never actually invoked.
+test('resume (clean path): a crash before the skip decision persists still resumes to SKIPPED, not RUNNING', async () => {
+  const { fixture, write } = await setUp();
+  try {
+    const phaseFile = await write({ maxCorrectionRounds: 1, escalation: true });
+    const runsRoot = join(fixture.container, 'runs');
+    const started = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: fixture.repository,
+      runsRoot,
+      // Never actually invoked in this test: the crash is simulated by
+      // hand-constructing the intermediate state below, before any real
+      // agent for solve/verify/fix runs.
+      agents: { codex: new ScenarioAgent('codex', {}), claude: new ScenarioAgent('claude', {}) },
+    });
+    const runId = started.snapshot().runId;
+    const before = started.snapshot();
+
+    // Write the review artifact a real `verify` task would have produced.
+    const reviewsDir = join(started.stateStore.runDirectory, 'reviews');
+    await mkdir(reviewsDir, { recursive: true });
+    const verifyReviewPath = join(reviewsDir, 'verify.json');
+    await writeFile(verifyReviewPath, JSON.stringify(approvedReview()), 'utf8');
+
+    // Hand-construct the moment of the crash: solve/verify already
+    // succeeded; fix was claimed RUNNING by a process that then died before
+    // creating a worktree (worktreePath undefined) or persisting any
+    // decision — the exact ambiguous state reconcile()'s fallback branch is
+    // built to resolve safely.
+    const interrupted: RunState = {
+      ...before,
+      status: 'RUNNING',
+      tasks: {
+        ...before.tasks,
+        solve: { ...before.tasks.solve!, status: 'SUCCEEDED', finishedAt: before.createdAt },
+        verify: {
+          ...before.tasks.verify!,
+          status: 'SUCCEEDED',
+          reviewPaths: [verifyReviewPath],
+          finishedAt: before.createdAt,
+        },
+        fix: {
+          ...before.tasks.fix!,
+          status: 'RUNNING',
+          startedAt: before.createdAt,
+          agentAttempts: [{ attempt: 1, agent: 'codex', startedAt: before.createdAt, pid: 2_147_483_647 }],
+        },
+      },
+    };
+    await started.stateStore.save(interrupted);
+
+    const resumed = await AgentOrchestrator.resume(runId, {
+      repositoryPath: fixture.repository,
+      runsRoot,
+      agents: {
+        // Registers no `fix`/`reverify`/`judge` behavior at all: if the
+        // engine tried to actually run any of them post-resume rather than
+        // skip, ScenarioAgent throws and the test fails loudly.
+        codex: new ScenarioAgent('codex', {}),
+        claude: new ScenarioAgent('claude', {}),
+      },
+    });
+    // reconcile() itself, run inside resume(), must already have moved the
+    // ambiguous RUNNING task back to READY rather than leaving it stuck.
+    assert.equal(resumed.snapshot().tasks.fix?.status, 'READY');
+
+    const completed = await resumed.execute();
+    assert.equal(completed.status, 'COMPLETED');
+    assert.equal(completed.tasks.fix?.status, 'SKIPPED');
+    assert.equal(completed.tasks.reverify?.status, 'SKIPPED');
+    assert.equal(completed.tasks.judge?.status, 'SKIPPED');
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+// 6 (resume, escalation path). Interrupt after Re-Verifier requests
+// escalation (reverify already SUCCEEDED with a non-approved, high-severity
+// review), before judge started. Resume must run judge exactly once.
+test('resume (escalation path): a crash before Judge starts resumes to exactly one Judge invocation', async () => {
+  const { fixture, write } = await setUp();
+  try {
+    const phaseFile = await write({ maxCorrectionRounds: 1, escalation: true });
+    const runsRoot = join(fixture.container, 'runs');
+    const started = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: fixture.repository,
+      runsRoot,
+      agents: { codex: new ScenarioAgent('codex', {}), claude: new ScenarioAgent('claude', {}) },
+    });
+    const runId = started.snapshot().runId;
+    const before = started.snapshot();
+
+    const reviewsDir = join(started.stateStore.runDirectory, 'reviews');
+    await mkdir(reviewsDir, { recursive: true });
+    const verifyReviewPath = join(reviewsDir, 'verify.json');
+    await writeFile(verifyReviewPath, JSON.stringify(changesRequestedReview()), 'utf8');
+    const reverifyReviewPath = join(reviewsDir, 'reverify.json');
+    await writeFile(reverifyReviewPath, JSON.stringify(changesRequestedReview('F002')), 'utf8');
+
+    const interrupted: RunState = {
+      ...before,
+      status: 'RUNNING',
+      tasks: {
+        ...before.tasks,
+        solve: { ...before.tasks.solve!, status: 'SUCCEEDED', finishedAt: before.createdAt },
+        verify: {
+          ...before.tasks.verify!,
+          status: 'SUCCEEDED',
+          reviewPaths: [verifyReviewPath],
+          finishedAt: before.createdAt,
+        },
+        fix: { ...before.tasks.fix!, status: 'SUCCEEDED', finishedAt: before.createdAt },
+        reverify: {
+          ...before.tasks.reverify!,
+          status: 'SUCCEEDED',
+          reviewPaths: [reverifyReviewPath],
+          finishedAt: before.createdAt,
+        },
+        judge: {
+          ...before.tasks.judge!,
+          status: 'RUNNING',
+          startedAt: before.createdAt,
+          agentAttempts: [{ attempt: 1, agent: 'claude', startedAt: before.createdAt, pid: 2_147_483_647 }],
+        },
+      },
+    };
+    await started.stateStore.save(interrupted);
+
+    let judgeInvocations = 0;
+    const resumed = await AgentOrchestrator.resume(runId, {
+      repositoryPath: fixture.repository,
+      runsRoot,
+      agents: {
+        codex: new ScenarioAgent('codex', {}),
+        claude: new ScenarioAgent('claude', {
+          judge: () => {
+            judgeInvocations += 1;
+            return completeHandoff({ decisions: ['Resolved after resume.'] });
+          },
+        }),
+      },
+    });
+    assert.equal(resumed.snapshot().tasks.judge?.status, 'READY');
+
+    const completed = await resumed.execute();
+    assert.equal(completed.status, 'COMPLETED');
+    assert.equal(completed.tasks.judge?.status, 'SUCCEEDED');
+    assert.equal(judgeInvocations, 1);
   } finally {
     await fixture.dispose();
   }

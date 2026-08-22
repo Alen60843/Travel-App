@@ -14,7 +14,14 @@ import {
   type PhaseConfig,
 } from '../config';
 import { OrchestratorError } from '../errors';
-import { AGENT_NAMES, EFFORT_LEVELS, type AgentName, type EffortLevel } from '../tasks/task-schema';
+import { FINDING_SEVERITIES, type FindingSeverity } from '../review/findings';
+import {
+  AGENT_NAMES,
+  EFFORT_LEVELS,
+  type AgentName,
+  type EffortLevel,
+  type TaskCondition,
+} from '../tasks/task-schema';
 
 /**
  * §2/§11: the SOLVER / VERIFIER / FIXER / JUDGE semantic-role vocabulary,
@@ -75,6 +82,12 @@ export interface WorkflowEscalationSpec {
   readonly agent: AgentName;
   readonly model?: string;
   readonly effort: EffortLevel;
+  /**
+   * §5 MVP default: 'high'. Medium/low findings alone must not invoke the
+   * expensive Judge — set this lower only as a deliberate, explicit opt-in,
+   * never silently.
+   */
+  readonly minimumSeverity: FindingSeverity;
 }
 
 export interface SolverVerifierWorkflow {
@@ -128,7 +141,7 @@ const WORKFLOW_KEYS = new Set([
   'escalation',
 ]);
 const AGENT_SPEC_KEYS = new Set(['agent', 'model', 'effort']);
-const ESCALATION_KEYS = new Set(['enabled', 'agent', 'model', 'effort']);
+const ESCALATION_KEYS = new Set(['enabled', 'agent', 'model', 'effort', 'minimumSeverity']);
 
 function stringArray(value: unknown, path: string): string[] {
   if (!Array.isArray(value)) {
@@ -172,7 +185,11 @@ function parseEscalation(value: unknown, path: string): WorkflowEscalationSpec |
     { agent: value.agent, model: value.model, effort: value.effort },
     path,
   );
-  return { enabled, ...base };
+  const minimumSeverity = nonEmptyString(value.minimumSeverity ?? 'high', `${path}.minimumSeverity`);
+  if (!(FINDING_SEVERITIES as readonly string[]).includes(minimumSeverity)) {
+    invalid(`${path}.minimumSeverity`, `must be one of ${FINDING_SEVERITIES.join(', ')}`);
+  }
+  return { enabled, ...base, minimumSeverity: minimumSeverity as FindingSeverity };
 }
 
 function assertOnlyKnownKeys(
@@ -278,6 +295,7 @@ interface GeneratedTask {
   readonly mode: string;
   readonly files: readonly string[];
   readonly dependsOn: readonly string[];
+  readonly condition?: TaskCondition;
 }
 
 function agentTask(
@@ -287,6 +305,7 @@ function agentTask(
   spec: WorkflowAgentSpec,
   files: readonly string[],
   dependsOn: readonly string[],
+  condition?: TaskCondition,
 ): GeneratedTask {
   return {
     id,
@@ -297,6 +316,7 @@ function agentTask(
     files,
     dependsOn,
     ...(spec.model === undefined ? {} : { model: spec.model }),
+    ...(condition === undefined ? {} : { condition }),
   };
 }
 
@@ -306,28 +326,37 @@ function agentTask(
  *
  *   solve (implementation)
  *     -> verify (review)
- *        -> [fix (correction) -> reverify (final_review)]   iff maxCorrectionRounds === 1
- *           -> judge (escalation)                            iff escalation.enabled
+ *        -> [fix (correction) -> reverify (final_review)]   graph edge iff maxCorrectionRounds === 1
+ *           -> judge (escalation)                            graph edge iff escalation.enabled
  *
  * `maxReviewRounds` on the resulting PhaseConfig is derived, not configured
  * separately: one review round per generated review/final_review task, which
  * is exactly what bounds the correction loop to `maxCorrectionRounds`.
  *
- * IMPORTANT, DELIBERATE SIMPLIFICATION: `fix`, `reverify`, and `judge` are
- * static graph edges, not a conditional branch. The underlying engine has no
- * mechanism to skip a task based on an upstream artifact's content (task
- * readiness is driven purely by dependency SUCCESS/FAILURE, never by what a
- * handoff/review actually said) — adding one would be exactly the "second
- * scheduler" this module is required not to build. So when
- * maxCorrectionRounds is 1, `fix` and `reverify` run even if `verify`
- * approved on the first pass, and `judge` runs even if `reverify` approved.
- * This is not new: it mirrors the engine's pre-existing precedent that a
- * `correction` task may legitimately make an EMPTY commit
- * (ensureTaskCommit's `allowEmpty`) when there is nothing to fix. The role
- * contracts (agent.ts's roleContract, prompts/judge.md) instruct the Fixer
- * and the Judge to report a trivial "nothing to do" completion rather than
- * invent work — the structural graph always executes; the agent's own
- * response is what makes an unnecessary step cheap rather than harmful.
+ * CONDITIONAL EXECUTION: `fix`, `reverify`, and `judge` are graph edges (so
+ * ownership/DAG validation and commit ordering are unconditional and simple),
+ * but each carries a `condition` (task-schema.ts's TaskCondition) gating
+ * whether it actually RUNS. AgentOrchestrator evaluates the condition against
+ * an already-persisted, validated review artifact — before creating a
+ * worktree or invoking an agent — and transitions the task straight to the
+ * terminal SKIPPED state when it is not satisfied:
+ *
+ *   fix.condition      = skip when verify approved
+ *   reverify.condition = skip when verify approved (same signal as fix — if
+ *                        there was nothing to correct, there is nothing to
+ *                        re-review either)
+ *   judge.condition    = skip when reverify approved (regardless of why: a
+ *                        skipped reverify has no review artifact to satisfy
+ *                        "not approved", so a fully clean run skips judge
+ *                        too, transitively)
+ *
+ * Whether reverify's OWN non-approved outcome is even allowed to reach
+ * SUCCEEDED (rather than hard-failing as BLOCKED_FOR_HUMAN_REVIEW) is a
+ * SEPARATE decision made in orchestrator.ts's finishReview, gated on
+ * workflow.escalation.minimumSeverity (§5 MVP default 'high') — judge only
+ * ever becomes reachable at all when that gate already passed, so its own
+ * condition only needs to distinguish "reverify approved" (skip) from
+ * "reverify was let through specifically for escalation" (run).
  */
 export function expandSolverVerifierWorkflow(file: SolverVerifierPhaseFile): PhaseConfig {
   const { workflow } = file;
@@ -335,6 +364,8 @@ export function expandSolverVerifierWorkflow(file: SolverVerifierPhaseFile): Pha
     agentTask('solve', 'Solver implementation', 'implementation', workflow.solver, workflow.files, []),
     agentTask('verify', 'Adversarial Verifier review', 'review', workflow.verifier, [], ['solve']),
   ];
+
+  const skipIfVerifyApproved: TaskCondition = { reviewOf: 'verify', skipIfStatus: ['approved'] };
 
   let lastReviewId = 'verify';
   if (workflow.maxCorrectionRounds === 1) {
@@ -346,8 +377,17 @@ export function expandSolverVerifierWorkflow(file: SolverVerifierPhaseFile): Pha
         workflow.correction,
         workflow.files,
         ['verify'],
+        skipIfVerifyApproved,
       ),
-      agentTask('reverify', 'Verifier re-review', 'final_review', workflow.verifier, [], ['fix']),
+      agentTask(
+        'reverify',
+        'Verifier re-review',
+        'final_review',
+        workflow.verifier,
+        [],
+        ['fix'],
+        skipIfVerifyApproved,
+      ),
     );
     lastReviewId = 'reverify';
   }
@@ -371,6 +411,11 @@ export function expandSolverVerifierWorkflow(file: SolverVerifierPhaseFile): Pha
         workflow.escalation,
         [],
         [lastReviewId],
+        {
+          reviewOf: 'reverify',
+          skipIfStatus: ['approved'],
+          minimumSeverity: workflow.escalation.minimumSeverity,
+        },
       ),
     );
   }

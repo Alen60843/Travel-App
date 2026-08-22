@@ -2,10 +2,17 @@ import { randomBytes } from 'node:crypto';
 import { open, readFile, rename, rm } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 
-import { ClaudeAgent, CodexAgent, type Agent, type AgentRequest, type AgentResult } from './agents';
+import {
+  ClaudeAgent,
+  CodexAgent,
+  resolveAgentExecutable,
+  type Agent,
+  type AgentRequest,
+  type AgentResult,
+  type ExecutableSource,
+} from './agents';
 import type { PhaseConfig } from './config';
 import { OrchestratorError, type ErrorCode } from './errors';
-import { findExecutable } from './executable';
 import {
   GitClient,
   WorktreeManager,
@@ -40,6 +47,8 @@ import {
   assertChangedFileOwnership,
   assertNoParallelOwnershipOverlap,
   assertReviewRoundAllowed,
+  severityAtLeast,
+  type TaskCondition,
   type TaskSpec,
   type TaskStatus,
 } from './tasks';
@@ -49,7 +58,18 @@ export interface PlanResult {
   readonly repositoryRoot: string;
   readonly config: PhaseConfig;
   readonly baseSha: string;
+  /** Display string per agent: a resolved absolute path, or 'injected-adapter'/'not-required'. */
   readonly agentExecutables: Readonly<Record<'codex' | 'claude', string>>;
+  /** §15: how each was found, for plan output. Absent for injected/not-required agents. */
+  readonly agentExecutableSources: Readonly<Partial<Record<'codex' | 'claude', ExecutableSource>>>;
+  /**
+   * §13: the REAL resolved paths only (excludes injected/not-required
+   * sentinels) — this is what `AgentOrchestrator.start()` threads into the
+   * actual runtime adapters, so plan-time discovery and run-time execution
+   * are guaranteed to agree rather than plan merely displaying a path that
+   * execution then ignores in favor of a bare command name.
+   */
+  readonly resolvedAgentExecutables: Readonly<Partial<Record<'codex' | 'claude', string>>>;
   readonly waves: readonly (readonly TaskSpec[])[];
 }
 
@@ -90,33 +110,56 @@ export async function planPhase(
     requiredAgents.add('codex');
     requiredAgents.add('claude');
   }
+
   const executables: Partial<Record<'codex' | 'claude', string>> = {};
+  const sources: Partial<Record<'codex' | 'claude', ExecutableSource>> = {};
+  const resolvedExecutables: Partial<Record<'codex' | 'claude', string>> = {};
+
+  const resolveOne = async (agent: 'codex' | 'claude'): Promise<void> => {
+    if (agent in executables) return;
+    if (options.agents?.[agent] !== undefined) {
+      executables[agent] = 'injected-adapter';
+      return;
+    }
+    const resolution = await resolveAgentExecutable(agent);
+    if (resolution === null) {
+      executables[agent] = 'not-required';
+      return;
+    }
+    executables[agent] = resolution.path;
+    sources[agent] = resolution.source;
+    resolvedExecutables[agent] = resolution.path;
+  };
+
   for (const agent of requiredAgents) {
     if (options.agents?.[agent] !== undefined) {
       executables[agent] = 'injected-adapter';
       continue;
     }
-    const executable = await findExecutable(agent);
-    if (executable === null) {
+    const resolution = await resolveAgentExecutable(agent);
+    if (resolution === null) {
       throw new OrchestratorError('AGENT_NOT_FOUND', `Required agent executable not found: ${agent}`, {
         details: { agent },
       });
     }
-    executables[agent] = executable;
+    executables[agent] = resolution.path;
+    sources[agent] = resolution.source;
+    resolvedExecutables[agent] = resolution.path;
   }
-  // Keep the result shape stable even if a phase happens to use one model.
-  executables.codex ??= options.agents?.codex === undefined
-    ? (await findExecutable('codex')) ?? 'not-required'
-    : 'injected-adapter';
-  executables.claude ??= options.agents?.claude === undefined
-    ? (await findExecutable('claude')) ?? 'not-required'
-    : 'injected-adapter';
+  // Keep the result shape stable even for an agent no task in this phase
+  // actually requires — resolved on a best-effort basis (never throws) so
+  // `agents:plan` output is complete without over-constraining phases that
+  // only use one agent.
+  await resolveOne('codex');
+  await resolveOne('claude');
 
   return {
     repositoryRoot,
     config,
     baseSha,
     agentExecutables: executables as Record<'codex' | 'claude', string>,
+    agentExecutableSources: sources,
+    resolvedAgentExecutables: resolvedExecutables,
     waves: new TaskGraph(config.tasks).executionWaves(config.concurrency),
   };
 }
@@ -175,6 +218,9 @@ export class AgentOrchestrator {
       baseSha: plan.baseSha,
       tasks: plan.config.tasks,
       ...(options.clock === undefined ? {} : { clock: options.clock }),
+      ...(Object.keys(plan.resolvedAgentExecutables).length === 0
+        ? {}
+        : { agentExecutables: plan.resolvedAgentExecutables }),
     });
     await stateStore.initialize(state);
     await copyPhaseSnapshot(resolve(phaseFile), join(stateStore.runDirectory, 'phase.yaml'));
@@ -189,7 +235,9 @@ export class AgentOrchestrator {
         repositoryPath: plan.repositoryRoot,
         git,
       }),
-      agents: createAgents(options.agents),
+      // §13: the SAME resolved paths just validated by planPhase, not a
+      // fresh re-resolution — this is the plan/runtime agreement itself.
+      agents: createAgents(options.agents, plan.resolvedAgentExecutables),
       clock: options.clock ?? (() => new Date()),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     });
@@ -232,7 +280,17 @@ export class AgentOrchestrator {
       state,
       git,
       worktrees: await WorktreeManager.create({ repositoryPath: repositoryRoot, git }),
-      agents: createAgents(options.agents),
+      // §7/§13: deliberately NOT a fresh planPhase/resolveAgentExecutable
+      // call. Re-resolving here would let PATH, CODEX_EXECUTABLE, or which
+      // VS Code extension version is newest change between the original run
+      // and a resume — the persisted state.agentExecutables (written once,
+      // at start()) is what start() itself validated against, so resume
+      // stays bound to that exact same binary even if the environment moved
+      // on. A run persisted before this field existed has no recorded path
+      // (agentExecutables undefined) and falls back to createAgents'/each
+      // adapter's own bare command-name default, matching this orchestrator's
+      // pre-existing behavior for that older state shape.
+      agents: createAgents(options.agents, state.agentExecutables ?? {}),
       clock: options.clock ?? (() => new Date()),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     });
@@ -305,7 +363,15 @@ export class AgentOrchestrator {
           // A resumed child is still alive. Do not duplicate it or busy-wait.
           return this.state;
         }
-        if (Object.values(this.state.tasks).every((task) => task.status === 'SUCCEEDED')) {
+        // SKIPPED counts alongside SUCCEEDED here — a run where the clean
+        // path skipped fix/reverify/judge entirely is still a fully
+        // successful run that must reach the deterministic gate, not one
+        // stuck waiting for tasks that were correctly never going to run.
+        if (
+          Object.values(this.state.tasks).every(
+            (task) => task.status === 'SUCCEEDED' || task.status === 'SKIPPED',
+          )
+        ) {
           await this.integrateAndVerify();
           return this.state;
         }
@@ -355,6 +421,22 @@ export class AgentOrchestrator {
   }
 
   private async executeTask(task: TaskSpec): Promise<void> {
+    // Checked BEFORE prepareTask deliberately: prepareTask is what creates
+    // the worktree and applies dependency commits. A task whose condition
+    // says skip must never reach that point — no worktree, no agent
+    // invocation, no commit — which is also what makes the skip decision
+    // safe to redo verbatim on resume (see reconcile()'s fallback path for a
+    // RUNNING task with no worktreePath yet: it retries from scratch, which
+    // for a conditionally-gated task just re-evaluates the same condition
+    // against the same persisted artifact and reaches the same answer).
+    if (task.condition !== undefined) {
+      const verdict = await this.evaluateCondition(task.condition);
+      if (verdict.skip) {
+        await this.skipTask(task.id, verdict.reason);
+        return;
+      }
+    }
+
     const prepared = await this.prepareTask(task);
     if (task.mode === 'debate') {
       await this.executeDebate(prepared);
@@ -379,6 +461,58 @@ export class AgentOrchestrator {
     } else {
       await this.finishHandoff(prepared, result);
     }
+  }
+
+  /**
+   * §5: evaluated purely from the already-validated StructuredReview an
+   * ancestor task produced — never free-form text. "No review artifact
+   * found" (the referenced task was itself SKIPPED, or genuinely has none)
+   * defaults to skip: there is nothing to act on, which is the same
+   * conclusion a human would draw and matches how a skip is meant to
+   * propagate through a chain of conditionally-gated tasks (see judge's
+   * condition on reverify, when reverify was itself skipped because verify
+   * approved).
+   */
+  private async evaluateCondition(
+    condition: TaskCondition,
+  ): Promise<{ readonly skip: boolean; readonly reason: string }> {
+    const reviewPath = this.state.tasks[condition.reviewOf]?.reviewPaths.at(-1);
+    if (reviewPath === undefined) {
+      return {
+        skip: true,
+        reason: `${condition.reviewOf} produced no review artifact (it was itself skipped, or has none yet)`,
+      };
+    }
+    const review = parseReview(await readFile(reviewPath, 'utf8'));
+    if (condition.skipIfStatus.includes(review.status)) {
+      return { skip: true, reason: `${condition.reviewOf} review status is ${review.status}` };
+    }
+    if (condition.minimumSeverity !== undefined) {
+      const minimumSeverity = condition.minimumSeverity;
+      const hasMaterialFinding = review.findings.some((finding) =>
+        severityAtLeast(finding.severity, minimumSeverity),
+      );
+      if (!hasMaterialFinding) {
+        return {
+          skip: true,
+          reason: `${condition.reviewOf} review has no finding at or above ${minimumSeverity} severity`,
+        };
+      }
+    }
+    return { skip: false, reason: '' };
+  }
+
+  private async skipTask(taskId: string, reason: string): Promise<void> {
+    await this.mutate((state) => updateTask(state, taskId, (task) => {
+      const { error: _previousError, ...withoutError } = task;
+      return {
+        ...withoutError,
+        status: 'SKIPPED',
+        skipReason: reason,
+        finishedAt: this.clock().toISOString(),
+      };
+    }));
+    await this.event('TASK_SKIPPED', taskId, { reason });
   }
 
   private async prepareTask(task: TaskSpec): Promise<PreparedTask> {
@@ -623,17 +757,22 @@ export class AgentOrchestrator {
     }
     // §8 escalation seam: a non-approved final_review normally stops the run
     // as BLOCKED_FOR_HUMAN_REVIEW immediately below, unconditionally — that
-    // remains the exact behavior for every phase that does not opt in. It
-    // changes ONLY when this specific task has an escalation-mode (JUDGE)
-    // dependent in the graph: then the disagreement is handed to the Judge
-    // for one bounded arbitration attempt instead. Detected structurally from
-    // the DAG, not from configuration, so nothing needs to be threaded
-    // through the phase config to enable it, and a phase with no escalation
-    // task literally cannot exercise this branch.
+    // remains the exact behavior for every phase that does not opt in, AND
+    // for one that opts in but whose remaining findings don't clear the
+    // severity bar (§5: medium/low alone must not invoke the expensive
+    // Judge — the run still stops for a human, it just does so without
+    // paying for arbitration first). It changes only when BOTH (a) this task
+    // has an escalation-mode (JUDGE) dependent in the graph, detected
+    // structurally, and (b) at least one remaining finding meets that
+    // dependent's own minimumSeverity (default 'high'): then the
+    // disagreement is handed to the Judge for one bounded attempt instead.
+    const escalationDependent = this.findEscalationDependent(prepared.task.id);
+    const escalationMinimumSeverity = escalationDependent?.condition?.minimumSeverity ?? 'high';
     const routeToEscalation =
       prepared.task.mode === 'final_review'
       && review.status !== 'approved'
-      && this.hasEscalationDependent(prepared.task.id);
+      && escalationDependent !== undefined
+      && review.findings.some((finding) => severityAtLeast(finding.severity, escalationMinimumSeverity));
     if (
       !routeToEscalation
       && (review.status === 'blocked'
@@ -739,8 +878,16 @@ export class AgentOrchestrator {
   }
 
   /** True if any task in the graph both depends on `taskId` and has mode 'escalation'. */
-  private hasEscalationDependent(taskId: string): boolean {
-    return this.config.tasks.some(
+  /**
+   * The escalation-mode (JUDGE) task that graph-depends on `taskId`, if any.
+   * §5's severity threshold lives on THAT task's own `condition.minimumSeverity`
+   * rather than being duplicated in a second config location — 'high' is the
+   * MVP default (§5) when the escalation task declares no condition at all,
+   * e.g. a hand-authored phase file that didn't opt into the generic
+   * condition mechanism.
+   */
+  private findEscalationDependent(taskId: string): TaskSpec | undefined {
+    return this.config.tasks.find(
       (candidate) => candidate.mode === 'escalation' && candidate.dependsOn.includes(taskId),
     );
   }
@@ -1126,12 +1273,28 @@ export class AgentOrchestrator {
   }
 }
 
+/**
+ * §13: `resolvedExecutables` is what makes plan-time discovery and run-time
+ * execution agree. Without threading it through, `CodexAgent`/`ClaudeAgent`
+ * fall back to their bare default command name (`this.executableOverride ??
+ * this.defaultExecutable` in process-agent.ts), which Node's own `spawn()`
+ * then resolves via the CHILD PROCESS's PATH lookup — entirely independent
+ * of whatever `resolveAgentExecutable` found. A phase could `agents:plan`
+ * successfully against a VS Code-extension-discovered Codex binary and then
+ * fail at `agents:run` with ENOENT, because the two paths were never
+ * actually connected.
+ */
 function createAgents(
   overrides: OrchestratorOptions['agents'],
+  resolvedExecutables?: Readonly<Partial<Record<'codex' | 'claude', string>>>,
 ): Readonly<Record<'codex' | 'claude', Agent>> {
   return {
-    codex: overrides?.codex ?? new CodexAgent(),
-    claude: overrides?.claude ?? new ClaudeAgent(),
+    codex:
+      overrides?.codex
+      ?? new CodexAgent(resolvedExecutables?.codex === undefined ? {} : { executable: resolvedExecutables.codex }),
+    claude:
+      overrides?.claude
+      ?? new ClaudeAgent(resolvedExecutables?.claude === undefined ? {} : { executable: resolvedExecutables.claude }),
   };
 }
 
