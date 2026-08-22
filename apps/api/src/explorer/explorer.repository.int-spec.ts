@@ -34,12 +34,12 @@ async function insertEvent(fixture: EventFixture): Promise<string> {
        (id, host_type, host_user_id, category_id, title, status, visibility,
         capacity_max, starts_at, ends_at, meeting_point, meeting_point_label,
         cancelled_at, completed_at)
-     SELECT $1, 'USER', $2, category.id, $3, $4, $5,
+     SELECT $1, 'USER', $2, category.id, $3, $4::event_status, $5,
             10, $6::timestamptz, $7::timestamptz,
             ST_SetSRID(ST_MakePoint($8, $9), 4326)::geography,
             $10,
-            CASE WHEN $4 = 'CANCELLED' THEN $6::timestamptz ELSE NULL END,
-            CASE WHEN $4 = 'COMPLETED' THEN $7::timestamptz ELSE NULL END
+            CASE WHEN $4::event_status = 'CANCELLED' THEN $6::timestamptz ELSE NULL END,
+            CASE WHEN $4::event_status = 'COMPLETED' THEN $7::timestamptz ELSE NULL END
        FROM event_categories category
       WHERE category.code = $11`,
     [
