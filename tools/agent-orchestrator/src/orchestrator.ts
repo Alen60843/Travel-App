@@ -1,10 +1,12 @@
 import { randomBytes } from 'node:crypto';
-import { open, readFile, rename, rm } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 
 import {
   ClaudeAgent,
   CodexAgent,
+  parseJsonOrNull,
+  readBoundedStdoutText,
   resolveAgentExecutable,
   type Agent,
   type AgentRequest,
@@ -12,7 +14,7 @@ import {
   type ExecutableSource,
 } from './agents';
 import type { PhaseConfig } from './config';
-import { OrchestratorError, type ErrorCode } from './errors';
+import { OrchestratorError, isOrchestratorError, type ErrorCode } from './errors';
 import {
   GitClient,
   WorktreeManager,
@@ -25,9 +27,16 @@ import {
   type IntegrationCommit,
   type OwnedWorktree,
 } from './git';
-import { parseHandoff, writeHandoff, type StructuredHandoff } from './handoff';
+import {
+  deterministicallyRepairHandoffKeys,
+  parseHandoff,
+  validateHandoff,
+  writeHandoff,
+  type StructuredHandoff,
+} from './handoff';
 import { IntegrationGate } from './integration/integration-gate';
-import { parseReview, type StructuredReview } from './review/findings';
+import { extractStructuredPayload } from './protocol';
+import { parseReview, validateReview, type StructuredReview } from './review/findings';
 import {
   StateStore,
   assertResumeBaseUnmoved,
@@ -94,6 +103,21 @@ interface PreparedTask {
 const REVIEW_MODES = new Set(['review', 'final_review']);
 const MAX_AGENT_DIFF_BYTES = 2 * 1024 * 1024;
 const INFRASTRUCTURE_FAILURES = new Set(['not_found', 'spawn_error', 'timed_out']);
+/** §6: bounded — a repair reformats existing text, it never does real work. */
+const HANDOFF_REPAIR_TIMEOUT_MS = 5 * 60 * 1000;
+
+interface HandoffOutcomeRecord {
+  readonly outcome: 'valid' | 'invalid';
+  readonly repairAttempted: boolean;
+  readonly repairSucceeded?: boolean;
+}
+
+/** Result of recoverHandoffFailures: which persisted FAILED tasks were actually recovered, and why any others were left untouched. */
+export interface HandoffRecoveryResult {
+  readonly orchestrator: AgentOrchestrator;
+  readonly recovered: readonly string[];
+  readonly skipped: readonly { readonly taskId: string; readonly reason: string }[];
+}
 
 export async function planPhase(
   phaseFile: string,
@@ -253,7 +277,17 @@ export class AgentOrchestrator {
     return orchestrator;
   }
 
-  static async resume(runId: string, options: OrchestratorOptions): Promise<AgentOrchestrator> {
+  /**
+   * Shared load/validate/construct path for anything that continues an
+   * existing run (resume() for interrupted RUNNING tasks; recoverHandoffFailures()
+   * for a run whose top-level status already went terminal). Deliberately
+   * does not call reconcile() or emit RUN_RESUMED itself — those are specific
+   * to the two distinct continuation modes above it, not to this shared step.
+   */
+  private static async loadRunForContinuation(
+    runId: string,
+    options: OrchestratorOptions,
+  ): Promise<AgentOrchestrator> {
     const git = options.git ?? new GitClient();
     const repositoryRoot = await git.repositoryRoot(resolve(options.repositoryPath));
     const runsRoot = resolve(
@@ -271,8 +305,11 @@ export class AgentOrchestrator {
       throw new OrchestratorError('STATE_CORRUPT', 'Stored phase base branch differs from run state');
     }
     const actualBaseSha = await resolveBaseSha(git, repositoryRoot, state.baseBranch);
+    // §9: this is the same immutable-base check resume() has always made —
+    // recovery must refuse just as loudly as a normal resume would if
+    // phase5/explorer (or any other run's base branch) moved underneath it.
     assertResumeBaseUnmoved(state.baseSha, actualBaseSha);
-    const orchestrator = new AgentOrchestrator({
+    return new AgentOrchestrator({
       config,
       repositoryRoot,
       runsRoot,
@@ -294,8 +331,290 @@ export class AgentOrchestrator {
       clock: options.clock ?? (() => new Date()),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     });
+  }
+
+  static async resume(runId: string, options: OrchestratorOptions): Promise<AgentOrchestrator> {
+    const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options);
     await orchestrator.reconcile();
     await orchestrator.event('RUN_RESUMED');
+    return orchestrator;
+  }
+
+  /**
+   * §8/§10/§15 (real Phase 5 dogfood recovery): explicit, narrow recovery for
+   * a run whose top-level status already went terminal (FAILED) because one
+   * or more tasks failed with HANDOFF_INVALID after their agent PROCESS
+   * itself succeeded. Never reruns the original implementation, never
+   * touches the original worktree's tracked contents, and never makes an
+   * arbitrary FAILED task retryable — see checkHandoffRecoveryEligibility for
+   * every invariant a task must meet first.
+   *
+   * All-or-nothing by design: eligibility for every HANDOFF_INVALID/FAILED
+   * task is checked BEFORE any state is mutated. If even one fails an
+   * invariant, this throws without recovering ANY task — "stop and require
+   * human review" means exactly that, not a partial silent recovery that
+   * could leave the run in a confusing mixed state.
+   */
+  static async recoverHandoffFailures(
+    runId: string,
+    options: OrchestratorOptions,
+  ): Promise<HandoffRecoveryResult> {
+    const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options);
+
+    // §12 (second real dogfood finding): a FAILED review/final_review task
+    // is recoverable the same way, under the review-specific error code
+    // REVIEW_BLOCKED — but ONLY when it is a review-mode task, so a
+    // superficially-similar debate-mode failure (which can also use
+    // REVIEW_BLOCKED, see executeDebate) is never mistaken for one.
+    type Kind = 'handoff' | 'review';
+    const candidatesOf = (kind: Kind, errorCode: 'HANDOFF_INVALID' | 'REVIEW_BLOCKED') =>
+      Object.values(orchestrator.state.tasks)
+        .filter((taskState) => taskState.status === 'FAILED' && taskState.error?.code === errorCode)
+        .map((taskState) => ({ taskState, kind }));
+    const allCandidates = [
+      ...candidatesOf('handoff', 'HANDOFF_INVALID'),
+      ...candidatesOf('review', 'REVIEW_BLOCKED'),
+    ];
+
+    const checked = await Promise.all(
+      allCandidates.map(async ({ taskState, kind }) => {
+        const task = orchestrator.config.tasks.find((spec) => spec.id === taskState.id);
+        if (task === undefined) {
+          return {
+            taskState,
+            task: undefined,
+            kind,
+            check: { eligible: false, reason: 'task id not found in the loaded phase config' },
+          };
+        }
+        if (kind === 'review' && !REVIEW_MODES.has(task.mode)) {
+          return {
+            taskState,
+            task,
+            kind,
+            check: { eligible: false, reason: `mode ${task.mode} is not a review/final_review task` },
+          };
+        }
+        const check = await orchestrator.checkStructuredOutputRecoveryEligibility(
+          taskState,
+          kind === 'handoff' ? 'HANDOFF_INVALID' : 'REVIEW_BLOCKED',
+        );
+        return { taskState, task, kind, check };
+      }),
+    );
+    const ineligible = checked.filter((entry) => !entry.check.eligible);
+    if (ineligible.length > 0) {
+      throw new OrchestratorError(
+        'TASK_STATE_INVALID',
+        `Refusing structured-output recovery: ${ineligible.length} task(s) failed an eligibility invariant`,
+        {
+          details: {
+            ineligible: ineligible.map((entry) => ({
+              taskId: entry.taskState.id,
+              reason: entry.check.reason,
+            })),
+          },
+        },
+      );
+    }
+
+    const recovered: string[] = [];
+    for (const entry of checked) {
+      if (entry.kind === 'handoff') {
+        await orchestrator.recoverHandoffInvalidTask(entry.task!, entry.taskState);
+      } else {
+        await orchestrator.recoverReviewBlockedTask(entry.task!, entry.taskState);
+      }
+      recovered.push(entry.taskState.id);
+    }
+    const unblocked = await orchestrator.unblockDependencyOnlyFailures();
+    if (recovered.length > 0) {
+      await orchestrator.mutate((current) =>
+        current.status === 'FAILED' ? { ...current, status: 'RUNNING' } : current,
+      );
+    }
+    await orchestrator.event('RUN_RESUMED', undefined, {
+      recoveryMode: 'handoff_repair',
+      recoveredTasks: recovered,
+      unblockedTasks: unblocked,
+    });
+    return { orchestrator, recovered, skipped: [] };
+  }
+
+  /**
+   * §7 (real Phase 5 dogfood recovery, run-20260822094645-5b090308): a
+   * narrowly-scoped retry of ONLY the deterministic integration gate for a
+   * run whose top-level status is BLOCKED specifically because
+   * INTEGRATION_TEST_FAILED — never for any other reason (an
+   * INTEGRATION_CONFLICT needing real human conflict resolution, or a
+   * task-level BLOCKED_FOR_HUMAN_REVIEW, are both left untouched). No task
+   * transitions back to RUNNING, no agent is invoked, and no worktree is
+   * recreated: integrateAndVerify() already re-validates that the existing
+   * integration worktree still matches its persisted headSha checkpoint
+   * before re-running the gate, so all this does is archive the failed
+   * attempt (so it is never silently overwritten) and unblock the run's own
+   * top-level status so its existing execute() loop naturally re-enters
+   * integrateAndVerify() on the next call.
+   */
+  static async retryIntegrationGate(
+    runId: string,
+    options: OrchestratorOptions,
+  ): Promise<AgentOrchestrator> {
+    const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options);
+    const state = orchestrator.state;
+    if (state.status !== 'BLOCKED') {
+      throw new OrchestratorError(
+        'TASK_STATE_INVALID',
+        `Refusing integration retry: run status is ${state.status}, not BLOCKED`,
+      );
+    }
+    if (state.integration.error?.code !== 'INTEGRATION_TEST_FAILED') {
+      throw new OrchestratorError(
+        'TASK_STATE_INVALID',
+        `Refusing integration retry: integration.error.code is ${state.integration.error?.code ?? 'undefined'}, not INTEGRATION_TEST_FAILED`,
+      );
+    }
+    const nonTerminalTasks = Object.values(state.tasks).filter(
+      (task) => task.status !== 'SUCCEEDED' && task.status !== 'SKIPPED',
+    );
+    if (nonTerminalTasks.length > 0) {
+      throw new OrchestratorError(
+        'TASK_STATE_INVALID',
+        `Refusing integration retry: ${nonTerminalTasks.length} task(s) are not SUCCEEDED/SKIPPED`,
+        {
+          details: {
+            tasks: nonTerminalTasks.map((task) => ({ id: task.id, status: task.status })),
+          },
+        },
+      );
+    }
+    if (state.integration.worktreePath === undefined || state.integration.headSha === undefined) {
+      throw new OrchestratorError(
+        'TASK_STATE_INVALID',
+        'Refusing integration retry: no preserved integration worktree/checkpoint recorded',
+      );
+    }
+
+    await orchestrator.archiveIntegrationAttempt();
+    await orchestrator.mutate((current) => ({ ...current, status: 'RUNNING' }));
+    await orchestrator.event('RUN_RESUMED', undefined, { recoveryMode: 'integration_retry' });
+    return orchestrator;
+  }
+
+  /**
+   * Moves the current (about-to-be-retried) integration log directory aside
+   * under an attempt-numbered name, and archives the current `integration`
+   * snapshot into `integrationAttempts` — both BEFORE anything is reset, so
+   * the original failing command output and the original blocked state
+   * remain genuinely inspectable rather than overwritten in place by the
+   * next attempt's identically-named log files.
+   */
+  private async archiveIntegrationAttempt(): Promise<void> {
+    const attemptNumber = (this.state.integrationAttempts?.length ?? 0) + 1;
+    const currentLogsDirectory = join(this.stateStore.runDirectory, 'logs', 'integration');
+    const archivedLogsDirectory = join(
+      this.stateStore.runDirectory,
+      'logs',
+      `integration-attempt-${attemptNumber}`,
+    );
+    try {
+      await rename(currentLogsDirectory, archivedLogsDirectory);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw error;
+      }
+    }
+    await this.mutate((state) => ({
+      ...state,
+      integrationAttempts: [...(state.integrationAttempts ?? []), state.integration],
+    }));
+  }
+
+  /**
+   * §8 (real Phase 5 dogfood recovery, THIRD structural finding): applies a
+   * narrow, explicitly-scoped source correction directly in the existing
+   * integration worktree after a real INTEGRATION_TEST_FAILED — used when
+   * the integrated source itself (not a build-order/protocol problem) needs
+   * a small fix, e.g. a test-fixture defect the adversarial review never
+   * exercised. This never reruns or rewrites a completed task: it commits
+   * ONLY on top of the existing integration worktree/headSha, exactly like
+   * ensureTaskCommit already does for a normal task, reusing the same
+   * ownership enforcement. The previous integration attempt is archived
+   * first (same mechanism as retryIntegrationGate), so the failing state
+   * this fix responds to remains genuinely inspectable.
+   */
+  static async applyIntegrationFix(
+    runId: string,
+    options: OrchestratorOptions,
+    fix: { readonly ownership: readonly string[]; readonly summary: string },
+  ): Promise<AgentOrchestrator> {
+    const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options);
+    const state = orchestrator.state;
+    if (state.status !== 'BLOCKED') {
+      throw new OrchestratorError(
+        'TASK_STATE_INVALID',
+        `Refusing integration fix: run status is ${state.status}, not BLOCKED`,
+      );
+    }
+    if (state.integration.error?.code !== 'INTEGRATION_TEST_FAILED') {
+      throw new OrchestratorError(
+        'TASK_STATE_INVALID',
+        `Refusing integration fix: integration.error.code is ${state.integration.error?.code ?? 'undefined'}, not INTEGRATION_TEST_FAILED`,
+      );
+    }
+    const nonTerminalTasks = Object.values(state.tasks).filter(
+      (task) => task.status !== 'SUCCEEDED' && task.status !== 'SKIPPED',
+    );
+    if (nonTerminalTasks.length > 0) {
+      throw new OrchestratorError(
+        'TASK_STATE_INVALID',
+        `Refusing integration fix: ${nonTerminalTasks.length} task(s) are not SUCCEEDED/SKIPPED`,
+      );
+    }
+    if (state.integration.worktreePath === undefined || state.integration.headSha === undefined) {
+      throw new OrchestratorError(
+        'TASK_STATE_INVALID',
+        'Refusing integration fix: no preserved integration worktree/checkpoint recorded',
+      );
+    }
+    if (fix.ownership.length === 0) {
+      throw new OrchestratorError('CONFIG_INVALID', 'Refusing integration fix: no ownership globs supplied');
+    }
+
+    const worktree = await orchestrator.worktrees.assertRegistered(state.integration.worktreePath);
+    const previousHeadSha = state.integration.headSha;
+    const ensured = await ensureTaskCommit(orchestrator.git, {
+      worktreePath: worktree.path,
+      baseSha: previousHeadSha,
+      agent: 'human',
+      taskId: 'integration-fix',
+      summary: fix.summary,
+    });
+    // Same ownership enforcement every task commit already goes through —
+    // an integration fix is not exempt merely because it is a fix.
+    assertChangedFileOwnership('integration-fix', ensured.changedFiles, fix.ownership);
+    assertNoSmuggledSchemaOrDependencyChange(ensured.changedFiles);
+
+    await orchestrator.archiveIntegrationAttempt();
+    await orchestrator.mutate((current) => {
+      const { error: _previousError, ...withoutError } = current.integration;
+      return {
+        ...current,
+        status: 'RUNNING',
+        integration: {
+          ...withoutError,
+          status: 'RUNNING',
+          headSha: ensured.commitSha,
+          integrationFixCommits: [...(current.integration.integrationFixCommits ?? []), ensured.commitSha],
+        },
+      };
+    });
+    await orchestrator.event('INTEGRATION_FIX_APPLIED', undefined, {
+      commitSha: ensured.commitSha,
+      previousHeadSha,
+      changedFiles: ensured.changedFiles,
+      summary: fix.summary,
+    });
     return orchestrator;
   }
 
@@ -612,6 +931,9 @@ export class AgentOrchestrator {
         responseSchema: REVIEW_MODES.has(task.mode)
           ? reviewResponseSchema()
           : handoffResponseSchema(),
+        responseSchemaNotes: REVIEW_MODES.has(task.mode)
+          ? reviewResponseSchemaNotes()
+          : handoffResponseSchemaNotes(),
       },
       canonicalDesignDocumentPath: join(
         this.repositoryRoot,
@@ -684,7 +1006,28 @@ export class AgentOrchestrator {
   }
 
   private async finishHandoff(prepared: PreparedTask, result: AgentResult): Promise<void> {
-    const handoff = parseHandoff(result.structuredHandoff);
+    const parsed = await this.parseOrRepairHandoff(
+      prepared.task,
+      result.structuredHandoff,
+      result.rawStdout ?? null,
+    );
+    await this.recordHandoffOutcome(prepared.task.id, parsed.outcome);
+    if (parsed.handoff === null) {
+      throw parsed.error;
+    }
+    await this.finishParsedHandoff(prepared, parsed.handoff);
+  }
+
+  /**
+   * §11 (real Phase 5 dogfood recovery): the exact same ownership/commit/
+   * succeed logic the live run always used, extracted so a repaired-handoff
+   * recovery path (recoverHandoffFailures) goes through IDENTICAL gates —
+   * never a shortcut merely because it is recovery.
+   */
+  private async finishParsedHandoff(
+    prepared: PreparedTask,
+    handoff: StructuredHandoff,
+  ): Promise<void> {
     const handoffPath = await writeHandoff(
       join(this.stateStore.runDirectory, 'handoffs'),
       prepared.task.id,
@@ -738,9 +1081,221 @@ export class AgentOrchestrator {
     await this.succeedTask(prepared.task.id, handoffPath, commit);
   }
 
+  /**
+   * §6/§7/§10 bounded handoff repair. Only ever triggered by an actual
+   * HANDOFF_INVALID from the real validator (never a broader catch-all) —
+   * any other error propagates unchanged. Records handoffOutcome/
+   * handoffRepairAttempted/handoffRepairSucceeded either way, so a task that
+   * still fails after a failed repair is clearly distinguishable in metrics
+   * from an actual agent-implementation failure.
+   */
+  private async parseOrRepairHandoff(
+    task: TaskSpec,
+    rawStructuredHandoff: unknown,
+    rawStdout: string | null,
+  ): Promise<
+    | { readonly handoff: StructuredHandoff; readonly error: null; readonly outcome: HandoffOutcomeRecord }
+    | { readonly handoff: null; readonly error: unknown; readonly outcome: HandoffOutcomeRecord }
+  > {
+    try {
+      const handoff = parseHandoff(rawStructuredHandoff);
+      return { handoff, error: null, outcome: { outcome: 'valid', repairAttempted: false } };
+    } catch (error) {
+      if (!isOrchestratorError(error, 'HANDOFF_INVALID')) {
+        throw error;
+      }
+      const repaired = await this.repairHandoff(task, rawStructuredHandoff, rawStdout);
+      await this.event('HANDOFF_REPAIR_ATTEMPTED', task.id, {
+        method: repaired?.method ?? 'none',
+        succeeded: repaired !== null,
+      });
+      if (repaired === null) {
+        return {
+          handoff: null,
+          error,
+          outcome: { outcome: 'invalid', repairAttempted: true, repairSucceeded: false },
+        };
+      }
+      return {
+        handoff: repaired.handoff,
+        error: null,
+        outcome: { outcome: 'valid', repairAttempted: true, repairSucceeded: true },
+      };
+    }
+  }
+
+  private async recordHandoffOutcome(taskId: string, outcome: HandoffOutcomeRecord): Promise<void> {
+    await this.mutate((state) => updateTask(state, taskId, (task) => ({
+      ...task,
+      handoffOutcome: outcome.outcome,
+      handoffRepairAttempted: outcome.repairAttempted,
+      ...(outcome.repairSucceeded === undefined ? {} : { handoffRepairSucceeded: outcome.repairSucceeded }),
+    })));
+  }
+
+  /**
+   * §10 (real Phase 5 dogfood recovery, run-20260822094645-5b090308,
+   * explorer-final-review): a second real transport failure — Claude's
+   * response was semantically a valid review, but prefaced with prose
+   * explaining why it was returning JSON, so whole-text JSON.parse failed
+   * before validation ever ran. Framing extraction (Layer A,
+   * src/protocol/structured-output.ts) is tried FIRST because it is the
+   * cheapest and it is what actually resolves that failure mode; it fails
+   * closed immediately on genuine ambiguity (never falls through to a
+   * cheaper/costlier guess in that case, since guessing is exactly what
+   * ambiguity handling exists to prevent). Deterministic key repair is next
+   * — free, and what resolved the FIRST real failure (a description baked
+   * into a key). Only if neither resolves it does this fall through to one
+   * bounded, read-only agent call. Never loops, never retries the agent
+   * step, never touches the original worktree.
+   */
+  private async repairHandoff(
+    task: TaskSpec,
+    rawStructuredHandoff: unknown,
+    rawStdout: string | null,
+  ): Promise<
+    { readonly handoff: StructuredHandoff; readonly method: 'framing' | 'deterministic' | 'agent' } | null
+  > {
+    const framed = extractStructuredPayload(rawStdout, validateHandoff);
+    if (framed.ok) {
+      return { handoff: framed.value, method: 'framing' };
+    }
+    if (framed.reason === 'ambiguous') {
+      return null;
+    }
+
+    const deterministic = deterministicallyRepairHandoffKeys(rawStructuredHandoff);
+    if (deterministic.changed) {
+      try {
+        return { handoff: parseHandoff(deterministic.value), method: 'deterministic' };
+      } catch {
+        // The rename didn't fully resolve it (e.g. a second, genuinely
+        // unrecognized field) — fall through rather than guessing further.
+      }
+    }
+    const repaired = await this.repairHandoffViaAgent(task, rawStructuredHandoff);
+    return repaired === null ? null : { handoff: repaired, method: 'agent' };
+  }
+
+  /**
+   * §6: a single, short, read-only invocation that never touches the
+   * original task worktree — it runs in its own throwaway directory under
+   * the run's own state, because reformatting JSON needs no repository
+   * access at all. One attempt only; a failure here means "fail closed", not
+   * "retry" — see repairHandoff's caller.
+   */
+  private async repairHandoffViaAgent(
+    task: TaskSpec,
+    malformedOutput: unknown,
+  ): Promise<StructuredHandoff | null> {
+    const repairDirectory = join(this.stateStore.runDirectory, 'repairs', task.id);
+    await mkdir(repairDirectory, { recursive: true, mode: 0o700 });
+    const request: AgentRequest = {
+      runId: this.state.runId,
+      taskId: `${task.id}-handoff-repair`,
+      role: 'handoff_repair',
+      worktreePath: repairDirectory,
+      baseSha: this.state.baseSha,
+      taskSpecification: {
+        malformedOutput,
+        responseSchema: handoffResponseSchema(),
+        responseSchemaNotes: handoffResponseSchemaNotes(),
+      },
+      canonicalDesignDocumentPath: join(this.repositoryRoot, this.config.canonicalDesignDocument),
+      allowedFileOwnership: [],
+      dependencyHandoffs: [],
+      previousReviewFindings: [],
+      requestedEffort: 'medium',
+      timeoutMs: HANDOFF_REPAIR_TIMEOUT_MS,
+      artifactsDirectory: join(this.stateStore.runDirectory, 'logs'),
+      access: 'read_only',
+      attempt: 1,
+    };
+    // §6: "fail closed" means exactly that — an agent that cannot even be
+    // invoked (a genuinely unexpected throw, not the ordinary
+    // succeeded/failed/timed_out result shape) must fall back to null here,
+    // never propagate and overwrite the original, more specific
+    // HANDOFF_INVALID with a generic uncaught-error code.
+    let result: AgentResult;
+    try {
+      result = await this.agents[task.owner].run(request);
+    } catch {
+      return null;
+    }
+    if (result.status !== 'succeeded') {
+      return null;
+    }
+    try {
+      return parseHandoff(result.structuredHandoff);
+    } catch {
+      return null;
+    }
+  }
+
   private async finishReview(prepared: PreparedTask, result: AgentResult): Promise<void> {
     await this.assertReadOnlyTaskClean(prepared);
-    const review = parseReview(result.structuredHandoff);
+    const parsed = await this.parseOrRecoverReview(
+      prepared.task,
+      result.structuredHandoff,
+      result.rawStdout ?? null,
+    );
+    await this.recordHandoffOutcome(prepared.task.id, parsed.outcome);
+    if (parsed.review === null) {
+      throw parsed.error;
+    }
+    await this.finishParsedReview(prepared, parsed.review);
+  }
+
+  /**
+   * §10/§11 (real Phase 5 dogfood recovery): review parsing has no
+   * deterministic-key-repair or agent-repair tier — Fix A already gives
+   * reviews exact bare keys, so the only real failure mode left is framing
+   * (surrounding prose), which extractStructuredPayload alone resolves. A
+   * candidate that is syntactically valid JSON but semantically wrong (bad
+   * status, unknown key, missing evidence, ...) still fails validateReview
+   * exactly as before — this never loosens what a "valid" review means.
+   */
+  private async parseOrRecoverReview(
+    task: TaskSpec,
+    rawStructuredHandoff: unknown,
+    rawStdout: string | null,
+  ): Promise<
+    | { readonly review: StructuredReview; readonly error: null; readonly outcome: HandoffOutcomeRecord }
+    | { readonly review: null; readonly error: unknown; readonly outcome: HandoffOutcomeRecord }
+  > {
+    try {
+      const review = parseReview(rawStructuredHandoff);
+      return { review, error: null, outcome: { outcome: 'valid', repairAttempted: false } };
+    } catch (error) {
+      if (!isOrchestratorError(error, 'REVIEW_BLOCKED')) {
+        throw error;
+      }
+      const framed = extractStructuredPayload(rawStdout, validateReview);
+      await this.event('HANDOFF_REPAIR_ATTEMPTED', task.id, {
+        method: 'framing',
+        succeeded: framed.ok,
+      });
+      if (!framed.ok) {
+        return {
+          review: null,
+          error,
+          outcome: { outcome: 'invalid', repairAttempted: true, repairSucceeded: false },
+        };
+      }
+      return {
+        review: framed.value,
+        error: null,
+        outcome: { outcome: 'valid', repairAttempted: true, repairSucceeded: true },
+      };
+    }
+  }
+
+  /**
+   * §11: the exact same escalation-routing/succeed logic the live run
+   * always used, extracted so a recovered-review recovery path
+   * (recoverHandoffFailures) goes through IDENTICAL gates.
+   */
+  private async finishParsedReview(prepared: PreparedTask, review: StructuredReview): Promise<void> {
     const reviewPath = join(
       this.stateStore.runDirectory,
       'reviews',
@@ -1103,6 +1658,163 @@ export class AgentOrchestrator {
     });
   }
 
+  private taskAttemptStdoutLogPath(taskId: string, attempt: AgentAttemptState): string {
+    return join(
+      this.stateStore.runDirectory,
+      'logs',
+      `${this.state.runId}.${taskId}.${attempt.agent}.attempt-${attempt.attempt}.stdout.log`,
+    );
+  }
+
+  /**
+   * §8 (real Phase 5 dogfood recovery): every invariant a persisted FAILED
+   * task must meet before recoverHandoffFailures() will touch it. Read-only —
+   * this never mutates state, so it is safe to run over every candidate
+   * before deciding whether to recover any of them.
+   */
+  /**
+   * §10/§11 (extended for the second real dogfood finding): the SAME
+   * invariants apply whether the persisted failure is a writer task's
+   * HANDOFF_INVALID or a read-only review task's REVIEW_BLOCKED — both are
+   * "the agent process itself already succeeded; only its structured output
+   * never validated." A review-mode task's `commit` is always undefined by
+   * construction (it is read-only), so the same check is harmless there too.
+   */
+  private async checkStructuredOutputRecoveryEligibility(
+    taskState: TaskRunState,
+    expectedErrorCode: 'HANDOFF_INVALID' | 'REVIEW_BLOCKED',
+  ): Promise<{ readonly eligible: boolean; readonly reason: string }> {
+    if (taskState.status !== 'FAILED' || taskState.error?.code !== expectedErrorCode) {
+      return { eligible: false, reason: `task is not currently FAILED with error code ${expectedErrorCode}` };
+    }
+    const lastAttempt = taskState.agentAttempts.at(-1);
+    if (lastAttempt?.outcome !== 'succeeded') {
+      return { eligible: false, reason: 'the most recent recorded agent attempt did not succeed' };
+    }
+    if (taskState.commit !== undefined) {
+      return { eligible: false, reason: 'a task commit is already recorded for this task' };
+    }
+    if (taskState.worktreePath === undefined || taskState.preparedHeadSha === undefined) {
+      return { eligible: false, reason: 'no preserved worktree path / prepared SHA recorded for this task' };
+    }
+    let worktree: OwnedWorktree;
+    try {
+      worktree = await this.worktrees.assertRegistered(taskState.worktreePath);
+    } catch (error) {
+      return { eligible: false, reason: `preserved worktree is not registered/present: ${errorText(error)}` };
+    }
+    let inspection: Awaited<ReturnType<typeof inspectTaskCommits>>;
+    try {
+      inspection = await inspectTaskCommits(this.git, worktree.path, taskState.preparedHeadSha);
+    } catch (error) {
+      return {
+        eligible: false,
+        reason: `worktree is not a valid descendant of its own prepared SHA: ${errorText(error)}`,
+      };
+    }
+    if (inspection.headSha !== taskState.preparedHeadSha) {
+      return { eligible: false, reason: 'worktree HEAD has moved past the SHA prepared for this task' };
+    }
+    if (inspection.commits.length > 0) {
+      return { eligible: false, reason: 'worktree already has commits beyond the prepared SHA' };
+    }
+    try {
+      await stat(this.taskAttemptStdoutLogPath(taskState.id, lastAttempt));
+    } catch {
+      return { eligible: false, reason: 'original agent stdout log is missing' };
+    }
+    return { eligible: true, reason: '' };
+  }
+
+  /**
+   * §10/§11: reconstructs the exact raw structured value the live run would
+   * have produced (reading the preserved stdout log, never re-invoking the
+   * agent), then reuses parseOrRepairHandoff/finishParsedHandoff verbatim —
+   * the same repair attempt and the same ownership/commit/succeed gates a
+   * live run always goes through, not a recovery-specific shortcut.
+   */
+  private async recoverHandoffInvalidTask(task: TaskSpec, taskState: TaskRunState): Promise<void> {
+    const worktree = await this.worktrees.assertRegistered(taskState.worktreePath!);
+    const lastAttempt = taskState.agentAttempts.at(-1)!;
+    const rawStdout = await readBoundedStdoutText(this.taskAttemptStdoutLogPath(task.id, lastAttempt));
+    const rawStructuredHandoff = parseJsonOrNull(rawStdout);
+    const parsed = await this.parseOrRepairHandoff(task, rawStructuredHandoff, rawStdout);
+    await this.recordHandoffOutcome(task.id, parsed.outcome);
+    if (parsed.handoff === null) {
+      throw parsed.error;
+    }
+    const prepared: PreparedTask = {
+      task,
+      worktree,
+      preparedHeadSha: taskState.preparedHeadSha!,
+      dependencyHandoffs: [],
+      previousReviewFindings: [],
+      actualDependencyDiff: '',
+    };
+    await this.finishParsedHandoff(prepared, parsed.handoff);
+  }
+
+  /**
+   * §12/§13 (second real dogfood finding, explorer-final-review): the
+   * review-mode analogue of recoverHandoffInvalidTask. Read-only tasks have
+   * no ownership/commit step — assertReadOnlyTaskClean is the same guard the
+   * live path already uses, run here before recovery for the same reason.
+   */
+  private async recoverReviewBlockedTask(task: TaskSpec, taskState: TaskRunState): Promise<void> {
+    const worktree = await this.worktrees.assertRegistered(taskState.worktreePath!);
+    const lastAttempt = taskState.agentAttempts.at(-1)!;
+    const rawStdout = await readBoundedStdoutText(this.taskAttemptStdoutLogPath(task.id, lastAttempt));
+    const rawStructuredHandoff = parseJsonOrNull(rawStdout);
+    const prepared: PreparedTask = {
+      task,
+      worktree,
+      preparedHeadSha: taskState.preparedHeadSha!,
+      dependencyHandoffs: [],
+      previousReviewFindings: [],
+      actualDependencyDiff: '',
+    };
+    await this.assertReadOnlyTaskClean(prepared);
+    const parsed = await this.parseOrRecoverReview(task, rawStructuredHandoff, rawStdout);
+    await this.recordHandoffOutcome(task.id, parsed.outcome);
+    if (parsed.review === null) {
+      throw parsed.error;
+    }
+    await this.finishParsedReview(prepared, parsed.review);
+  }
+
+  /**
+   * §12: BLOCKED is terminal for TaskScheduler (scheduler.ts's TRANSITIONS)
+   * and is re-seeded directly from persisted state on every construction, so
+   * a task blocked purely because a dependency failed stays stuck forever
+   * unless something explicitly resets it. TASK_DEPENDENCY_FAILED is, by
+   * construction, always a scheduler-computed cascade — never an independent
+   * human/business decision like BLOCKED_FOR_HUMAN_REVIEW or an ownership
+   * violation — so resetting every such task to PENDING in one pass is
+   * always safe: the next scheduler refresh re-derives the correct outcome
+   * per task (READY once its own dependency truly succeeded, otherwise still
+   * PENDING, never incorrectly promoted).
+   */
+  private async unblockDependencyOnlyFailures(): Promise<readonly string[]> {
+    const eligible = Object.values(this.state.tasks).filter(
+      (task) => task.status === 'BLOCKED' && task.error?.code === 'TASK_DEPENDENCY_FAILED',
+    );
+    if (eligible.length === 0) {
+      return [];
+    }
+    await this.mutate((state) => ({
+      ...state,
+      tasks: {
+        ...state.tasks,
+        ...Object.fromEntries(eligible.map((task) => {
+          const current = state.tasks[task.id]!;
+          const { error: _previousError, finishedAt: _previousFinishedAt, ...withoutTerminal } = current;
+          return [task.id, { ...withoutTerminal, status: 'PENDING' as const }];
+        })),
+      },
+    }));
+    return eligible.map((task) => task.id);
+  }
+
   private async reconcile(): Promise<void> {
     const observations: Record<string, {
       processAlive: boolean;
@@ -1161,11 +1873,7 @@ export class AgentOrchestrator {
         }
         const output = lastAttempt === undefined
           ? undefined
-          : join(
-              this.stateStore.runDirectory,
-              'logs',
-              `${this.state.runId}.${task.id}.${lastAttempt.agent}.attempt-${lastAttempt.attempt}.stdout.log`,
-            );
+          : this.taskAttemptStdoutLogPath(task.id, lastAttempt);
         if (output !== undefined) {
           let source: string | undefined;
           try {
@@ -1379,6 +2087,35 @@ function storedError(
   };
 }
 
+/**
+ * §8: an integration fix's ownership globs already restrict WHICH files it
+ * may touch, but this is a second, independent guard against a narrower and
+ * more dangerous category regardless of ownership: no migration, no
+ * package.json/lockfile, ever smuggled in as part of what is supposed to be
+ * a narrow test/source correction.
+ */
+function assertNoSmuggledSchemaOrDependencyChange(changedFiles: readonly string[]): void {
+  const forbidden = changedFiles.filter(
+    (file) =>
+      file.includes('/database/migrations/')
+      || file === 'package.json'
+      || file.endsWith('/package.json')
+      || file === 'pnpm-lock.yaml'
+      || file.endsWith('/pnpm-lock.yaml'),
+  );
+  if (forbidden.length > 0) {
+    throw new OrchestratorError(
+      'OWNERSHIP_VIOLATION',
+      'Integration fix touches a forbidden migration/schema/dependency file',
+      { details: { files: forbidden } },
+    );
+  }
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function normalizeError(error: unknown, clock: () => Date): StoredError {
   if (error instanceof OrchestratorError) {
     return storedError(error.code, error.message, clock, error.details);
@@ -1455,6 +2192,19 @@ function sameStrings(left: readonly string[], right: readonly string[]): boolean
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
+// Recovery note (real Phase 5 dogfood run run-20260822094645-5b090308): these
+// two functions previously baked each optional field's description directly
+// into its own JSON key, e.g. 'assumptions (optional; implementation tasks)'
+// instead of the bare 'assumptions'. A model shown that as "the schema" has
+// no way to know the parenthetical is prose, not part of the key — and both
+// real Codex Solver tasks reproduced it verbatim, which the strict validator
+// then correctly rejected as an unsupported field. The fix is to keep every
+// key exactly as the real validator (handoff/schemas.ts's HANDOFF_KEYS,
+// review/findings.ts's FINDING_KEYS) accepts it, and move every optionality/
+// scope note into the separate, clearly-prose `*ResponseSchemaNotes()` below
+// — never back into a key name. See buildAgentPrompt()'s explicit instruction
+// not to copy a note into a property name, and
+// test/agents/response-schema-prompt.test.ts for the regression coverage.
 function handoffResponseSchema(): unknown {
   return {
     status: 'complete | blocked | failed',
@@ -1464,20 +2214,26 @@ function handoffResponseSchema(): unknown {
     tests: [{ command: 'string', result: 'pass | fail | not_run', details: 'string' }],
     openQuestions: ['string'],
     reviewRequested: ['string'],
-    'assumptions (optional; implementation tasks)':
-      ['non-obvious constraint or choice a reviewer could not derive from the diff alone'],
-    'knownRisks (optional; implementation tasks)': ['known gap or trade-off, stated up front'],
-    'attackSurface (optional; implementation tasks)':
-      ['where an adversarial reviewer is most likely to find a real defect'],
-    'findingResponses (optional; correction tasks — one entry per finding you are responding to)': [{
+    assumptions: ['non-obvious constraint or choice a reviewer could not derive from the diff alone'],
+    knownRisks: ['known gap or trade-off, stated up front'],
+    attackSurface: ['where an adversarial reviewer is most likely to find a real defect'],
+    findingResponses: [{
       findingId: 'F001',
       decision: 'confirmed | rejected',
       evidence: 'string',
-      'fix (when confirmed)': 'string',
-      'verification (when confirmed)': 'string',
-      'reason (when rejected)': 'string',
+      fix: 'string',
+      verification: 'string',
+      reason: 'string',
     }],
   };
+}
+
+function handoffResponseSchemaNotes(): readonly string[] {
+  return [
+    'assumptions, knownRisks, and attackSurface are optional and apply only to implementation tasks. Omit a field entirely if you have nothing real to report for it — do not include it empty.',
+    'findingResponses is optional and applies only to correction tasks: include exactly one entry per finding you are responding to.',
+    'Within each findingResponses entry: fix and verification apply only when decision is "confirmed"; reason applies only when decision is "rejected". Omit whichever field does not apply — do not include it empty.',
+  ];
 }
 
 function reviewResponseSchema(): unknown {
@@ -1494,10 +2250,16 @@ function reviewResponseSchema(): unknown {
       impact: 'string',
       suggestedFix: 'string',
       verificationRequired: 'string',
-      'counterexample (optional, prefer supplying)': 'concrete input/state that triggers the defect',
-      'reproduction (optional, prefer supplying)': 'exact steps or a failing test to reproduce it',
-      'expectedBehavior (optional, prefer supplying)': 'string',
-      'violatingBehavior (optional, prefer supplying)': 'string',
+      counterexample: 'concrete input/state that triggers the defect',
+      reproduction: 'exact steps or a failing test to reproduce it',
+      expectedBehavior: 'string',
+      violatingBehavior: 'string',
     }],
   };
+}
+
+function reviewResponseSchemaNotes(): readonly string[] {
+  return [
+    'On each finding, counterexample, reproduction, expectedBehavior, and violatingBehavior are optional. Prefer supplying them over a bare claim, but omit any you cannot fill in — do not include it empty.',
+  ];
 }

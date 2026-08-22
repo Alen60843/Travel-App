@@ -62,6 +62,19 @@ export interface TaskRunState {
   readonly error?: StoredError;
   /** Present only when status is SKIPPED: why the task's condition was not satisfied. */
   readonly skipReason?: string;
+  /**
+   * §7 (real Phase 5 dogfood recovery): distinguishes an agent-implementation
+   * failure from a protocol/handoff failure — a task whose process succeeded
+   * can still end up here as 'invalid' if handoff repair also failed. Set
+   * once a handoff (or review) has actually been parsed, whether the first
+   * attempt succeeded or only a repair did; absent for tasks that never got
+   * that far (e.g. the agent process itself failed, or the task is SKIPPED).
+   */
+  readonly handoffOutcome?: 'valid' | 'invalid';
+  /** Whether a bounded handoff-repair attempt (deterministic and/or a single read-only agent call) was made for this task's most recent structured output. */
+  readonly handoffRepairAttempted?: boolean;
+  /** Present only when handoffRepairAttempted is true: whether that attempt produced a schema-valid result. */
+  readonly handoffRepairSucceeded?: boolean;
 }
 
 export interface IntegrationRunState {
@@ -71,6 +84,15 @@ export interface IntegrationRunState {
   /** Exact integration HEAD after all task cherry-picks and before the gate. */
   readonly headSha?: string;
   readonly integratedTaskCommits: readonly string[];
+  /**
+   * §8 (real Phase 5 dogfood recovery, THIRD structural finding): distinct
+   * from integratedTaskCommits (the cherry-picked task commits) — each entry
+   * here is a narrow, auditable integration-only correction applied via
+   * AgentOrchestrator.applyIntegrationFix after a real INTEGRATION_TEST_FAILED,
+   * never a completed task's own work. Empty/absent for a run that never
+   * needed one.
+   */
+  readonly integrationFixCommits?: readonly string[];
   readonly currentCommand?: number;
   readonly error?: StoredError;
 }
@@ -87,6 +109,16 @@ export interface RunState {
   readonly status: RunStatus;
   readonly tasks: Readonly<Record<string, TaskRunState>>;
   readonly integration: IntegrationRunState;
+  /**
+   * §7 (real Phase 5 dogfood recovery): archived, terminal integration
+   * attempts, oldest first — populated only by AgentOrchestrator's
+   * retryIntegrationGate, which archives the current (BLOCKED,
+   * INTEGRATION_TEST_FAILED) `integration` snapshot here before resetting
+   * the run so the deterministic gate can run again. Never rewritten or
+   * removed: this is the durable record that a first attempt genuinely
+   * failed, preserved rather than silently overwritten by a later success.
+   */
+  readonly integrationAttempts?: readonly IntegrationRunState[];
   readonly errors: readonly StoredError[];
   /**
    * §13: the EXACT executable path each real (non-injected) agent adapter
@@ -109,6 +141,7 @@ export const RUN_EVENT_NAMES = [
   'AGENT_STARTED',
   'AGENT_FINISHED',
   'HANDOFF_WRITTEN',
+  'HANDOFF_REPAIR_ATTEMPTED',
   'REVIEW_STARTED',
   'FINDING_REPORTED',
   'TASK_COMMITTED',
@@ -117,6 +150,7 @@ export const RUN_EVENT_NAMES = [
   'TASK_FAILED',
   'INTEGRATION_STARTED',
   'INTEGRATION_COMMAND_FINISHED',
+  'INTEGRATION_FIX_APPLIED',
   'RUN_BLOCKED',
   'RUN_CANCELLED',
   'RUN_COMPLETED',
@@ -223,6 +257,14 @@ function optionalString(value: unknown, path: string): string | undefined {
   return value === undefined ? undefined : string(value, path);
 }
 
+function optionalBoolean(value: unknown, path: string): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'boolean') {
+    throw new OrchestratorError('STATE_CORRUPT', `${path} must be a boolean`);
+  }
+  return value;
+}
+
 function stringArray(value: unknown, path: string): string[] {
   if (!Array.isArray(value)) {
     throw new OrchestratorError('STATE_CORRUPT', `${path} must be an array`);
@@ -276,6 +318,59 @@ function parseAttempt(value: unknown, path: string): AgentAttemptState {
     ...(value.error === undefined
       ? {}
       : { error: parseStoredError(value.error, `${path}.error`) }),
+  };
+}
+
+/**
+ * Factored out (previously inline in validateRunState) so the same parser
+ * validates both the live `integration` field and each archived entry in
+ * `integrationAttempts` — see AgentOrchestrator.retryIntegrationGate, which
+ * archives a BLOCKED/INTEGRATION_TEST_FAILED attempt here before letting the
+ * gate run again, rather than ever overwriting it in place.
+ */
+function parseIntegrationState(value: unknown, path: string): IntegrationRunState {
+  if (!isObject(value)) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path} must be an object`);
+  }
+  const integrationStatus = string(value.status, `${path}.status`);
+  if (!(INTEGRATION_STATUSES as readonly string[]).includes(integrationStatus)) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path}.status is invalid`);
+  }
+  const integratedTaskCommits = stringArray(
+    value.integratedTaskCommits,
+    `${path}.integratedTaskCommits`,
+  );
+  integratedTaskCommits.forEach((sha, index) =>
+    assertFullSha(sha, `${path}.integratedTaskCommits[${index}]`),
+  );
+  let integrationFixCommits: string[] | undefined;
+  if (value.integrationFixCommits !== undefined) {
+    integrationFixCommits = stringArray(value.integrationFixCommits, `${path}.integrationFixCommits`);
+    integrationFixCommits.forEach((sha, index) =>
+      assertFullSha(sha, `${path}.integrationFixCommits[${index}]`),
+    );
+  }
+  return {
+    status: integrationStatus as IntegrationStatus,
+    ...(value.worktreePath === undefined
+      ? {}
+      : { worktreePath: string(value.worktreePath, `${path}.worktreePath`) }),
+    ...(value.branch === undefined ? {} : { branch: string(value.branch, `${path}.branch`) }),
+    ...(value.headSha === undefined
+      ? {}
+      : {
+          headSha: (() => {
+            const sha = string(value.headSha, `${path}.headSha`);
+            assertFullSha(sha, `${path}.headSha`);
+            return sha;
+          })(),
+        }),
+    integratedTaskCommits,
+    ...(integrationFixCommits === undefined ? {} : { integrationFixCommits }),
+    ...(value.currentCommand === undefined
+      ? {}
+      : { currentCommand: integer(value.currentCommand, `${path}.currentCommand`) }),
+    ...(value.error === undefined ? {} : { error: parseStoredError(value.error, `${path}.error`) }),
   };
 }
 
@@ -365,6 +460,25 @@ function parseTask(value: unknown, key: string): TaskRunState {
     ...(value.skipReason === undefined
       ? {}
       : { skipReason: string(value.skipReason, `${path}.skipReason`) }),
+    ...(value.handoffOutcome === undefined
+      ? {}
+      : {
+          handoffOutcome: (() => {
+            const outcome = string(value.handoffOutcome, `${path}.handoffOutcome`);
+            if (outcome !== 'valid' && outcome !== 'invalid') {
+              throw new OrchestratorError('STATE_CORRUPT', `${path}.handoffOutcome is invalid`);
+            }
+            return outcome;
+          })(),
+        }),
+    ...((): { handoffRepairAttempted?: boolean } => {
+      const parsed = optionalBoolean(value.handoffRepairAttempted, `${path}.handoffRepairAttempted`);
+      return parsed === undefined ? {} : { handoffRepairAttempted: parsed };
+    })(),
+    ...((): { handoffRepairSucceeded?: boolean } => {
+      const parsed = optionalBoolean(value.handoffRepairSucceeded, `${path}.handoffRepairSucceeded`);
+      return parsed === undefined ? {} : { handoffRepairSucceeded: parsed };
+    })(),
   };
 }
 
@@ -392,13 +506,6 @@ export function validateRunState(value: unknown): RunState {
   if (Object.keys(tasks).length === 0) {
     throw new OrchestratorError('STATE_CORRUPT', 'tasks must not be empty');
   }
-  if (!isObject(value.integration)) {
-    throw new OrchestratorError('STATE_CORRUPT', 'integration must be an object');
-  }
-  const integrationStatus = string(value.integration.status, 'integration.status');
-  if (!(INTEGRATION_STATUSES as readonly string[]).includes(integrationStatus)) {
-    throw new OrchestratorError('STATE_CORRUPT', 'integration.status is invalid');
-  }
   if (!Array.isArray(value.errors)) {
     throw new OrchestratorError('STATE_CORRUPT', 'errors must be an array');
   }
@@ -414,43 +521,16 @@ export function validateRunState(value: unknown): RunState {
       'phase must be a positive integer or non-empty string',
     );
   }
-  const integratedTaskCommits = stringArray(
-    value.integration.integratedTaskCommits,
-    'integration.integratedTaskCommits',
-  );
-  integratedTaskCommits.forEach((sha, index) =>
-    assertFullSha(sha, `integration.integratedTaskCommits[${index}]`),
-  );
-  const integration: IntegrationRunState = {
-    status: integrationStatus as IntegrationStatus,
-    ...(value.integration.worktreePath === undefined
-      ? {}
-      : { worktreePath: string(value.integration.worktreePath, 'integration.worktreePath') }),
-    ...(value.integration.branch === undefined
-      ? {}
-      : { branch: string(value.integration.branch, 'integration.branch') }),
-    ...(value.integration.headSha === undefined
-      ? {}
-      : {
-          headSha: (() => {
-            const sha = string(value.integration.headSha, 'integration.headSha');
-            assertFullSha(sha, 'integration.headSha');
-            return sha;
-          })(),
-        }),
-    integratedTaskCommits,
-    ...(value.integration.currentCommand === undefined
-      ? {}
-      : {
-          currentCommand: integer(
-            value.integration.currentCommand,
-            'integration.currentCommand',
-          ),
-        }),
-    ...(value.integration.error === undefined
-      ? {}
-      : { error: parseStoredError(value.integration.error, 'integration.error') }),
-  };
+  const integration = parseIntegrationState(value.integration, 'integration');
+  let integrationAttempts: IntegrationRunState[] | undefined;
+  if (value.integrationAttempts !== undefined) {
+    if (!Array.isArray(value.integrationAttempts)) {
+      throw new OrchestratorError('STATE_CORRUPT', 'integrationAttempts must be an array');
+    }
+    integrationAttempts = value.integrationAttempts.map((entry, index) =>
+      parseIntegrationState(entry, `integrationAttempts[${index}]`),
+    );
+  }
   const repositoryRoot = string(value.repositoryRoot, 'repositoryRoot');
   if (!repositoryRoot.startsWith('/')) {
     throw new OrchestratorError('STATE_CORRUPT', 'repositoryRoot must be absolute');
@@ -480,6 +560,7 @@ export function validateRunState(value: unknown): RunState {
     status: status as RunStatus,
     tasks,
     integration,
+    ...(integrationAttempts === undefined ? {} : { integrationAttempts }),
     errors: value.errors.map((error, index) => parseStoredError(error, `errors[${index}]`)),
     ...(agentExecutables === undefined ? {} : { agentExecutables }),
   };

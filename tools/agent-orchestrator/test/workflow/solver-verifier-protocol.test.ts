@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
 
 import type { Agent, AgentName, AgentRequest, AgentResult } from '../../src/agents';
+import { HANDOFF_KEYS, FINDING_RESPONSE_KEYS } from '../../src/handoff';
 import { AgentOrchestrator } from '../../src/orchestrator';
+import { FINDING_KEYS, REVIEW_KEYS } from '../../src/review/findings';
 import type { RunState } from '../../src/state';
+import { WorktreeManager } from '../../src/git';
 import { createTemporaryRepository } from '../git/helpers';
 
 /**
@@ -735,6 +738,1074 @@ test('resume (escalation path): a crash before Judge starts resumes to exactly o
     assert.equal(completed.status, 'COMPLETED');
     assert.equal(completed.tasks.judge?.status, 'SUCCEEDED');
     assert.equal(judgeInvocations, 1);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+/**
+ * §13 (real Phase 5 dogfood recovery, run-20260822094645-5b090308): the
+ * scenarios below cover Fix A (exact response-schema keys, never a
+ * description baked into a key), Fix B (bounded handoff repair — deterministic
+ * first, one read-only agent call as a fallback, fail closed otherwise), and
+ * Fix C (explicit recovery of a persisted FAILED/HANDOFF_INVALID task, and
+ * the downstream unblock it requires). All still use FAKE agents only.
+ */
+
+// 11. Fix A: the exact prompt-facing schema for implementation/correction and
+// review/final_review tasks must use the real validator's own bare keys.
+test('scenario 11: implementation and review response schemas use exact keys, never a description-annotated one', async () => {
+  const { fixture, write } = await setUp();
+  try {
+    const phaseFile = await write({ maxCorrectionRounds: 1, escalation: true });
+    let solveSchema: Record<string, unknown> | undefined;
+    let verifySchema: Record<string, unknown> | undefined;
+    const codex = new ScenarioAgent('codex', {
+      solve: async (request) => {
+        const spec = request.taskSpecification as { responseSchema: Record<string, unknown> };
+        solveSchema = spec.responseSchema;
+        await writeFile(join(request.worktreePath, 'feature.txt'), 'implemented', 'utf8');
+        return completeHandoff();
+      },
+    });
+    const claude = new ScenarioAgent('claude', {
+      verify: (request) => {
+        const spec = request.taskSpecification as { responseSchema: Record<string, unknown> };
+        verifySchema = spec.responseSchema;
+        return approvedReview();
+      },
+    });
+    const orchestrator = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: fixture.repository,
+      runsRoot: join(fixture.container, 'runs'),
+      agents: { codex, claude },
+    });
+    await orchestrator.execute();
+
+    assert.ok(solveSchema);
+    assert.ok(verifySchema);
+    const solveKeys = Object.keys(solveSchema!);
+    assert.deepEqual(solveKeys.sort(), [...HANDOFF_KEYS].sort());
+    for (const key of solveKeys) {
+      assert.doesNotMatch(key, /[()]/, `handoff schema key "${key}" must not carry an annotation`);
+    }
+    const findingResponseEntry = (solveSchema!.findingResponses as unknown[])[0] as Record<string, unknown>;
+    const findingResponseKeys = Object.keys(findingResponseEntry);
+    assert.deepEqual(findingResponseKeys.sort(), [...FINDING_RESPONSE_KEYS].sort());
+    for (const key of findingResponseKeys) {
+      assert.doesNotMatch(key, /[()]/);
+    }
+
+    const reviewKeys = Object.keys(verifySchema!);
+    assert.deepEqual(reviewKeys.sort(), [...REVIEW_KEYS].sort());
+    const findingEntry = (verifySchema!.findings as unknown[])[0] as Record<string, unknown>;
+    const findingKeys = Object.keys(findingEntry);
+    assert.deepEqual(findingKeys.sort(), [...FINDING_KEYS].sort());
+    for (const key of findingKeys) {
+      assert.doesNotMatch(key, /[()]/);
+    }
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+// 12. Fix B: the exact real-world failure mode (a description-annotated
+// optional key) is repaired deterministically, with zero repair-agent
+// invocation and zero Solver re-invocation.
+test('scenario 12: a description-annotated handoff key is repaired deterministically, without re-invoking the Solver', async () => {
+  const { fixture, write } = await setUp();
+  try {
+    const phaseFile = await write({ maxCorrectionRounds: 1, escalation: true });
+    const codex = new ScenarioAgent('codex', {
+      solve: async (request) => {
+        await writeFile(join(request.worktreePath, 'feature.txt'), 'implemented', 'utf8');
+        // The exact real defect: a schema description baked into the key
+        // instead of the bare 'assumptions'. No 'solve-handoff-repair'
+        // behavior is registered: if the engine fell through to an
+        // agent-based repair, ScenarioAgent would throw and fail this test.
+        return completeHandoff({
+          'assumptions (optional; implementation tasks)': ['a real assumption'],
+        });
+      },
+    });
+    const claude = new ScenarioAgent('claude', { verify: () => approvedReview() });
+    const orchestrator = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: fixture.repository,
+      runsRoot: join(fixture.container, 'runs'),
+      agents: { codex, claude },
+    });
+    const completed = await orchestrator.execute();
+    assert.equal(completed.status, 'COMPLETED');
+    assert.equal(completed.tasks.solve?.status, 'SUCCEEDED');
+    assert.equal(completed.tasks.solve?.handoffOutcome, 'valid');
+    assert.equal(completed.tasks.solve?.handoffRepairAttempted, true);
+    assert.equal(completed.tasks.solve?.handoffRepairSucceeded, true);
+    assert.deepEqual(codex.invocations, ['solve']);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+// 13. Fix B: a handoff that neither deterministic repair nor one bounded
+// agent-repair attempt can fix fails closed with the ORIGINAL error, and the
+// Solver is never rerun.
+test('scenario 13: a handoff repair-agent failure fails closed without rerunning the Solver', async () => {
+  const { fixture, write } = await setUp();
+  try {
+    const phaseFile = await write({ maxCorrectionRounds: 1, escalation: true });
+    const codex = new ScenarioAgent('codex', {
+      solve: async (request) => {
+        await writeFile(join(request.worktreePath, 'feature.txt'), 'implemented', 'utf8');
+        return {
+          status: 'complete',
+          summary: 'ok',
+          filesChanged: [],
+          decisions: [],
+          tests: [],
+          openQuestions: [],
+          reviewRequested: [],
+          somethingGenuinelyUnknown: true,
+        };
+      },
+      'solve-handoff-repair': () => ({
+        status: 'complete',
+        summary: 'still bad',
+        filesChanged: [],
+        decisions: [],
+        tests: [],
+        openQuestions: [],
+        reviewRequested: [],
+        stillUnknown: true,
+      }),
+    });
+    const claude = new ScenarioAgent('claude', {});
+    const orchestrator = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: fixture.repository,
+      runsRoot: join(fixture.container, 'runs'),
+      agents: { codex, claude },
+    });
+    const completed = await orchestrator.execute();
+    assert.equal(completed.tasks.solve?.status, 'FAILED');
+    assert.equal(completed.tasks.solve?.error?.code, 'HANDOFF_INVALID');
+    assert.match(completed.tasks.solve?.error?.message ?? '', /somethingGenuinelyUnknown/);
+    assert.equal(completed.tasks.solve?.handoffOutcome, 'invalid');
+    assert.equal(completed.tasks.solve?.handoffRepairAttempted, true);
+    assert.equal(completed.tasks.solve?.handoffRepairSucceeded, false);
+    // The Solver ran once; the repair agent ran once; neither looped or reran.
+    assert.deepEqual(codex.invocations, ['solve', 'solve-handoff-repair']);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+// 14. A real agent-process failure (nonzero exit) never triggers handoff
+// repair at all — repair only ever concerns structured-output validity.
+test('scenario 14: a real agent process failure never triggers handoff repair', async () => {
+  const { fixture, write } = await setUp();
+  try {
+    const phaseFile = await write({ maxCorrectionRounds: 1, escalation: true });
+    const invocations: string[] = [];
+    const failingCodex: Agent = {
+      name: 'codex',
+      async run(request) {
+        invocations.push(request.taskId);
+        const timestamp = new Date().toISOString();
+        return {
+          agent: 'codex',
+          runId: request.runId,
+          taskId: request.taskId,
+          status: 'failed',
+          failureCode: 'AGENT_FAILED',
+          exitCode: 7,
+          signal: null,
+          stdoutPath: join(request.artifactsDirectory, `${request.taskId}.stdout.log`),
+          stderrPath: join(request.artifactsDirectory, `${request.taskId}.stderr.log`),
+          structuredHandoff: null,
+          changedFiles: [],
+          gitDiffSummary: null,
+          testsReported: [],
+          unresolvedQuestions: [],
+          startedAt: timestamp,
+          endedAt: timestamp,
+          durationMs: 0,
+          timedOut: false,
+          aborted: false,
+          errorMessage: 'intentional failure',
+        };
+      },
+    };
+    const orchestrator = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: fixture.repository,
+      runsRoot: join(fixture.container, 'runs'),
+      agents: { codex: failingCodex, claude: new ScenarioAgent('claude', {}) },
+    });
+    const completed = await orchestrator.execute();
+    assert.equal(completed.tasks.solve?.status, 'FAILED');
+    assert.equal(completed.tasks.solve?.error?.code, 'AGENT_FAILED');
+    assert.equal(completed.tasks.solve?.handoffOutcome ?? null, null);
+    assert.equal(completed.tasks.solve?.handoffRepairAttempted ?? false, false);
+    assert.deepEqual(invocations, ['solve']);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+// 15. An ownership violation still blocks the task exactly as before; the
+// handoff-repair refactor did not weaken or bypass it.
+test('scenario 15: an ownership violation still blocks the task; unaffected by handoff repair', async () => {
+  const { fixture, write } = await setUp();
+  try {
+    const phaseFile = await write({ maxCorrectionRounds: 1, escalation: true });
+    const codex = new ScenarioAgent('codex', {
+      solve: async (request) => {
+        await writeFile(join(request.worktreePath, 'outside-ownership.txt'), 'oops', 'utf8');
+        return completeHandoff({ filesChanged: ['outside-ownership.txt'] });
+      },
+    });
+    const claude = new ScenarioAgent('claude', {});
+    const orchestrator = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: fixture.repository,
+      runsRoot: join(fixture.container, 'runs'),
+      agents: { codex, claude },
+    });
+    const completed = await orchestrator.execute();
+    assert.equal(completed.tasks.solve?.status, 'FAILED');
+    assert.equal(completed.tasks.solve?.error?.code, 'OWNERSHIP_VIOLATION');
+    // The handoff itself was perfectly valid; nothing here needed repair.
+    assert.equal(completed.tasks.solve?.handoffOutcome, 'valid');
+    assert.equal(completed.tasks.solve?.handoffRepairAttempted, false);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+// 16. Fix C: a persisted FAILED/HANDOFF_INVALID task with a succeeded agent
+// attempt and a genuinely preserved worktree is recoverable via
+// AgentOrchestrator.recoverHandoffFailures — WITHOUT re-invoking the Solver —
+// and the resulting run correctly unblocks its dependents and proceeds to
+// the next real step (the Verifier), exactly like the real dogfood recovery.
+test('scenario 16: a persisted FAILED/HANDOFF_INVALID task recovers via recoverHandoffFailures without rerunning the Solver, and unblocks its dependents', async () => {
+  const { fixture, write } = await setUp();
+  try {
+    const phaseFile = await write({ maxCorrectionRounds: 1, escalation: true });
+    const runsRoot = join(fixture.container, 'runs');
+    const started = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: fixture.repository,
+      runsRoot,
+      agents: { codex: new ScenarioAgent('codex', {}), claude: new ScenarioAgent('claude', {}) },
+    });
+    const runId = started.snapshot().runId;
+    const before = started.snapshot();
+
+    // Build a real worktree exactly like prepareTask() would, with real
+    // preserved uncommitted implementation work — mirroring the actual
+    // dogfood failure (no task commit was ever created).
+    const worktrees = await WorktreeManager.create({ repositoryPath: fixture.repository });
+    const worktree = await worktrees.createTaskWorktree({
+      runId,
+      taskId: 'solve',
+      baseBranch: fixture.baseBranch,
+      baseSha: before.baseSha,
+    });
+    await writeFile(join(worktree.path, 'feature.txt'), 'implemented', 'utf8');
+
+    // The exact real defect, written to the preserved stdout log a real
+    // Codex process would have produced.
+    const logsDir = join(started.stateStore.runDirectory, 'logs');
+    await mkdir(logsDir, { recursive: true });
+    await writeFile(
+      join(logsDir, `${runId}.solve.codex.attempt-1.stdout.log`),
+      JSON.stringify({
+        ...(completeHandoff() as Record<string, unknown>),
+        'assumptions (optional; implementation tasks)': ['a real assumption'],
+      }),
+      'utf8',
+    );
+
+    const dependencyFailedError = {
+      code: 'TASK_DEPENDENCY_FAILED' as const,
+      message: 'A task dependency did not succeed',
+      at: before.createdAt,
+    };
+    const failed: RunState = {
+      ...before,
+      status: 'FAILED',
+      tasks: {
+        ...before.tasks,
+        solve: {
+          ...before.tasks.solve!,
+          status: 'FAILED',
+          worktreePath: worktree.path,
+          branch: worktree.branch,
+          preparedHeadSha: before.baseSha,
+          startedAt: before.createdAt,
+          finishedAt: before.createdAt,
+          agentAttempts: [{
+            attempt: 1,
+            agent: 'codex',
+            startedAt: before.createdAt,
+            finishedAt: before.createdAt,
+            outcome: 'succeeded',
+          }],
+          error: {
+            code: 'HANDOFF_INVALID',
+            message: 'handoff.assumptions (optional; implementation tasks): is not a supported field',
+            at: before.createdAt,
+          },
+        },
+        verify: { ...before.tasks.verify!, status: 'BLOCKED', finishedAt: before.createdAt, error: dependencyFailedError },
+        fix: { ...before.tasks.fix!, status: 'BLOCKED', finishedAt: before.createdAt, error: dependencyFailedError },
+        reverify: { ...before.tasks.reverify!, status: 'BLOCKED', finishedAt: before.createdAt, error: dependencyFailedError },
+        judge: { ...before.tasks.judge!, status: 'BLOCKED', finishedAt: before.createdAt, error: dependencyFailedError },
+      },
+    };
+    await started.stateStore.save(failed);
+
+    // Recovery agents register NO 'solve' or 'solve-handoff-repair' behavior
+    // at all: if the engine re-invoked the Solver or fell through to an
+    // agent-based repair, ScenarioAgent throws and this test fails loudly.
+    const recoveryCodex = new ScenarioAgent('codex', {});
+    const recoveryClaude = new ScenarioAgent('claude', { verify: () => approvedReview() });
+    const { orchestrator, recovered, skipped } = await AgentOrchestrator.recoverHandoffFailures(runId, {
+      repositoryPath: fixture.repository,
+      runsRoot,
+      agents: { codex: recoveryCodex, claude: recoveryClaude },
+    });
+    assert.deepEqual(recovered, ['solve']);
+    assert.deepEqual(skipped, []);
+    const afterRecovery = orchestrator.snapshot();
+    assert.equal(afterRecovery.tasks.solve?.status, 'SUCCEEDED');
+    assert.equal(afterRecovery.tasks.solve?.handoffOutcome, 'valid');
+    assert.equal(afterRecovery.tasks.solve?.handoffRepairAttempted, true);
+    assert.equal(afterRecovery.tasks.solve?.handoffRepairSucceeded, true);
+    assert.ok(afterRecovery.tasks.solve?.commit?.sha, 'a real task commit must have been created');
+    // Downstream, dependency-only BLOCKED tasks are unblocked to PENDING —
+    // not jumped straight to READY (verify's own dependency check runs it).
+    assert.equal(afterRecovery.tasks.verify?.status, 'PENDING');
+    assert.equal(afterRecovery.status, 'RUNNING');
+    assert.deepEqual(recoveryCodex.invocations, []);
+
+    const completed = await orchestrator.execute();
+    assert.equal(completed.status, 'COMPLETED');
+    assert.deepEqual(recoveryCodex.invocations, [], 'the Solver must never be re-invoked');
+    assert.deepEqual(recoveryClaude.invocations, ['verify']);
+    assert.equal(completed.tasks.fix?.status, 'SKIPPED');
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+// 17. An arbitrary FAILED task (a real implementation failure, not a handoff
+// problem) is never treated as an automatic recovery candidate.
+test('scenario 17: a FAILED task with AGENT_FAILED is not an automatic recovery candidate', async () => {
+  const { fixture, write } = await setUp();
+  try {
+    const phaseFile = await write({ maxCorrectionRounds: 1, escalation: true });
+    const runsRoot = join(fixture.container, 'runs');
+    const started = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: fixture.repository,
+      runsRoot,
+      agents: { codex: new ScenarioAgent('codex', {}), claude: new ScenarioAgent('claude', {}) },
+    });
+    const runId = started.snapshot().runId;
+    const before = started.snapshot();
+    const failed: RunState = {
+      ...before,
+      status: 'FAILED',
+      tasks: {
+        ...before.tasks,
+        solve: {
+          ...before.tasks.solve!,
+          status: 'FAILED',
+          finishedAt: before.createdAt,
+          agentAttempts: [{ attempt: 1, agent: 'codex', startedAt: before.createdAt, finishedAt: before.createdAt, outcome: 'failed' }],
+          error: { code: 'AGENT_FAILED', message: 'intentional failure', at: before.createdAt },
+        },
+      },
+    };
+    await started.stateStore.save(failed);
+
+    const result = await AgentOrchestrator.recoverHandoffFailures(runId, {
+      repositoryPath: fixture.repository,
+      runsRoot,
+      agents: { codex: new ScenarioAgent('codex', {}), claude: new ScenarioAgent('claude', {}) },
+    });
+    assert.deepEqual(result.recovered, []);
+    assert.equal(result.orchestrator.snapshot().status, 'FAILED');
+    assert.equal(result.orchestrator.snapshot().tasks.solve?.status, 'FAILED');
+    assert.equal(result.orchestrator.snapshot().tasks.solve?.error?.code, 'AGENT_FAILED');
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+// 18. All-or-nothing: a HANDOFF_INVALID task that fails ONE eligibility
+// invariant (its last agent attempt did not actually succeed) refuses the
+// ENTIRE recovery call rather than partially recovering other tasks.
+test('scenario 18: an eligibility invariant failure refuses recovery entirely (all-or-nothing)', async () => {
+  const { fixture, write } = await setUp();
+  try {
+    const phaseFile = await write({ maxCorrectionRounds: 1, escalation: true });
+    const runsRoot = join(fixture.container, 'runs');
+    const started = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: fixture.repository,
+      runsRoot,
+      agents: { codex: new ScenarioAgent('codex', {}), claude: new ScenarioAgent('claude', {}) },
+    });
+    const runId = started.snapshot().runId;
+    const before = started.snapshot();
+    const failed: RunState = {
+      ...before,
+      status: 'FAILED',
+      tasks: {
+        ...before.tasks,
+        solve: {
+          ...before.tasks.solve!,
+          status: 'FAILED',
+          finishedAt: before.createdAt,
+          // No worktreePath/preparedHeadSha at all, and the recorded attempt
+          // did not actually succeed -- an invariant violation, not the real
+          // dogfood shape.
+          agentAttempts: [{ attempt: 1, agent: 'codex', startedAt: before.createdAt, finishedAt: before.createdAt, outcome: 'failed' }],
+          error: { code: 'HANDOFF_INVALID', message: 'handoff is not valid JSON', at: before.createdAt },
+        },
+      },
+    };
+    await started.stateStore.save(failed);
+
+    await assert.rejects(
+      AgentOrchestrator.recoverHandoffFailures(runId, {
+        repositoryPath: fixture.repository,
+        runsRoot,
+        agents: { codex: new ScenarioAgent('codex', {}), claude: new ScenarioAgent('claude', {}) },
+      }),
+      (error: unknown) => {
+        assert.match((error as Error).message, /eligibility invariant/);
+        return true;
+      },
+    );
+    // Nothing was mutated: reloading the persisted state must still show FAILED.
+    const stillFailed = await AgentOrchestrator.resume(runId, {
+      repositoryPath: fixture.repository,
+      runsRoot,
+      agents: { codex: new ScenarioAgent('codex', {}), claude: new ScenarioAgent('claude', {}) },
+    });
+    assert.equal(stillFailed.snapshot().tasks.solve?.status, 'FAILED');
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+// 19. A crash while a bounded handoff-repair attempt is in flight must never
+// cause resume to re-invoke the Solver: the original attempt already
+// succeeded and left real uncommitted work in the worktree, so reconcile()
+// must not treat this as "process disappeared, safe to retry from scratch."
+test('scenario 19: a crash during handoff repair does not duplicate the Solver invocation on resume', async () => {
+  const { fixture, write } = await setUp();
+  try {
+    const phaseFile = await write({ maxCorrectionRounds: 1, escalation: true });
+    const runsRoot = join(fixture.container, 'runs');
+    const started = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: fixture.repository,
+      runsRoot,
+      agents: { codex: new ScenarioAgent('codex', {}), claude: new ScenarioAgent('claude', {}) },
+    });
+    const runId = started.snapshot().runId;
+    const before = started.snapshot();
+
+    const logsDir = join(started.stateStore.runDirectory, 'logs');
+    await mkdir(logsDir, { recursive: true });
+    await writeFile(
+      join(logsDir, `${runId}.solve.codex.attempt-1.stdout.log`),
+      JSON.stringify({ ...(completeHandoff() as Record<string, unknown>), 'assumptions (optional; implementation tasks)': ['x'] }),
+      'utf8',
+    );
+    const worktrees = await WorktreeManager.create({ repositoryPath: fixture.repository });
+    const worktree = await worktrees.createTaskWorktree({
+      runId,
+      taskId: 'solve',
+      baseBranch: fixture.baseBranch,
+      baseSha: before.baseSha,
+    });
+    await writeFile(join(worktree.path, 'feature.txt'), 'implemented', 'utf8');
+
+    const interrupted: RunState = {
+      ...before,
+      status: 'RUNNING',
+      tasks: {
+        ...before.tasks,
+        solve: {
+          ...before.tasks.solve!,
+          status: 'RUNNING',
+          worktreePath: worktree.path,
+          branch: worktree.branch,
+          preparedHeadSha: before.baseSha,
+          startedAt: before.createdAt,
+          // The ORIGINAL attempt already finished successfully by the time a
+          // crash could occur mid-repair -- runTrackedAgent() always persists
+          // this before finishHandoff() (and therefore any repair) begins.
+          agentAttempts: [{
+            attempt: 1,
+            agent: 'codex',
+            startedAt: before.createdAt,
+            finishedAt: before.createdAt,
+            outcome: 'succeeded',
+            pid: 2_147_483_647,
+          }],
+        },
+      },
+    };
+    await started.stateStore.save(interrupted);
+
+    const resumeCodex = new ScenarioAgent('codex', {});
+    const resumed = await AgentOrchestrator.resume(runId, {
+      repositoryPath: fixture.repository,
+      runsRoot,
+      agents: { codex: resumeCodex, claude: new ScenarioAgent('claude', {}) },
+    });
+    assert.notEqual(resumed.snapshot().tasks.solve?.status, 'READY');
+    assert.deepEqual(resumeCodex.invocations, []);
+
+    await resumed.execute().catch(() => undefined);
+    assert.deepEqual(resumeCodex.invocations, [], 'the Solver must never be re-invoked after a crash mid-repair');
+    assert.equal(resumed.snapshot().tasks.solve!.agentAttempts.length, 1);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+/**
+ * §10-§13 (real Phase 5 dogfood recovery, SECOND finding,
+ * run-20260822094645-5b090308, explorer-final-review): Claude's real
+ * response was `"...prose explaining the contract...\n{"status":"approved","findings":[]}"`
+ * — semantically valid, but whole-text JSON.parse failed on the prose. These
+ * scenarios exercise the resulting framing-extraction layer end to end
+ * through the real orchestrator, still with fake agents only.
+ */
+
+function agentReturning(name: AgentName, structuredHandoff: unknown, rawStdout: string): Agent {
+  return {
+    name,
+    async run(request) {
+      const timestamp = new Date().toISOString();
+      return {
+        agent: name,
+        runId: request.runId,
+        taskId: request.taskId,
+        status: 'succeeded',
+        failureCode: null,
+        exitCode: 0,
+        signal: null,
+        stdoutPath: join(request.artifactsDirectory, `${request.taskId}.stdout.log`),
+        stderrPath: join(request.artifactsDirectory, `${request.taskId}.stderr.log`),
+        structuredHandoff,
+        rawStdout,
+        changedFiles: [],
+        gitDiffSummary: null,
+        testsReported: [],
+        unresolvedQuestions: [],
+        startedAt: timestamp,
+        endedAt: timestamp,
+        durationMs: 0,
+        timedOut: false,
+        aborted: false,
+        errorMessage: null,
+      };
+    },
+  };
+}
+
+// 20. Live path: a review response prefaced with prose (the exact real
+// Claude failure mode) is recovered via framing, without any repair-agent
+// invocation (review recovery is framing-only, by design).
+test('scenario 20: a review response prefaced with prose is recovered via framing on the live path', async () => {
+  const { fixture, write } = await setUp();
+  try {
+    const phaseFile = await write({ maxCorrectionRounds: 1, escalation: true });
+    const codex = new ScenarioAgent('codex', {
+      solve: async (request) => {
+        await writeFile(join(request.worktreePath, 'feature.txt'), 'implemented', 'utf8');
+        return completeHandoff();
+      },
+    });
+    // Whole-text JSON.parse of this fails (there is prose before the JSON),
+    // exactly like the real Claude output; structuredHandoff is therefore
+    // null, mirroring what process-agent.ts would actually have produced.
+    const claudeStdout = [
+      'All on-disk files match the diff exactly. This completes my verification.',
+      '',
+      'Note: this task requires a single JSON verdict object; providing it directly.',
+      '',
+      JSON.stringify(approvedReview()),
+    ].join('\n');
+    const claude = agentReturning('claude', null, claudeStdout);
+    const orchestrator = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: fixture.repository,
+      runsRoot: join(fixture.container, 'runs'),
+      agents: { codex, claude },
+    });
+    const completed = await orchestrator.execute();
+    assert.equal(completed.status, 'COMPLETED');
+    assert.equal(completed.tasks.verify?.status, 'SUCCEEDED');
+    assert.equal(completed.tasks.verify?.handoffOutcome, 'valid');
+    assert.equal(completed.tasks.verify?.handoffRepairAttempted, true);
+    assert.equal(completed.tasks.verify?.handoffRepairSucceeded, true);
+    assert.equal(completed.tasks.fix?.status, 'SKIPPED');
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+// 21. Persisted FAILED recovery for a review-mode task (REVIEW_BLOCKED),
+// mirroring the exact real dogfood shape: final_review recovered from its
+// preserved stdout, Claude NOT re-invoked, and Judge correctly SKIPPED
+// afterward because the recovered review approved.
+test('scenario 21: a persisted FAILED/REVIEW_BLOCKED final_review recovers via framing, Claude is not re-invoked, and Judge is SKIPPED', async () => {
+  const { fixture, write } = await setUp();
+  try {
+    const phaseFile = await write({ maxCorrectionRounds: 1, escalation: true });
+    const runsRoot = join(fixture.container, 'runs');
+    const started = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: fixture.repository,
+      runsRoot,
+      agents: { codex: new ScenarioAgent('codex', {}), claude: new ScenarioAgent('claude', {}) },
+    });
+    const runId = started.snapshot().runId;
+    const before = started.snapshot();
+
+    const worktrees = await WorktreeManager.create({ repositoryPath: fixture.repository });
+    const worktree = await worktrees.createTaskWorktree({
+      runId,
+      taskId: 'reverify',
+      baseBranch: fixture.baseBranch,
+      baseSha: before.baseSha,
+    });
+    // Read-only task: worktree stays exactly at the prepared SHA, no changes.
+
+    const logsDir = join(started.stateStore.runDirectory, 'logs');
+    await mkdir(logsDir, { recursive: true });
+    const claudeStdout = [
+      'All on-disk files match the diff exactly. This completes my verification.',
+      '',
+      'Note: this task requires a single JSON verdict object; providing it directly.',
+      '',
+      JSON.stringify(approvedReview()),
+    ].join('\n');
+    await writeFile(
+      join(logsDir, `${runId}.reverify.claude.attempt-1.stdout.log`),
+      claudeStdout,
+      'utf8',
+    );
+
+    const dependencyFailedError = {
+      code: 'TASK_DEPENDENCY_FAILED' as const,
+      message: 'A task dependency did not succeed',
+      at: before.createdAt,
+    };
+    const failed: RunState = {
+      ...before,
+      status: 'FAILED',
+      tasks: {
+        ...before.tasks,
+        solve: { ...before.tasks.solve!, status: 'SUCCEEDED', finishedAt: before.createdAt },
+        verify: {
+          ...before.tasks.verify!,
+          status: 'SUCCEEDED',
+          reviewPaths: [],
+          finishedAt: before.createdAt,
+        },
+        fix: { ...before.tasks.fix!, status: 'SUCCEEDED', finishedAt: before.createdAt },
+        reverify: {
+          ...before.tasks.reverify!,
+          status: 'FAILED',
+          worktreePath: worktree.path,
+          branch: worktree.branch,
+          preparedHeadSha: before.baseSha,
+          startedAt: before.createdAt,
+          finishedAt: before.createdAt,
+          agentAttempts: [{
+            attempt: 1,
+            agent: 'claude',
+            startedAt: before.createdAt,
+            finishedAt: before.createdAt,
+            outcome: 'succeeded',
+          }],
+          error: { code: 'REVIEW_BLOCKED', message: 'review: must be an object', at: before.createdAt },
+        },
+        judge: { ...before.tasks.judge!, status: 'BLOCKED', finishedAt: before.createdAt, error: dependencyFailedError },
+      },
+    };
+    await started.stateStore.save(failed);
+
+    // No 'reverify' or 'judge' behavior registered: if the engine re-invoked
+    // Claude for either, ScenarioAgent throws and this test fails loudly.
+    const recoveryClaude = new ScenarioAgent('claude', {});
+    const { orchestrator, recovered, skipped } = await AgentOrchestrator.recoverHandoffFailures(runId, {
+      repositoryPath: fixture.repository,
+      runsRoot,
+      agents: { codex: new ScenarioAgent('codex', {}), claude: recoveryClaude },
+    });
+    assert.deepEqual(recovered, ['reverify']);
+    assert.deepEqual(skipped, []);
+    const afterRecovery = orchestrator.snapshot();
+    assert.equal(afterRecovery.tasks.reverify?.status, 'SUCCEEDED');
+    assert.equal(afterRecovery.tasks.reverify?.handoffOutcome, 'valid');
+    assert.equal(afterRecovery.tasks.reverify?.handoffRepairAttempted, true);
+    assert.equal(afterRecovery.tasks.reverify?.handoffRepairSucceeded, true);
+    // Read-only task: no commit, ever.
+    assert.equal(afterRecovery.tasks.reverify?.commit, undefined);
+    assert.equal(afterRecovery.tasks.judge?.status, 'PENDING');
+    assert.equal(afterRecovery.status, 'RUNNING');
+    assert.deepEqual(recoveryClaude.invocations, []);
+
+    const completed = await orchestrator.execute();
+    assert.equal(completed.status, 'COMPLETED');
+    // The whole point of the condition: an approved recovered review must
+    // SKIP the Judge, never invoke Opus after the fact.
+    assert.equal(completed.tasks.judge?.status, 'SKIPPED');
+    assert.deepEqual(recoveryClaude.invocations, [], 'Claude must never be re-invoked for either task');
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+// 22. Uniform coverage across roles: an implementation handoff prefaced with
+// prose is ALSO recovered via framing on the live path (proves this isn't a
+// review-only hack — the same mechanism applies to the handoff schema too).
+test('scenario 22: an implementation handoff prefaced with prose is recovered via framing on the live path', async () => {
+  const { fixture, write } = await setUp();
+  try {
+    const phaseFile = await write({ maxCorrectionRounds: 1, escalation: true });
+    const solveHandoff = completeHandoff() as Record<string, unknown>;
+    const codexStdout = [
+      'I have completed the implementation and verified it against the spec.',
+      '',
+      JSON.stringify(solveHandoff),
+    ].join('\n');
+    const codex: Agent = {
+      name: 'codex',
+      async run(request) {
+        await writeFile(join(request.worktreePath, 'feature.txt'), 'implemented', 'utf8');
+        const inner = agentReturning('codex', null, codexStdout);
+        return inner.run(request);
+      },
+    };
+    const claude = new ScenarioAgent('claude', { verify: () => approvedReview() });
+    const orchestrator = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: fixture.repository,
+      runsRoot: join(fixture.container, 'runs'),
+      agents: { codex, claude },
+    });
+    const completed = await orchestrator.execute();
+    assert.equal(completed.status, 'COMPLETED');
+    assert.equal(completed.tasks.solve?.status, 'SUCCEEDED');
+    assert.equal(completed.tasks.solve?.handoffOutcome, 'valid');
+    assert.equal(completed.tasks.solve?.handoffRepairAttempted, true);
+    assert.equal(completed.tasks.solve?.handoffRepairSucceeded, true);
+    assert.ok(completed.tasks.solve?.commit?.sha);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+/**
+ * §7 (real Phase 5 dogfood recovery, THIRD finding, integration gate
+ * command-order defect): AgentOrchestrator.retryIntegrationGate retries
+ * ONLY the deterministic gate for a run BLOCKED specifically with
+ * INTEGRATION_TEST_FAILED, reusing the exact same integration worktree and
+ * headSha checkpoint (integrateAndVerify() already re-validates that before
+ * re-running the gate) — no task is touched, no agent is invoked.
+ */
+test('retryIntegrationGate: retries only the gate after a fix, reusing the same checkpoint, without re-invoking any agent', async () => {
+  const fixture = await createTemporaryRepository();
+  try {
+    await writeFile(join(fixture.repository, 'design.md'), '# Design\n', 'utf8');
+    await fixture.git.run(fixture.repository, ['add', '--', 'design.md']);
+    await fixture.git.run(fixture.repository, ['commit', '-m', 'add design']);
+
+    const runsRoot = join(fixture.container, 'runs');
+    const phaseFile = join(fixture.container, 'phase.yaml');
+    const failingGateYaml = `
+phase: retry-gate-test
+name: Retry gate scenario
+baseBranch: ${fixture.baseBranch}
+canonicalDesignDocument: design.md
+concurrency: 1
+tasks:
+  - id: solve
+    title: Solve
+    owner: codex
+    effort: high
+    mode: implementation
+    files: [feature.txt]
+integration:
+  commands:
+    - node -e "process.exit(1)"
+`;
+    await writeFile(phaseFile, failingGateYaml, 'utf8');
+
+    const codex = new ScenarioAgent('codex', {
+      solve: async (request) => {
+        await writeFile(join(request.worktreePath, 'feature.txt'), 'implemented', 'utf8');
+        return completeHandoff();
+      },
+    });
+    const started = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: fixture.repository,
+      runsRoot,
+      agents: { codex, claude: new ScenarioAgent('claude', {}) },
+    });
+    const runId = started.snapshot().runId;
+    const failed = await started.execute();
+    assert.equal(failed.status, 'BLOCKED');
+    assert.equal(failed.integration.status, 'BLOCKED');
+    assert.equal(failed.integration.error?.code, 'INTEGRATION_TEST_FAILED');
+    const originalIntegratedCommits = failed.integration.integratedTaskCommits;
+    const originalHeadSha = failed.integration.headSha;
+    assert.deepEqual(codex.invocations, ['solve']);
+
+    // Simulate the real fix: correct the phase file's OWN persisted
+    // snapshot (mirroring editing phase5.real.yaml between attempts).
+    const snapshotPath = join(started.stateStore.runDirectory, 'phase.yaml');
+    await writeFile(snapshotPath, failingGateYaml.replace('process.exit(1)', 'process.exit(0)'), 'utf8');
+
+    // No 'solve' behavior registered: if the engine re-invoked the Solver
+    // for a gate-only retry, ScenarioAgent throws and this fails loudly.
+    const retryCodex = new ScenarioAgent('codex', {});
+    const retried = await AgentOrchestrator.retryIntegrationGate(runId, {
+      repositoryPath: fixture.repository,
+      runsRoot,
+      agents: { codex: retryCodex, claude: new ScenarioAgent('claude', {}) },
+    });
+    assert.equal(retried.snapshot().status, 'RUNNING');
+    assert.equal(retried.snapshot().integrationAttempts?.length, 1);
+    assert.equal(retried.snapshot().integrationAttempts?.[0]?.error?.code, 'INTEGRATION_TEST_FAILED');
+
+    // The archived log directory preserves the ORIGINAL failing output —
+    // never overwritten in place by the retry.
+    const archivedLogDir = join(started.stateStore.runDirectory, 'logs', 'integration-attempt-1');
+    const archivedFiles = await readdir(archivedLogDir);
+    assert.ok(archivedFiles.length > 0, 'the original failed attempt\'s logs must be preserved');
+
+    const completed = await retried.execute();
+    assert.equal(completed.status, 'COMPLETED');
+    assert.equal(completed.integration.status, 'SUCCEEDED');
+    // Same worktree/checkpoint reused verbatim: no re-cherry-pick.
+    assert.deepEqual(completed.integration.integratedTaskCommits, originalIntegratedCommits);
+    assert.equal(completed.integration.headSha, originalHeadSha);
+    assert.deepEqual(retryCodex.invocations, [], 'no agent may be re-invoked for a gate-only retry');
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test('retryIntegrationGate refuses when the run is not BLOCKED, and refuses when blocked for a different reason', async () => {
+  const { fixture, write } = await setUp();
+  try {
+    const phaseFile = await write({ maxCorrectionRounds: 0 });
+    const runsRoot = join(fixture.container, 'runs');
+    const codex = new ScenarioAgent('codex', {
+      solve: async (request) => {
+        await writeFile(join(request.worktreePath, 'feature.txt'), 'implemented', 'utf8');
+        return completeHandoff();
+      },
+    });
+    const claude = new ScenarioAgent('claude', { verify: () => approvedReview() });
+    const started = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: fixture.repository,
+      runsRoot,
+      agents: { codex, claude },
+    });
+    const runId = started.snapshot().runId;
+    const completed = await started.execute();
+    assert.equal(completed.status, 'COMPLETED');
+
+    // Not BLOCKED at all (it's COMPLETED) -- must refuse.
+    await assert.rejects(
+      AgentOrchestrator.retryIntegrationGate(runId, { repositoryPath: fixture.repository, runsRoot }),
+      /not BLOCKED/,
+    );
+
+    // Now hand-construct a run BLOCKED for an unrelated reason (an
+    // INTEGRATION_CONFLICT, which needs real human conflict resolution, not
+    // an automatic gate-only retry).
+    const before = started.snapshot();
+    const wrongReason: RunState = {
+      ...before,
+      status: 'BLOCKED',
+      integration: {
+        ...before.integration,
+        status: 'BLOCKED',
+        error: { code: 'INTEGRATION_CONFLICT', message: 'conflict', at: before.createdAt },
+      },
+    };
+    await started.stateStore.save(wrongReason);
+    await assert.rejects(
+      AgentOrchestrator.retryIntegrationGate(runId, { repositoryPath: fixture.repository, runsRoot }),
+      /not INTEGRATION_TEST_FAILED/,
+    );
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+/**
+ * §8 (real Phase 5 dogfood recovery, THIRD structural finding): the
+ * integrated source itself sometimes needs a small, auditable correction
+ * after a real INTEGRATION_TEST_FAILED — applyIntegrationFix commits an
+ * ALREADY-MADE, uncommitted edit in the existing integration worktree as one
+ * new commit on top of the existing head, enforcing the same ownership gate
+ * every task commit already goes through, and rejecting a smuggled
+ * migration/package.json/lockfile change regardless of ownership.
+ */
+test('applyIntegrationFix: commits a narrow source correction on top of the existing integration head, then the retried gate passes', async () => {
+  const fixture = await createTemporaryRepository();
+  try {
+    await writeFile(join(fixture.repository, 'design.md'), '# Design\n', 'utf8');
+    await fixture.git.run(fixture.repository, ['add', '--', 'design.md']);
+    await fixture.git.run(fixture.repository, ['commit', '-m', 'add design']);
+
+    const runsRoot = join(fixture.container, 'runs');
+    const phaseFile = join(fixture.container, 'phase.yaml');
+    const gateYaml = `
+phase: fix-gate-test
+name: Integration fix scenario
+baseBranch: ${fixture.baseBranch}
+canonicalDesignDocument: design.md
+concurrency: 1
+tasks:
+  - id: solve
+    title: Solve
+    owner: codex
+    effort: high
+    mode: implementation
+    files: [feature.txt]
+integration:
+  commands:
+    - node -e "process.exit(require('fs').readFileSync('feature.txt','utf8').trim()==='implemented-fixed'?0:1)"
+`;
+    await writeFile(phaseFile, gateYaml, 'utf8');
+
+    const codex = new ScenarioAgent('codex', {
+      solve: async (request) => {
+        await writeFile(join(request.worktreePath, 'feature.txt'), 'implemented', 'utf8');
+        return completeHandoff();
+      },
+    });
+    const started = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: fixture.repository,
+      runsRoot,
+      agents: { codex, claude: new ScenarioAgent('claude', {}) },
+    });
+    const runId = started.snapshot().runId;
+    const failed = await started.execute();
+    assert.equal(failed.status, 'BLOCKED');
+    assert.equal(failed.integration.error?.code, 'INTEGRATION_TEST_FAILED');
+    const integrationWorktree = failed.integration.worktreePath!;
+    assert.deepEqual(codex.invocations, ['solve']);
+
+    // The actual "fix": a human/Codex edits the already-integrated source
+    // directly in the existing integration worktree (uncommitted so far).
+    await writeFile(join(integrationWorktree, 'feature.txt'), 'implemented-fixed', 'utf8');
+
+    const fixed = await AgentOrchestrator.applyIntegrationFix(
+      runId,
+      { repositoryPath: fixture.repository, runsRoot },
+      { summary: 'Fix feature.txt content for the gate check.', ownership: ['feature.txt'] },
+    );
+    assert.equal(fixed.snapshot().status, 'RUNNING');
+    assert.equal(fixed.snapshot().integrationAttempts?.length, 1);
+    assert.equal(fixed.snapshot().integration.integrationFixCommits?.length, 1);
+    const fixCommit = fixed.snapshot().integration.integrationFixCommits![0]!;
+    assert.notEqual(fixCommit, failed.integration.headSha);
+
+    const retryCodex = new ScenarioAgent('codex', {});
+    const completed = await AgentOrchestrator.resume(runId, {
+      repositoryPath: fixture.repository,
+      runsRoot,
+      agents: { codex: retryCodex, claude: new ScenarioAgent('claude', {}) },
+    }).then((orchestrator) => orchestrator.execute());
+    assert.equal(completed.status, 'COMPLETED');
+    assert.equal(completed.integration.headSha, fixCommit);
+    assert.deepEqual(retryCodex.invocations, [], 'no agent may be re-invoked for an integration-fix retry');
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test('applyIntegrationFix refuses a change outside the given ownership, and refuses a smuggled package.json change', async () => {
+  const fixture = await createTemporaryRepository();
+  try {
+    await writeFile(join(fixture.repository, 'design.md'), '# Design\n', 'utf8');
+    await fixture.git.run(fixture.repository, ['add', '--', 'design.md']);
+    await fixture.git.run(fixture.repository, ['commit', '-m', 'add design']);
+
+    const runsRoot = join(fixture.container, 'runs');
+    const phaseFile = join(fixture.container, 'phase.yaml');
+    await writeFile(
+      phaseFile,
+      `
+phase: fix-gate-ownership-test
+name: Integration fix ownership scenario
+baseBranch: ${fixture.baseBranch}
+canonicalDesignDocument: design.md
+concurrency: 1
+tasks:
+  - id: solve
+    title: Solve
+    owner: codex
+    effort: high
+    mode: implementation
+    files: [feature.txt]
+integration:
+  commands:
+    - node -e "process.exit(1)"
+`,
+      'utf8',
+    );
+
+    const codex = new ScenarioAgent('codex', {
+      solve: async (request) => {
+        await writeFile(join(request.worktreePath, 'feature.txt'), 'implemented', 'utf8');
+        return completeHandoff();
+      },
+    });
+    const started = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: fixture.repository,
+      runsRoot,
+      agents: { codex, claude: new ScenarioAgent('claude', {}) },
+    });
+    const runId = started.snapshot().runId;
+    const failed = await started.execute();
+    const integrationWorktree = failed.integration.worktreePath!;
+
+    // Edit a file outside the declared ownership. ensureTaskCommit commits
+    // BEFORE the ownership check runs (the same pre-existing pattern
+    // finishParsedHandoff already uses, so the rejected attempt stays
+    // forensically inspectable) -- so a real commit lands on the worktree
+    // even though this call rejects; hard-reset back to the pre-attempt
+    // head to test the next scenario from a clean starting point.
+    await writeFile(join(integrationWorktree, 'other.txt'), 'sneaky', 'utf8');
+    await assert.rejects(
+      AgentOrchestrator.applyIntegrationFix(
+        runId,
+        { repositoryPath: fixture.repository, runsRoot },
+        { summary: 'attempted fix', ownership: ['feature.txt'] },
+      ),
+    );
+    await fixture.git.run(integrationWorktree, ['reset', '--hard', failed.integration.headSha!]);
+    await fixture.git.run(integrationWorktree, ['clean', '-fd']);
+
+    // Edit package.json -- forbidden regardless of declared ownership.
+    await writeFile(join(integrationWorktree, 'package.json'), '{"name":"sneaky"}', 'utf8');
+    await assert.rejects(
+      AgentOrchestrator.applyIntegrationFix(
+        runId,
+        { repositoryPath: fixture.repository, runsRoot },
+        { summary: 'attempted fix', ownership: ['package.json'] },
+      ),
+      /forbidden migration\/schema\/dependency file/,
+    );
   } finally {
     await fixture.dispose();
   }

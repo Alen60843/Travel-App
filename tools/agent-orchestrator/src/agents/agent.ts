@@ -7,7 +7,15 @@ export type AgentRole =
   | 'final_review'
   | 'escalation'
   | 'integration'
-  | 'debate';
+  | 'debate'
+  /**
+   * §6/§10 bounded handoff repair (not a TaskMode — never assigned to a
+   * TaskSpec, never produced by planPhase's waves): a single, cheap,
+   * read-only invocation that reformats a previously-malformed structured
+   * output into the exact expected schema without rerunning the original
+   * work. See orchestrator.ts's repairHandoffViaAgent.
+   */
+  | 'handoff_repair';
 
 export type AgentEffort = 'medium' | 'high' | 'extra_high';
 
@@ -68,6 +76,16 @@ export interface AgentResult {
   readonly stdoutPath: string;
   readonly stderrPath: string;
   readonly structuredHandoff: unknown | null;
+  /**
+   * The raw, bounded, already-redacted stdout text `structuredHandoff` was
+   * derived from — null when unavailable (no process ran, or genuinely
+   * empty/oversized output). Optional so existing fake-agent test doubles
+   * that only ever modeled the already-decided `structuredHandoff` value
+   * don't need updating; a repair/framing step that needs the raw text
+   * simply treats its absence as "nothing to recover from," which is
+   * correct for those synthetic cases. See src/protocol/structured-output.ts.
+   */
+  readonly rawStdout?: string | null;
   readonly changedFiles: readonly string[];
   readonly gitDiffSummary: string | null;
   readonly testsReported: readonly AgentTestReport[];
@@ -87,7 +105,11 @@ export interface Agent {
 }
 
 export function defaultAccessForRole(role: AgentRole): AgentAccess {
-  return role === 'review' || role === 'final_review' || role === 'escalation' || role === 'debate'
+  return role === 'review'
+    || role === 'final_review'
+    || role === 'escalation'
+    || role === 'debate'
+    || role === 'handoff_repair'
     ? 'read_only'
     : 'writer';
 }
@@ -129,7 +151,7 @@ export function buildAgentPrompt(request: AgentRequest): string {
     'Previous review findings:',
     stringifyPromptValue(request.previousReviewFindings),
     '',
-    'Your final response must be one JSON object matching the task handoff or review schema supplied by the task. Do not wrap it in Markdown.',
+    'Your final response must be exactly one JSON object using precisely the property names shown in the task specification\'s responseSchema — copy each key exactly as written, character for character. Never add a description, comment, parenthetical, or any other annotation into a property name; optionality and scope notes are listed separately in responseSchemaNotes, in prose, and must stay there, not in a key. Include an optional field only when you have real content for it; omit it entirely otherwise rather than leaving an empty placeholder. Do not wrap the JSON in Markdown fences or add any text before or after it.',
   ].join('\n');
 }
 
@@ -149,6 +171,8 @@ function roleContract(role: AgentRole): string {
       return 'Perform only the explicitly owned Lead composition work. If bounded debate artifacts are supplied, record an explicit A, B, HYBRID, or BLOCKED selection in decisions. Do not merge the phase branch or push; the orchestrator performs deterministic integration and verification later.';
     case 'debate':
       return 'If no peer proposal is supplied, produce one bounded proposal. If one peer proposal is supplied, critique that proposal once. Do not start an open-ended conversation.';
+    case 'handoff_repair':
+      return 'You are performing a bounded HANDOFF REPAIR, not the original task. The task specification\'s malformedOutput field is a previous, real result that failed strict schema validation for a formatting/key-naming reason only — it was not rejected as incorrect work. Preserve every value exactly as given: do not invent, remove, or alter any factual content. Your only job is to re-emit it with the correct property names and shape, matching responseSchema exactly. Do not implement anything, run any tools or commands, or modify any file. Return only the corrected JSON object.';
   }
 }
 

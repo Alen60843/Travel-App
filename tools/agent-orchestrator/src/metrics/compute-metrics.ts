@@ -45,6 +45,24 @@ export interface TaskMetrics {
   readonly executed: boolean;
   /** Present only when status is SKIPPED. */
   readonly skipReason: string | null;
+  /**
+   * §7 (real Phase 5 dogfood recovery): the AGENT PROCESS's own outcome —
+   * derived from the last recorded agentAttempts entry, not from whether the
+   * task's structured output later validated. Distinguishing this from
+   * handoffOutcome below is the entire point: a task can have
+   * implementationOutcome 'succeeded' and still end up FAILED because its
+   * handoff never became valid (handoffOutcome 'invalid', even after a
+   * repair attempt) — that is a protocol failure, not an implementation one.
+   * Null only when the task never reached an agent attempt at all (e.g.
+   * still PENDING, or SKIPPED before any invocation).
+   */
+  readonly implementationOutcome: 'succeeded' | 'failed' | 'timed_out' | 'aborted' | null;
+  /** Whether the task's structured output was ultimately schema-valid, whether directly or only after a repair. Null if no handoff/review parse was ever attempted. */
+  readonly handoffOutcome: 'valid' | 'invalid' | null;
+  /** Whether a bounded handoff-repair attempt (deterministic and/or one read-only agent call) was made. */
+  readonly handoffRepairAttempted: boolean;
+  /** Present only when handoffRepairAttempted is true. */
+  readonly handoffRepairSucceeded: boolean | null;
   readonly attempts: number;
   readonly durationMs: number | null;
   readonly findingsProduced: number;
@@ -228,6 +246,12 @@ export async function computeRunMetrics(
       status: runState.status,
       executed: !NOT_YET_EXECUTED_STATUSES.has(runState.status),
       skipReason: runState.status === 'SKIPPED' ? (runState.skipReason ?? null) : null,
+      implementationOutcome: lastAttempt?.outcome ?? null,
+      handoffOutcome: runState.handoffOutcome ?? null,
+      handoffRepairAttempted: runState.handoffRepairAttempted ?? false,
+      handoffRepairSucceeded: runState.handoffRepairAttempted === true
+        ? (runState.handoffRepairSucceeded ?? false)
+        : null,
       attempts: runState.agentAttempts.length,
       durationMs: taskDurationMs(runState),
       findingsProduced,

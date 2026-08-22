@@ -17,17 +17,55 @@ Usage:
   pnpm agents:status <run-id>
   pnpm agents:cleanup <run-id>
   pnpm agents:metrics <run-id>
+  pnpm agents:recover-handoffs <run-id>
+  pnpm agents:retry-integration <run-id>
+  pnpm agents:apply-integration-fix <run-id> <summary> <ownership-glob> [more-globs...]
 
 Planning is read-only. Running or resuming may invoke locally authenticated paid agents.
 No command merges into the phase branch or pushes to a remote.
 metrics is read-only: it recomputes a summary from persisted run artifacts and never
-touches agents, worktrees, or state.`;
+touches agents, worktrees, or state.
+recover-handoffs recovers a run's persisted FAILED/HANDOFF_INVALID or FAILED/REVIEW_BLOCKED
+tasks whose agent process already succeeded, using a bounded, mostly local repair (never
+rerunning the original implementation/review); it refuses (all-or-nothing) if any targeted
+task fails an eligibility invariant. It does not itself execute further tasks -- run
+agents:resume afterward to continue the run.
+retry-integration retries ONLY the deterministic integration gate for a run that is BLOCKED
+specifically with INTEGRATION_TEST_FAILED (never for any other blocking reason); it archives
+the failed attempt (never overwrites it) and does not invoke any agent or move any task. Run
+agents:resume afterward to actually re-run the gate.
+apply-integration-fix commits ALREADY-MADE, uncommitted changes in the existing integration
+worktree (you make the edit yourself first) as one narrow, auditable fix commit on top of the
+existing integration head -- only for a run BLOCKED with INTEGRATION_TEST_FAILED, only within
+the given ownership globs, and never touching a migration/package.json/lockfile. It archives
+the failed attempt first and never reruns or rewrites a completed task. Run agents:resume
+afterward to actually re-run the gate.`;
 
 async function main(argv: readonly string[]): Promise<number> {
   const [command, argument, ...extra] = argv;
   if (command === undefined || command === '--help' || command === '-h') {
     process.stdout.write(`${USAGE}\n`);
     return command === undefined ? 1 : 0;
+  }
+  if (command === 'apply-integration-fix') {
+    const [summary, ...ownership] = extra;
+    if (argument === undefined || summary === undefined || ownership.length === 0) {
+      process.stderr.write(`${USAGE}\n`);
+      return 1;
+    }
+    const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
+    const orchestrator = await AgentOrchestrator.applyIntegrationFix(
+      argument,
+      { repositoryPath },
+      { summary, ownership },
+    );
+    process.stdout.write(`${JSON.stringify({
+      runId: orchestrator.snapshot().runId,
+      runStatus: orchestrator.snapshot().status,
+      integrationFixCommits: orchestrator.snapshot().integration.integrationFixCommits ?? [],
+      manualNextStep: 'Run `pnpm agents:resume <run-id>` to actually re-run the deterministic gate.',
+    }, null, 2)}\n`);
+    return 0;
   }
   if (argument === undefined || extra.length > 0) {
     process.stderr.write(`${USAGE}\n`);
@@ -68,6 +106,32 @@ async function main(argv: readonly string[]): Promise<number> {
     } finally {
       cancellation.dispose();
     }
+  }
+  if (command === 'recover-handoffs') {
+    const { orchestrator, recovered, skipped } = await AgentOrchestrator.recoverHandoffFailures(
+      argument,
+      { repositoryPath },
+    );
+    process.stdout.write(`${JSON.stringify({
+      runId: orchestrator.snapshot().runId,
+      runStatus: orchestrator.snapshot().status,
+      recovered,
+      skipped,
+      manualNextStep: recovered.length > 0
+        ? 'Inspect the recovered task(s) below, then run `pnpm agents:resume <run-id>` to continue the run.'
+        : 'No FAILED/HANDOFF_INVALID task was eligible for recovery; nothing changed.',
+    }, null, 2)}\n`);
+    return 0;
+  }
+  if (command === 'retry-integration') {
+    const orchestrator = await AgentOrchestrator.retryIntegrationGate(argument, { repositoryPath });
+    process.stdout.write(`${JSON.stringify({
+      runId: orchestrator.snapshot().runId,
+      runStatus: orchestrator.snapshot().status,
+      archivedAttempts: orchestrator.snapshot().integrationAttempts?.length ?? 0,
+      manualNextStep: 'Run `pnpm agents:resume <run-id>` to actually re-run the deterministic gate.',
+    }, null, 2)}\n`);
+    return 0;
   }
   if (command === 'status') {
     const { store } = await locateRun(repositoryPath, argument);
