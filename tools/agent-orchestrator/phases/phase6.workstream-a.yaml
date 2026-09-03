@@ -1,0 +1,260 @@
+# Phase 6 — Events & Join Requests
+# Workstream A only: USER-hosted Event application layer and lifecycle.
+#
+# This deliberately does NOT implement Join Requests/Participants yet. The
+# canonical schema already contains events, event_join_requests,
+# event_participants, lifecycle triggers, participant-count projection, and
+# capacity invariants. Workstream A exposes and tests the Event aggregate over
+# those existing invariants; Workstream B will add join/approval flows after A
+# is reviewed.
+
+phase: 6
+name: Events & Join Requests — Workstream A (Event lifecycle)
+baseBranch: phase6/events-join-requests
+canonicalDesignDocument: docs/superpowers/specs/2026-08-20-tripwith-phase-1-design.md
+concurrency: 1
+agentRetries: 1
+maxReviewRounds: 2
+agentTimeoutMs: 3600000
+
+tasks:
+  - id: events-core-api
+    title: USER-hosted Event draft/configure/publish lifecycle API
+    owner: codex
+    effort: high
+    mode: implementation
+    files:
+      - apps/api/src/events/**
+    dependsOn: []
+    instructions: |
+      Implement ONLY Phase 6 Workstream A: the application layer for USER-hosted
+      Events. Do not implement join requests, participant approval, payments,
+      provider-host creation, reviews, chat, or marketplace code in this task.
+
+      FIRST inspect the repository and treat it as source of truth. In
+      particular inspect:
+        - apps/api/src/database/entities/events.entity.ts
+        - apps/api/src/database/migrations/sql/1787184000000-InitialSchema.up.sql
+        - packages/shared/src/enums.ts
+        - apps/api/src/trips/** for Controller/Service/Repository conventions
+        - apps/api/src/auth/** for authenticated-user handling
+        - apps/api/src/outbox/** before inventing any event-delivery mechanism
+        - apps/api/src/explorer/** so Event write responses do not conflict with
+          the already-shipped discovery/read model.
+
+      IMPORTANT DISCOVERY ALREADY VERIFIED BEFORE THIS RUN:
+      the schema already owns Event lifecycle and core correctness. Do NOT add a
+      migration merely because Phase 6 is starting. Existing DB guarantees
+      include:
+        - event_status and EVENT_STATUS_TRANSITIONS
+        - tw_event_status_guard / event_status_history
+        - events_capacity_not_exceeded_chk
+        - trigger-maintained participant_count
+        - event_join_requests_active_uk
+        - event_participants_active_uk
+        - tw_sync_participant_count concurrency protection
+      If implementation proves a schema change is genuinely required, STOP and
+      report the exact gap instead of modifying canonical migrations.
+
+      Build an idiomatic NestJS EventsModule with Controller, Service,
+      Repository, DTOs, errors/types/validation as appropriate to existing
+      TripWith conventions.
+
+      API shape should follow the repository's authenticated `me/...` style.
+      Prefer one coherent versioned management surface such as:
+        POST  /api/v1/me/events
+        GET   /api/v1/me/events
+        GET   /api/v1/me/events/:eventId
+        PATCH /api/v1/me/events/:eventId
+        POST  /api/v1/me/events/:eventId/publish
+        POST  /api/v1/me/events/:eventId/cancel
+      Adapt route details only if repository conventions provide a stronger
+      reason. Do not create a generic endpoint that accepts arbitrary status.
+
+      CREATE / DRAFT:
+      - Authenticated identity comes from TripWithAuthGuard; never accept an
+        authoritative hostUserId from the client.
+      - Workstream A creates USER-hosted Events only: host_type=USER,
+        host_user_id=current user, host_provider_id=NULL.
+      - Use the existing Event schema defaults where appropriate. Because the
+        canonical DB requires several fields even for DRAFT, choose a minimal,
+        coherent draft contract that satisfies the real schema rather than
+        creating nullable shadow state.
+      - Normalize/validate title, category, capacity, price/deposit/currency,
+        timestamps, visibility, trust threshold, joinApprovalRequired, meeting
+        point, and cancellation policy according to DB constraints and existing
+        API conventions. Reuse GeoService for point validation instead of
+        hand-rolling lat/lng semantics.
+      - Category must exist; publishing must reject inactive categories.
+
+      UPDATE / CONFIGURE:
+      - Only the owning USER host may mutate the Event.
+      - Ordinary field edits are DRAFT-only in this workstream. Do not silently
+        allow a published Event's economics/time/capacity/location to mutate;
+        later product work can add explicit post-publish edit policy.
+      - participant_count and generated time_range are read-only projections;
+        never write them.
+      - Reject empty patches and protected fields.
+
+      PUBLISH:
+      - Use an explicit command, not PATCH status.
+      - Lock/re-read the owned Event inside a DB transaction.
+      - Validate current status DRAFT, active category, complete required
+        configuration, valid ordered times, and that the Event has not already
+        started. Do not fabricate additional product rules that are absent from
+        the canonical schema/spec.
+      - Transition DRAFT -> ACTIVE using the existing lifecycle. Before the
+        status write, set transaction-local PostgreSQL settings expected by the
+        existing audit trigger:
+          tripwith.actor_user_id = authenticated user UUID
+          tripwith.transition_reason = a stable reason such as 'host_publish'
+        Use set_config(..., true) or an equivalent transaction-local mechanism;
+        do not alter the trigger.
+
+      CANCEL:
+      - Use an explicit command and lifecycle validation.
+      - Owner only. Lock/re-read in one transaction.
+      - Only transitions already permitted by EVENT_STATUS_TRANSITIONS / DB
+        trigger may occur; completed/cancelled Events must fail cleanly.
+      - Set cancelled_at consistently with status=CANCELLED in the same
+        transaction, because the schema has a consistency CHECK.
+      - Record tripwith.actor_user_id and transition_reason='host_cancel'.
+
+      READ MODEL:
+      - Management views may expose fields the host needs, including status and
+        participantCount, but must not serialize ORM entities blindly.
+      - Explorer remains the public discovery surface; do not duplicate its
+        geospatial query engine here.
+
+      DOMAIN EVENTS:
+      - Do not invent a second event bus. Inspect the existing transactional
+        outbox. If a durable EventPublished/EventCancelled notification is
+        clearly needed by current repository contracts, enqueue it inside the
+        same DB transaction using the existing OutboxEnqueuer. Otherwise keep
+        this workstream bounded and document the integration hook rather than
+        introducing speculative jobs.
+
+      TESTS are mandatory and should live under apps/api/src/events/**. Prove at
+      minimum:
+        - authenticated user creates a USER-hosted DRAFT, never from client host id
+        - only owner can read/mutate management resource
+        - invalid category/value/time/location rejected
+        - DRAFT patch works; empty patch/protected mutation rejected
+        - publish performs exactly DRAFT -> ACTIVE
+        - publish of inactive category or already-started Event rejected
+        - illegal/repeated publish rejected
+        - cancel from permitted states works and sets cancelled_at
+        - completed/cancelled terminal behavior follows existing state machine
+        - event_status_history records actor/reason through the DB trigger in an
+          integration test when a real PostgreSQL test DB is available
+        - no code writes participant_count/time_range
+      Add focused unit tests plus repository/integration tests consistent with
+      existing test infrastructure. Do not weaken canonical DB tests.
+
+  - id: events-core-review
+    title: Independent adversarial review of Event lifecycle Workstream A
+    owner: claude
+    model: sonnet
+    effort: high
+    mode: review
+    files: []
+    dependsOn:
+      - events-core-api
+    instructions: |
+      Adversarially review Workstream A. Attempt to falsify authorization,
+      lifecycle, DB-audit and validation correctness. Focus on IDOR, client host
+      spoofing, generic status mutation, DRAFT-only edit bypass, stale-state
+      races, missing row locks, bad actor/reason audit attribution, cancelled_at
+      consistency, category activation, started-event publication, lat/lng
+      mistakes, ORM entity overexposure, participant_count/time_range writes,
+      accidental public discovery duplication, and scope creep into Join/Phase7+.
+      Report only material findings with concrete evidence/reproduction.
+
+  - id: events-core-correction
+    title: Verify and correct Event lifecycle findings
+    owner: codex
+    effort: high
+    mode: correction
+    files:
+      - apps/api/src/events/**
+    dependsOn:
+      - events-core-review
+    condition:
+      reviewOf: events-core-review
+      skipIfStatus:
+        - approved
+    instructions: |
+      Classify every material verifier finding CONFIRMED or REJECTED with
+      evidence. Correct confirmed defects within apps/api/src/events/** only.
+      Do not broaden scope or create migrations to make tests pass.
+
+  - id: events-core-final-review
+    title: Final independent review of Event lifecycle corrections
+    owner: claude
+    model: sonnet
+    effort: high
+    mode: final_review
+    files: []
+    dependsOn:
+      - events-core-correction
+    condition:
+      reviewOf: events-core-review
+      skipIfStatus:
+        - approved
+    instructions: |
+      Re-check the original findings, correction evidence, final diff and tests.
+      Approve only if all material confirmed findings are genuinely resolved.
+
+  - id: events-core-judge
+    title: Escalation arbitration for unresolved high/critical Event finding
+    owner: claude
+    model: opus
+    effort: extra_high
+    mode: escalation
+    files: []
+    dependsOn:
+      - events-core-final-review
+    condition:
+      reviewOf: events-core-final-review
+      skipIfStatus:
+        - approved
+      minimumSeverity: high
+    instructions: |
+      Read-only arbitration of one unresolved high/critical disagreement. Do
+      not modify code and do not loop. Block for human review if unresolved.
+
+  - id: events-core-integration
+    title: Wire EventsModule and verify Workstream A
+    owner: codex
+    effort: high
+    mode: integration
+    files:
+      - apps/api/src/app.module.ts
+    dependsOn:
+      - events-core-judge
+    instructions: |
+      Wire the already-reviewed EventsModule into AppModule and make only the
+      smallest composition-root change required. Update the stale AppModule
+      comment that currently says Events lifecycle is intentionally absent.
+      Do not re-implement Event logic here and do not start Workstream B.
+
+integration:
+  commands:
+    - command: pnpm install --frozen-lockfile
+      timeoutMs: 600000
+    - pnpm --filter @tripwith/shared typecheck
+    - pnpm --filter @tripwith/shared build
+    - pnpm --filter @tripwith/api typecheck
+    - pnpm --filter @tripwith/api build
+    - pnpm --filter @tripwith/shared test
+    - command: pnpm --filter @tripwith/api test -- --runInBand --detectOpenHandles
+      timeoutMs: 1800000
+    - pnpm run check:enums
+    - command: pnpm --filter @tripwith/api db:verify
+      timeoutMs: 1800000
+  diagnostics:
+    - pnpm audit --prod
+
+# Iterative execution rule: this file implements Workstream A only. After the
+# run reaches COMPLETED, inspect/review/merge it before authoring or executing
+# Workstream B (Join Requests + participant approval/concurrency API).
