@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { EventStatus, EventVisibility, UserAccountStatus } from '@tripwith/shared';
+import type { EntityManager } from 'typeorm';
 
 import { AppDataSource } from '../database/data-source';
 import { GeoService } from '../database/geo';
@@ -63,6 +64,24 @@ function draftInput(overrides: Partial<CreateEventDto> = {}): CreateEventDto {
     cancellationPolicy: '  Cancel before noon  ',
     ...overrides,
   };
+}
+
+async function waitForPostgresLockWait(
+  backendPid: number,
+  timeoutMs = 5_000,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    const [activity] = (await AppDataSource.query(
+      `SELECT wait_event_type
+         FROM pg_stat_activity
+        WHERE pid = $1`,
+      [backendPid],
+    )) as Array<{ wait_event_type: string | null }>;
+    if (activity?.wait_event_type === 'Lock') return true;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  } while (Date.now() < deadline);
+  return false;
 }
 
 describe('EventsService (real PostgreSQL/PostGIS)', () => {
@@ -254,6 +273,99 @@ describe('EventsService (real PostgreSQL/PostGIS)', () => {
         actor_user_id: owner.id,
         reason: 'host_cancel',
       },
+    ]);
+  });
+
+  it('serializes overlapping publish attempts on the same draft row', async () => {
+    const owner = await createUser('concurrent-publish-owner');
+    const draft = await service.createEvent(
+      owner.id,
+      draftInput({ title: 'Concurrent publish event' }),
+    );
+
+    let markFirstLockAcquired!: () => void;
+    const firstLockAcquired = new Promise<void>((resolve) => {
+      markFirstLockAcquired = resolve;
+    });
+    let releaseFirstLock!: () => void;
+    const firstLockRelease = new Promise<void>((resolve) => {
+      releaseFirstLock = resolve;
+    });
+    let markSecondTransactionStarted!: (backendPid: number) => void;
+    const secondTransactionStarted = new Promise<number>((resolve) => {
+      markSecondTransactionStarted = resolve;
+    });
+
+    // Pause the first service call only after its real SELECT ... FOR UPDATE
+    // has returned. The second call uses another pooled connection and must
+    // remain inside PostgreSQL's lock wait until the first transaction commits.
+    const lockingRepository = new (class extends EventsRepository {
+      private transactionOrdinal = 0;
+      private lockedEventReads = 0;
+
+      override transaction<T>(
+        work: (manager: EntityManager) => Promise<T>,
+      ): Promise<T> {
+        const transactionOrdinal = ++this.transactionOrdinal;
+        return super.transaction(async (manager) => {
+          if (transactionOrdinal === 2) {
+            const [connection] = (await manager.query(
+              `SELECT pg_backend_pid() AS pid`,
+            )) as Array<{ pid: number }>;
+            if (!connection) throw new Error('Failed to identify PostgreSQL backend.');
+            markSecondTransactionStarted(connection.pid);
+          }
+          return work(manager);
+        });
+      }
+
+      override async findOwnedEvent(
+        ...args: Parameters<EventsRepository['findOwnedEvent']>
+      ) {
+        const event = await super.findOwnedEvent(...args);
+        if (args[3] && ++this.lockedEventReads === 1) {
+          markFirstLockAcquired();
+          await firstLockRelease;
+        }
+        return event;
+      }
+    })(AppDataSource);
+    const concurrentService = new EventsService(lockingRepository, new GeoService());
+
+    const firstPublish = concurrentService.publishEvent(owner.id, draft.id, NOW);
+    await firstLockAcquired;
+    const secondPublish = concurrentService.publishEvent(owner.id, draft.id, NOW);
+    const outcomes = Promise.allSettled([firstPublish, secondPublish]);
+    const secondBackendPid = await secondTransactionStarted;
+
+    let secondWaitedOnLock: boolean;
+    try {
+      secondWaitedOnLock = await waitForPostgresLockWait(secondBackendPid);
+    } finally {
+      releaseFirstLock();
+    }
+
+    const [firstOutcome, secondOutcome] = await outcomes;
+    expect(secondWaitedOnLock).toBe(true);
+    expect(firstOutcome).toMatchObject({
+      status: 'fulfilled',
+      value: { status: EventStatus.Active },
+    });
+    expect(secondOutcome).toMatchObject({
+      status: 'rejected',
+      reason: expect.any(EventPublishNotAllowedError),
+    });
+
+    const history = (await AppDataSource.query(
+      `SELECT to_status, reason
+         FROM event_status_history
+        WHERE event_id = $1
+        ORDER BY created_at ASC, id ASC`,
+      [draft.id],
+    )) as Array<Record<string, unknown>>;
+    expect(history).toEqual([
+      { to_status: EventStatus.Draft, reason: 'created' },
+      { to_status: EventStatus.Active, reason: 'host_publish' },
     ]);
   });
 
