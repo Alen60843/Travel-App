@@ -121,6 +121,31 @@ export interface TaskRunState {
   readonly handoffRepairAttempts: readonly HandoffRepairAttemptRecord[];
   /** Explicit agent/process failure recoveries, oldest first; never rewritten or removed. */
   readonly agentFailureRecoveries?: readonly AgentFailureRecoveryState[];
+  /**
+   * Crash-safety checkpoints for salvaging a timed-out writer's dirty
+   * worktree (AgentOrchestrator.salvageTask). Present only once salvage has
+   * been authorized for this task. `verification` is present only once
+   * salvage.verify has actually passed, and is bound to the exact diff/
+   * config it validated — see SalvageVerificationCheckpoint.
+   */
+  readonly salvage?: {
+    readonly authorizedAt: string;
+    readonly verification?: SalvageVerificationCheckpoint;
+  };
+}
+
+/**
+ * Binds a passing salvage.verify result to the exact tracked-file diff and
+ * verify command list it validated, so a crash-resumed salvage only reuses
+ * this checkpoint (skipping a costly re-run) when nothing relevant has
+ * changed since it was recorded — never against a since-mutated worktree or
+ * a since-edited config.
+ */
+export interface SalvageVerificationCheckpoint {
+  readonly worktreeHeadSha: string;
+  readonly trackedDiffFingerprint: string;
+  readonly verifyConfigFingerprint: string;
+  readonly result: 'passed';
 }
 
 export interface IntegrationRunState {
@@ -253,6 +278,9 @@ export const RUN_EVENT_NAMES = [
   'INTEGRATION_PREPARATION_STARTED',
   'INTEGRATION_PREPARATION_COMMAND_FINISHED',
   'INTEGRATION_PREPARATION_FAILED',
+  'SALVAGE_AUTHORIZED',
+  'SALVAGE_VERIFIED',
+  'SALVAGE_VERIFICATION_FAILED',
 ] as const;
 export type RunEventName = (typeof RUN_EVENT_NAMES)[number];
 
@@ -655,6 +683,41 @@ function normalizeHandoffRepairAttempts(
   }];
 }
 
+function parseSalvageVerificationCheckpoint(value: unknown, path: string): SalvageVerificationCheckpoint {
+  if (!isObject(value)) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path} must be an object`);
+  }
+  const result = string(value.result, `${path}.result`);
+  if (result !== 'passed') {
+    throw new OrchestratorError('STATE_CORRUPT', `${path}.result is invalid`);
+  }
+  return {
+    worktreeHeadSha: (() => {
+      const sha = string(value.worktreeHeadSha, `${path}.worktreeHeadSha`);
+      assertFullSha(sha, `${path}.worktreeHeadSha`);
+      return sha;
+    })(),
+    trackedDiffFingerprint: string(value.trackedDiffFingerprint, `${path}.trackedDiffFingerprint`),
+    verifyConfigFingerprint: string(value.verifyConfigFingerprint, `${path}.verifyConfigFingerprint`),
+    result: 'passed',
+  };
+}
+
+function parseSalvageState(
+  value: unknown,
+  path: string,
+): { readonly authorizedAt: string; readonly verification?: SalvageVerificationCheckpoint } {
+  if (!isObject(value)) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path} must be an object`);
+  }
+  return {
+    authorizedAt: timestamp(value.authorizedAt, `${path}.authorizedAt`),
+    ...(value.verification === undefined
+      ? {}
+      : { verification: parseSalvageVerificationCheckpoint(value.verification, `${path}.verification`) }),
+  };
+}
+
 function parseTask(value: unknown, key: string): TaskRunState {
   const path = `tasks.${key}`;
   if (!/^[a-z][a-z0-9-]{0,63}$/.test(key)) {
@@ -773,6 +836,7 @@ function parseTask(value: unknown, key: string): TaskRunState {
         }),
     handoffRepairAttempts: normalizeHandoffRepairAttempts(value, path),
     ...(agentFailureRecoveries === undefined ? {} : { agentFailureRecoveries }),
+    ...(value.salvage === undefined ? {} : { salvage: parseSalvageState(value.salvage, `${path}.salvage`) }),
   };
 }
 

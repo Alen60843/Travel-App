@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 
@@ -19,6 +19,7 @@ import {
   GitClient,
   WorktreeManager,
   assertBaseBranchUnmoved,
+  computeTrackedDiffFingerprint,
   ensureTaskCommit,
   inspectTaskCommits,
   integrateTaskCommits,
@@ -60,7 +61,9 @@ import {
   assertChangedFileOwnership,
   assertNoParallelOwnershipOverlap,
   assertReviewRoundAllowed,
+  matchesOwnershipPattern,
   severityAtLeast,
+  validateChangedFileOwnership,
   type TaskCondition,
   type TaskSpec,
   type TaskStatus,
@@ -153,6 +156,20 @@ type HandoffRecoveryEligibilityReasonCode =
   | 'HANDOFF_ORIGINAL_LOG_MISSING'
   | 'HANDOFF_REPAIR_BUDGET_EXHAUSTED';
 
+/** Stable, machine-readable eligibility-failure classification for salvage-task — same pattern as HandoffRecoveryEligibilityReasonCode. */
+type SalvageEligibilityReasonCode =
+  | 'SALVAGE_NOT_TIMED_OUT'
+  | 'SALVAGE_COMMIT_ALREADY_RECORDED'
+  | 'SALVAGE_WORKTREE_NOT_REGISTERED'
+  | 'SALVAGE_WORKTREE_HEAD_MOVED'
+  | 'SALVAGE_WORKTREE_HAS_FOREIGN_COMMITS'
+  | 'SALVAGE_WORKTREE_CLEAN'
+  | 'SALVAGE_OWNERSHIP_VIOLATION'
+  | 'SALVAGE_UNEXPECTED_UNTRACKED_FILE'
+  | 'SALVAGE_DIFF_CHECK_FAILED'
+  | 'SALVAGE_ALREADY_INTEGRATED'
+  | 'SALVAGE_DEPENDENCY_UNSATISFIED';
+
 type HandoffRepairMethod = 'framing' | 'deterministic' | 'agent';
 type HandoffRepairFailureReason = 'agent_invocation_failed' | 'evidence_insufficient' | 'contradiction_detected';
 type RepairOutcome =
@@ -172,6 +189,13 @@ export interface AgentFailureRetryResult {
   readonly taskId: string;
   readonly recovery: AgentFailureRecoveryState;
   readonly reopenedTasks: readonly string[];
+}
+
+/** Result of AgentOrchestrator.salvageTask. */
+export interface SalvageResult {
+  readonly orchestrator: AgentOrchestrator;
+  readonly taskId: string;
+  readonly commitSha: string;
 }
 
 export async function planPhase(
@@ -905,6 +929,160 @@ export class AgentOrchestrator {
       summary: fix.summary,
     });
     return orchestrator;
+  }
+
+  /**
+   * Salvages useful work a timed-out writer left behind in its dirty
+   * worktree. A dirty diff is only evidence, never success on its own:
+   * eligibility (ownership/foreign-commit/diff-check-clean) -> deterministic
+   * salvage.verify (never trusting operator prose) -> a diff/config-bound
+   * SALVAGE_VERIFIED checkpoint -> the Orchestrator (never salvage code
+   * itself) creates the commit via the same ensureTaskCommit/
+   * assertChangedFileOwnership path applyIntegrationFix already uses. No
+   * canonical-finding handling yet at this step (see the follow-up task
+   * that adds it) — a task with no required canonical findings goes
+   * straight from a passing verification to a synthesized handoff and
+   * succeedTask, exactly like any other task completion.
+   */
+  static async salvageTask(
+    runId: string,
+    taskId: string,
+    options: OrchestratorOptions,
+  ): Promise<SalvageResult> {
+    const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options);
+    const checked = await orchestrator.checkSalvageEligibility(taskId);
+    if (!checked.eligible) {
+      throw new OrchestratorError(
+        'TASK_STATE_INVALID',
+        `Refusing salvage for ${taskId}: ${checked.reason}`,
+        { details: { runId, taskId, reason: checked.reason, reasonCode: checked.reasonCode } },
+      );
+    }
+    const taskSpec = orchestrator.config.tasks.find((task) => task.id === taskId)!;
+    const preparedHeadSha = orchestrator.state.tasks[taskId]!.preparedHeadSha!;
+
+    if (orchestrator.state.tasks[taskId]?.salvage === undefined) {
+      await orchestrator.mutate((state) => updateTask(state, taskId, (task) => ({
+        ...task,
+        salvage: { authorizedAt: orchestrator.clock().toISOString() },
+      })));
+      await orchestrator.event('SALVAGE_AUTHORIZED', taskId, {});
+    }
+
+    const verifyConfigFingerprint = createHash('sha256')
+      .update(JSON.stringify(orchestrator.config.salvage.verify), 'utf8')
+      .digest('hex');
+    const existingCheckpoint = orchestrator.state.tasks[taskId]?.salvage?.verification;
+    const currentDiffFingerprint = await computeTrackedDiffFingerprint(
+      orchestrator.git, checked.worktree.path, preparedHeadSha,
+    );
+    const checkpointValid = existingCheckpoint !== undefined
+      && existingCheckpoint.worktreeHeadSha === preparedHeadSha
+      && existingCheckpoint.trackedDiffFingerprint === currentDiffFingerprint
+      && existingCheckpoint.verifyConfigFingerprint === verifyConfigFingerprint;
+
+    if (!checkpointValid) {
+      if (orchestrator.config.agentWorktree.prepare.length > 0) {
+        const prepared = await new IntegrationGate().run({
+          cwd: checked.worktree.path,
+          logsDirectory: join(orchestrator.stateStore.runDirectory, 'logs', taskId, 'salvage-prepare'),
+          commands: orchestrator.config.agentWorktree.prepare,
+          ...(orchestrator.signal === undefined ? {} : { signal: orchestrator.signal }),
+        });
+        if (!prepared.passed) {
+          throw new OrchestratorError(
+            'AGENT_WORKTREE_PREPARATION_FAILED',
+            `Refusing salvage for ${taskId}: worktree preparation failed`,
+            { details: { runId, taskId } },
+          );
+        }
+      }
+      if (orchestrator.config.salvage.verify.length === 0) {
+        throw new OrchestratorError(
+          'SALVAGE_VERIFICATION_FAILED',
+          `Refusing salvage for ${taskId}: no salvage.verify commands configured`,
+          { details: { runId, taskId, reason: 'no_verify_configured' } },
+        );
+      }
+      const preFingerprint = await computeTrackedDiffFingerprint(
+        orchestrator.git, checked.worktree.path, preparedHeadSha,
+      );
+      const verified = await new IntegrationGate().run({
+        cwd: checked.worktree.path,
+        logsDirectory: join(orchestrator.stateStore.runDirectory, 'logs', taskId, 'salvage-verify'),
+        commands: orchestrator.config.salvage.verify,
+        ...(orchestrator.signal === undefined ? {} : { signal: orchestrator.signal }),
+      });
+      const postFingerprint = await computeTrackedDiffFingerprint(
+        orchestrator.git, checked.worktree.path, preparedHeadSha,
+      );
+      // Mutation detection takes priority over the commands' own exit
+      // codes: a verify command must never silently become another writer,
+      // even one that happens to also report success.
+      if (postFingerprint !== preFingerprint) {
+        await orchestrator.event('SALVAGE_VERIFICATION_FAILED', taskId, { reason: 'verify_mutated_tracked_source' });
+        throw new OrchestratorError(
+          'SALVAGE_VERIFICATION_FAILED',
+          `Refusing salvage for ${taskId}: verify commands modified tracked source`,
+          { details: { runId, taskId, reason: 'verify_mutated_tracked_source' } },
+        );
+      }
+      if (!verified.passed) {
+        await orchestrator.event('SALVAGE_VERIFICATION_FAILED', taskId, { reason: 'verify_command_failed' });
+        throw new OrchestratorError(
+          'SALVAGE_VERIFICATION_FAILED',
+          `Refusing salvage for ${taskId}: required verify command failed`,
+          { details: { runId, taskId, reason: 'verify_command_failed' } },
+        );
+      }
+      await orchestrator.mutate((state) => updateTask(state, taskId, (task) => ({
+        ...task,
+        salvage: {
+          authorizedAt: task.salvage!.authorizedAt,
+          verification: {
+            worktreeHeadSha: preparedHeadSha,
+            trackedDiffFingerprint: postFingerprint,
+            verifyConfigFingerprint,
+            result: 'passed',
+          },
+        },
+      })));
+      await orchestrator.event('SALVAGE_VERIFIED', taskId, {});
+    }
+
+    const ensured = await ensureTaskCommit(orchestrator.git, {
+      worktreePath: checked.worktree.path,
+      baseSha: preparedHeadSha,
+      agent: taskSpec.owner,
+      taskId,
+      summary: `Salvaged timed-out writer work for ${taskId}`,
+    });
+    // Same ownership enforcement every task commit already goes through —
+    // salvage is not exempt merely because the original agent never
+    // produced a handoff.
+    assertChangedFileOwnership(taskId, ensured.changedFiles, taskSpec.files);
+
+    const handoff: StructuredHandoff = {
+      status: 'complete',
+      summary: `Salvaged timed-out writer work for ${taskId} after deterministic verification.`,
+      filesChanged: [...ensured.changedFiles],
+      decisions: [],
+      tests: orchestrator.config.salvage.verify.map((command) => ({
+        command: command.command,
+        result: 'pass' as const,
+        details: 'salvage.verify required command passed',
+      })),
+      openQuestions: [],
+      reviewRequested: [],
+    };
+    const handoffPath = await writeHandoff(join(orchestrator.stateStore.runDirectory, 'handoffs'), taskId, handoff);
+    await orchestrator.succeedTask(taskId, handoffPath, {
+      sha: ensured.commitSha,
+      parentSha: preparedHeadSha,
+      changedFiles: [...ensured.changedFiles],
+    });
+
+    return { orchestrator, taskId, commitSha: ensured.commitSha };
   }
 
   snapshot(): RunState {
@@ -2815,6 +2993,164 @@ export class AgentOrchestrator {
       return { eligible: false, reason: `preserved worktree checkpoint is invalid: ${errorText(error)}` };
     }
     return { eligible: true, reason: '' };
+  }
+
+  /**
+   * Salvage eligibility for a timed-out writer's dirty worktree — the
+   * structural mirror of checkAgentFailureRetryEligibility, inverted on
+   * dirtiness: retry-agent requires a CLEAN preserved worktree (no partial
+   * work); salvage requires a DIRTY one whose every changed tracked file is
+   * inside the task's own ownership globs, with no foreign commits and no
+   * unexpected untracked files. AGENT_FAILED (a process crash) is
+   * deliberately out of scope here — only a completed AGENT_TIMEOUT attempt
+   * qualifies; a crashed process is a different failure shape and folding it
+   * in without a real example to validate against would be scope creep.
+   */
+  private async checkSalvageEligibility(taskId: string): Promise<
+    | { readonly eligible: true; readonly worktree: OwnedWorktree; readonly trackedChanged: readonly string[] }
+    | { readonly eligible: false; readonly reason: string; readonly reasonCode: SalvageEligibilityReasonCode }
+  > {
+    const taskSpec = this.config.tasks.find((task) => task.id === taskId);
+    const taskState = this.state.tasks[taskId];
+    if (taskSpec === undefined || taskState === undefined) {
+      return { eligible: false, reason: 'task id does not exist in this run', reasonCode: 'SALVAGE_NOT_TIMED_OUT' };
+    }
+    const lastAttempt = taskState.agentAttempts.at(-1);
+    const timedOut = taskState.error?.code === 'AGENT_TIMEOUT' && lastAttempt?.outcome === 'timed_out';
+    if ((taskState.status !== 'FAILED' && taskState.status !== 'BLOCKED') || !timedOut) {
+      return {
+        eligible: false,
+        reason: 'task did not end in a completed AGENT_TIMEOUT agent attempt',
+        reasonCode: 'SALVAGE_NOT_TIMED_OUT',
+      };
+    }
+    if (taskState.commit !== undefined) {
+      return {
+        eligible: false,
+        reason: 'a task commit is already recorded for this task',
+        reasonCode: 'SALVAGE_COMMIT_ALREADY_RECORDED',
+      };
+    }
+    if (
+      this.state.integration.integratedTaskCommits.length > 0
+      || (this.state.integration.integrationFixCommits?.length ?? 0) > 0
+    ) {
+      return {
+        eligible: false,
+        reason: 'integration has already consumed committed work for this run',
+        reasonCode: 'SALVAGE_ALREADY_INTEGRATED',
+      };
+    }
+    const unsatisfiedDependencies = taskSpec.dependsOn.filter((dependencyId) => {
+      const status = this.state.tasks[dependencyId]?.status;
+      return status !== 'SUCCEEDED' && status !== 'SKIPPED';
+    });
+    if (unsatisfiedDependencies.length > 0) {
+      return {
+        eligible: false,
+        reason: `dependencies are not satisfied: ${unsatisfiedDependencies.join(', ')}`,
+        reasonCode: 'SALVAGE_DEPENDENCY_UNSATISFIED',
+      };
+    }
+    if (
+      taskState.worktreePath === undefined
+      || taskState.branch === undefined
+      || taskState.preparedHeadSha === undefined
+    ) {
+      return {
+        eligible: false,
+        reason: 'no preserved worktree path / prepared SHA recorded for this task',
+        reasonCode: 'SALVAGE_WORKTREE_NOT_REGISTERED',
+      };
+    }
+    let worktree: OwnedWorktree;
+    try {
+      worktree = await this.worktrees.assertRegistered(taskState.worktreePath);
+    } catch (error) {
+      return {
+        eligible: false,
+        reason: `preserved worktree is not registered/present: ${errorText(error)}`,
+        reasonCode: 'SALVAGE_WORKTREE_NOT_REGISTERED',
+      };
+    }
+    let headSha: string;
+    try {
+      headSha = await this.git.resolveCommit(worktree.path, 'HEAD');
+    } catch (error) {
+      return {
+        eligible: false,
+        reason: `preserved worktree HEAD could not be resolved: ${errorText(error)}`,
+        reasonCode: 'SALVAGE_WORKTREE_NOT_REGISTERED',
+      };
+    }
+    if (headSha !== taskState.preparedHeadSha) {
+      return {
+        eligible: false,
+        reason: 'worktree HEAD has moved past the SHA prepared for this task',
+        reasonCode: 'SALVAGE_WORKTREE_HEAD_MOVED',
+      };
+    }
+    const ancestorLog = await this.git.run(
+      worktree.path, ['log', '--format=%H', `${taskState.preparedHeadSha}..HEAD`],
+    );
+    if (ancestorLog.stdout.trim().length > 0) {
+      return {
+        eligible: false,
+        reason: 'worktree already has commits beyond the prepared SHA',
+        reasonCode: 'SALVAGE_WORKTREE_HAS_FOREIGN_COMMITS',
+      };
+    }
+    const status = await this.git.run(
+      worktree.path, ['status', '--porcelain=v1', '-z', '--untracked-files=all'],
+    );
+    const entries = status.stdout.split('\0').filter((entry) => entry.length > 0);
+    if (entries.length === 0) {
+      return {
+        eligible: false,
+        reason: 'worktree has no dirty changes to salvage',
+        reasonCode: 'SALVAGE_WORKTREE_CLEAN',
+      };
+    }
+    const trackedChanged: string[] = [];
+    const untrackedNew: string[] = [];
+    for (const entry of entries) {
+      const marker = entry.slice(0, 2);
+      const path = entry.slice(3);
+      if (marker === '??') {
+        untrackedNew.push(path);
+      } else {
+        trackedChanged.push(path);
+      }
+    }
+    const ownershipCheck = validateChangedFileOwnership(trackedChanged, taskSpec.files);
+    if (ownershipCheck.violations.length > 0) {
+      return {
+        eligible: false,
+        reason: `tracked changes outside ownership: ${ownershipCheck.violations.join(', ')}`,
+        reasonCode: 'SALVAGE_OWNERSHIP_VIOLATION',
+      };
+    }
+    const untrackedViolations = untrackedNew.filter(
+      (path) => !taskSpec.files.some((pattern) => matchesOwnershipPattern(path, pattern)),
+    );
+    if (untrackedViolations.length > 0) {
+      return {
+        eligible: false,
+        reason: `unexpected untracked files: ${untrackedViolations.join(', ')}`,
+        reasonCode: 'SALVAGE_UNEXPECTED_UNTRACKED_FILE',
+      };
+    }
+    const diffCheck = await this.git.run(
+      worktree.path, ['diff', '--check', taskState.preparedHeadSha], { allowFailure: true },
+    );
+    if (diffCheck.exitCode !== 0) {
+      return {
+        eligible: false,
+        reason: 'git diff --check reported whitespace/conflict-marker errors',
+        reasonCode: 'SALVAGE_DIFF_CHECK_FAILED',
+      };
+    }
+    return { eligible: true, worktree, trackedChanged };
   }
 
   /**
