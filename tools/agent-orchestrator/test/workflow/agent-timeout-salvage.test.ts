@@ -3,7 +3,7 @@ import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import type { Agent, AgentRequest, AgentResult } from '../../src/agents';
+import type { Agent, AgentName, AgentRequest, AgentResult } from '../../src/agents';
 import { isOrchestratorError } from '../../src/errors';
 import { WorktreeManager } from '../../src/git';
 import { AgentOrchestrator } from '../../src/orchestrator';
@@ -388,6 +388,233 @@ test('a task with a recorded commit already cannot be salvaged again (duplicate 
         assert.equal((error.details as unknown as { reasonCode?: string }).reasonCode, 'SALVAGE_NOT_TIMED_OUT');
         return true;
       },
+    );
+  } finally {
+    await scenario.fixture.dispose();
+  }
+});
+
+
+// --- Canonical finding handling during salvage --------------------------
+//
+// Reuses the exact adaptive correction-lifecycle shape from
+// test/adaptive/adaptive-correction-integration.test.ts (a live
+// changes_requested final_review authorizes one root correction work
+// unit requiring canonical finding F001), but the correction-role agent
+// writes its fix to the worktree and then FAILS the process (simulating
+// what a real timeout leaves behind: a dirty, evidence-backed diff with
+// no accepted handoff) instead of completing normally. The failed
+// attempt's outcome/error are then rewritten to the AGENT_TIMEOUT shape
+// via the same direct stateStore.save technique used throughout this
+// file and in test/workflow/agent-failure-retry.test.ts, leaving the
+// dirty worktree untouched.
+
+class CorrectionTimeoutAgent implements Agent {
+  readonly invocations: AgentRequest[] = [];
+  constructor(
+    readonly name: AgentName,
+    private readonly repairBehavior: 'succeed' | 'omit' = 'succeed',
+  ) {}
+
+  async run(request: AgentRequest): Promise<AgentResult> {
+    this.invocations.push(request);
+    await request.onStarted?.(process.pid);
+    let structuredHandoff: unknown = null;
+    let status: AgentResult['status'] = 'succeeded';
+    let failureCode: AgentResult['failureCode'] = null;
+    if (request.role === 'final_review') {
+      structuredHandoff = {
+        status: 'changes_requested',
+        findings: [{
+          id: 'F001', severity: 'medium', category: 'correctness', file: 'feature.txt', location: 'line 1',
+          problem: 'feature remains buggy', evidence: 'the persisted implementation contains buggy',
+          impact: 'incorrect result', suggestedFix: 'replace buggy with fixed', verificationRequired: 'read the corrected file',
+        }],
+        additionalWorkRequests: [{
+          role: 'correction', concern: 'review', objective: 'agent child must remain denied',
+          reason: 'finding proposal', dependencies: [], capabilities: [{ capability: 'typescript_backend_editing' }],
+          resourceClaims: [{ kind: 'repository_path', key: 'feature.txt', mode: 'write' }],
+          evidence: [{ kind: 'finding', reference: 'F001', summary: 'untrusted child proposal' }],
+          risk: 'medium', priority: 80,
+        }],
+      };
+    } else if (request.role === 'correction') {
+      await writeFile(join(request.worktreePath, 'feature.txt'), 'fixed\n', 'utf8');
+      status = 'failed';
+      failureCode = 'AGENT_FAILED';
+      structuredHandoff = null;
+    } else if (request.role === 'handoff_repair') {
+      const spec = request.taskSpecification as {
+        malformedOutput: Record<string, unknown>;
+        requiredCanonicalFindings: Array<{ findingId: string; canonicalFindingKey: string }>;
+      };
+      structuredHandoff = this.repairBehavior === 'omit'
+        ? { ...spec.malformedOutput }
+        : {
+            ...spec.malformedOutput,
+            findingResponses: [{
+              findingId: 'F001',
+              canonicalFindingKey: spec.requiredCanonicalFindings[0]!.canonicalFindingKey,
+              decision: 'confirmed', resolution: 'resolved',
+              evidence: 'salvaged diff contains the fix', fix: 'replaced buggy with fixed',
+              verification: 'salvage.verify required command passed',
+            }],
+          };
+    } else {
+      structuredHandoff = { status: 'approved', findings: [] };
+    }
+    const now = new Date().toISOString();
+    return {
+      agent: this.name, runId: request.runId, taskId: request.taskId, status, failureCode,
+      exitCode: status === 'succeeded' ? 0 : 1, signal: null,
+      stdoutPath: join(request.artifactsDirectory, `${request.taskId}.stdout`),
+      stderrPath: join(request.artifactsDirectory, `${request.taskId}.stderr`),
+      structuredHandoff, changedFiles: [], gitDiffSummary: null, testsReported: [], unresolvedQuestions: [],
+      startedAt: now, endedAt: now, durationMs: 0, timedOut: false, aborted: false, errorMessage: null,
+    };
+  }
+}
+
+function adaptiveCorrectionPhaseYaml(baseBranch: string): string {
+  return `mode: adaptive
+phase: salvage-canonical-test
+name: Adaptive correction salvage
+baseBranch: ${baseBranch}
+canonicalDesignDocument: design.md
+goal: Review and correct one canonical finding
+constraints: [Use only canonical evidence]
+policy:
+  allowedConcerns: [review]
+  allowedOwnership: [feature.txt]
+  allowedResources: []
+  limits:
+    maxConcurrentAgents: 2
+    maxAgentInvocations: 8
+    maxTotalWorkUnits: 10
+    maxDecompositionDepth: 2
+    maxFanOutPerWorkUnit: 3
+    maxSynthesisInputs: 2
+    maxWallClockMs: 600000
+  requireEvidenceForExpansion: true
+  agingIntervalMs: 1000
+  agingStep: 1
+  humanApprovalRisks: []
+  correctionPolicy:
+    allowedOwnership: [feature.txt]
+    allowedRoles: [correction, testing]
+    requireCanonicalFinding: true
+    maxRounds: 2
+initialCandidates:
+  - role: final_review
+    concern: review
+    objective: Canonical review
+    reason: Independent verdict is required
+    evidence: [{ kind: file, reference: feature.txt, summary: implementation }]
+    resourceClaims: [{ kind: repository_path, key: feature.txt, mode: read }]
+    capabilities: [{ capability: review }]
+    risk: medium
+    priority: 90
+executors:
+  - id: reviewer
+    adapter: claude
+    capabilities: [{ capability: review }]
+    roles: [review, final_review]
+    effort: high
+  - id: writer
+    adapter: codex
+    capabilities: [{ capability: typescript_backend_editing }, { capability: testing }]
+    roles: [correction, testing]
+    effort: high
+agentRetries: 0
+agentTimeoutMs: 60000
+salvage:
+  verify:
+    - command: "true"
+      required: true
+integration:
+  prepare: []
+  commands:
+    - command: "true"
+      required: true
+  diagnostics: []
+`;
+}
+
+async function createAdaptiveTimeoutScenario(repairBehavior: 'succeed' | 'omit'): Promise<{
+  readonly fixture: TemporaryRepository;
+  readonly runsRoot: string;
+  readonly runId: string;
+  readonly correctionTaskId: string;
+}> {
+  const fixture = await createTemporaryRepository();
+  await writeFile(join(fixture.repository, 'design.md'), '# contract\n', 'utf8');
+  await writeFile(join(fixture.repository, 'feature.txt'), 'buggy\n', 'utf8');
+  await fixture.git.run(fixture.repository, ['add', '--', 'design.md', 'feature.txt']);
+  await fixture.git.run(fixture.repository, ['commit', '-m', 'implementation']);
+  const phaseFile = join(fixture.container, 'phase.yaml');
+  const runsRoot = join(fixture.container, 'runs');
+  await writeFile(phaseFile, adaptiveCorrectionPhaseYaml(fixture.baseBranch), 'utf8');
+  const codex = new CorrectionTimeoutAgent('codex', repairBehavior);
+  const claude = new CorrectionTimeoutAgent('claude', repairBehavior);
+  const orchestrator = await AgentOrchestrator.start(phaseFile, {
+    repositoryPath: fixture.repository, runsRoot, agents: { codex, claude },
+  });
+  const runId = orchestrator.snapshot().runId;
+  const completed = await orchestrator.execute();
+  const correctionTaskId = Object.entries(completed.tasks).find(
+    ([, task]) => task.error?.code === 'AGENT_FAILED',
+  )?.[0];
+  if (correctionTaskId === undefined) {
+    throw new Error(`expected exactly one AGENT_FAILED correction task, got: ${JSON.stringify(completed.tasks)}`);
+  }
+  const correctionTask = completed.tasks[correctionTaskId]!;
+  await orchestrator.stateStore.save({
+    ...completed,
+    status: 'BLOCKED',
+    tasks: {
+      ...completed.tasks,
+      [correctionTaskId]: {
+        ...correctionTask,
+        status: 'BLOCKED',
+        agentAttempts: [
+          ...correctionTask.agentAttempts.slice(0, -1),
+          { ...correctionTask.agentAttempts.at(-1)!, outcome: 'timed_out' },
+        ],
+        error: { code: 'AGENT_TIMEOUT', message: 'bounded execution timeout', at: completed.createdAt },
+      },
+    },
+  });
+
+  return { fixture, runsRoot, runId, correctionTaskId };
+}
+
+test('salvage of a task with a required canonical finding synthesizes a handoff and attaches a valid findingResponses entry via the repair cascade', async () => {
+  const scenario = await createAdaptiveTimeoutScenario('succeed');
+  try {
+    const result = await AgentOrchestrator.salvageTask(scenario.runId, scenario.correctionTaskId, {
+      repositoryPath: scenario.fixture.repository,
+      runsRoot: scenario.runsRoot,
+      agents: { codex: new CorrectionTimeoutAgent('codex', 'succeed'), claude: new CorrectionTimeoutAgent('claude', 'succeed') },
+    });
+    const after = result.orchestrator.snapshot();
+    assert.equal(after.tasks[scenario.correctionTaskId]?.status, 'SUCCEEDED');
+    assert.equal(after.tasks[scenario.correctionTaskId]?.handoffOutcome, 'valid');
+    assert.ok(after.tasks[scenario.correctionTaskId]?.commit?.sha);
+  } finally {
+    await scenario.fixture.dispose();
+  }
+});
+
+test('salvage fails closed if the repair cascade cannot produce a valid findingResponses entry for a required canonical finding', async () => {
+  const scenario = await createAdaptiveTimeoutScenario('omit');
+  try {
+    await assert.rejects(
+      () => AgentOrchestrator.salvageTask(scenario.runId, scenario.correctionTaskId, {
+        repositoryPath: scenario.fixture.repository,
+        runsRoot: scenario.runsRoot,
+        agents: { codex: new CorrectionTimeoutAgent('codex', 'omit'), claude: new CorrectionTimeoutAgent('claude', 'omit') },
+      }),
+      (error: unknown) => isOrchestratorError(error, 'HANDOFF_INVALID'),
     );
   } finally {
     await scenario.fixture.dispose();

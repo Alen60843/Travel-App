@@ -1062,7 +1062,21 @@ export class AgentOrchestrator {
     // produced a handoff.
     assertChangedFileOwnership(taskId, ensured.changedFiles, taskSpec.files);
 
-    const handoff: StructuredHandoff = {
+    // A timed-out writer never produced a handoff at all, so one is
+    // synthesized here from the salvaged diff and verify evidence. If the
+    // task carries required canonical findings, this shell deliberately
+    // omits findingResponses, which routes it through the exact same
+    // parseOrRepairHandoff -> repairHandoff -> repairHandoffViaAgent
+    // cascade Part A hardened — the identical bounded, evidence-only
+    // repair, never a canonical-validation bypass. A task with no required
+    // canonical findings passes straight through with no repair attempt at
+    // all (validateCanonicalFindingResponses is a no-op for an empty
+    // requirement list).
+    const requiredCanonicalFindings = orchestrator.requiredCanonicalFindings(taskId);
+    const finalDiff = (await orchestrator.git.run(
+      checked.worktree.path, ['diff', '--no-ext-diff', '--no-color', preparedHeadSha],
+    )).stdout;
+    const synthesizedHandoff = {
       status: 'complete',
       summary: `Salvaged timed-out writer work for ${taskId} after deterministic verification.`,
       filesChanged: [...ensured.changedFiles],
@@ -1075,7 +1089,14 @@ export class AgentOrchestrator {
       openQuestions: [],
       reviewRequested: [],
     };
-    const handoffPath = await writeHandoff(join(orchestrator.stateStore.runDirectory, 'handoffs'), taskId, handoff);
+    const parsed = await orchestrator.parseOrRepairHandoff(
+      taskSpec, synthesizedHandoff, null, requiredCanonicalFindings, finalDiff,
+    );
+    await orchestrator.recordHandoffOutcome(taskId, parsed.outcome);
+    if (parsed.handoff === null) {
+      throw parsed.error;
+    }
+    const handoffPath = await writeHandoff(join(orchestrator.stateStore.runDirectory, 'handoffs'), taskId, parsed.handoff);
     await orchestrator.succeedTask(taskId, handoffPath, {
       sha: ensured.commitSha,
       parentSha: preparedHeadSha,
