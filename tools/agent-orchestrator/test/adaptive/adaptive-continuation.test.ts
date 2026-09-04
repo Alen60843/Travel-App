@@ -268,9 +268,15 @@ class ContinuationAgent implements Agent {
   }
 }
 
+type RepairBehavior = 'succeed' | 'throw' | 'contradict';
+
 class SemanticRepairAgent implements Agent {
   readonly invocations: AgentRequest[] = [];
-  constructor(readonly name: 'codex' | 'claude', private readonly supported = true) {}
+  constructor(
+    readonly name: 'codex' | 'claude',
+    private readonly supported = true,
+    private readonly repairBehavior: RepairBehavior = 'succeed',
+  ) {}
 
   async run(request: AgentRequest): Promise<AgentResult> {
     this.invocations.push(request);
@@ -295,8 +301,14 @@ class SemanticRepairAgent implements Agent {
       assert.match(spec.deterministicTaskEvidence.taskDiff, /corrected F001/);
       assert.equal(spec.requiredCanonicalFindings[0]?.findingId, 'F001');
       assert.ok(spec.requiredCanonicalFindings[0]?.finding);
+      if (this.repairBehavior === 'throw') {
+        throw new Error('simulated agent-invocation-layer failure (e.g. empty/crashed process output)');
+      }
       structuredHandoff = {
         ...spec.malformedOutput,
+        // 'contradict' rewrites a field OTHER than findingResponses, which the
+        // real repair path must detect and reject as a silent semantic rewrite.
+        ...(this.repairBehavior === 'contradict' ? { summary: 'a different, unrequested summary' } : {}),
         findingResponses: [{
           findingId: 'F001', canonicalFindingKey: spec.requiredCanonicalFindings[0]!.canonicalFindingKey,
           decision: 'confirmed', resolution: 'resolved', evidence: 'task diff contains correction',
@@ -587,8 +599,11 @@ test('canonical-incomplete handoff receives one bounded metadata-only repair and
     assert.deepEqual(codex.invocations.map((request) => request.role), ['correction', 'handoff_repair']);
     const correction = Object.values(completed.tasks).find((task) => task.commit !== undefined)!;
     assert.deepEqual(correction.commit?.changedFiles, ['feature.txt']);
-    assert.equal(correction.handoffRepairAttempts.length > 0, true);
+    assert.equal(correction.handoffRepairAttempts.length, 1);
     assert.equal(correction.handoffRepairAttempts.at(-1)?.succeeded, true);
+    assert.equal(correction.handoffRepairAttempts.at(-1)?.method, 'agent');
+    assert.equal(correction.handoffRepairAttempts.at(-1)?.failureReason, undefined);
+    assert.equal(typeof correction.handoffRepairAttempts.at(-1)?.timestamp, 'string');
     const handoff = JSON.parse(await readFile(correction.handoffPath!, 'utf8')) as { findingResponses: unknown[] };
     assert.equal(handoff.findingResponses.length, 1);
     await orchestrator.cleanup();
@@ -611,6 +626,55 @@ test('semantic repair cannot fabricate resolved success without both diff and pa
     assert.equal(Object.values(failed.tasks)[0]?.error?.code, 'HANDOFF_INVALID');
     assert.equal(Object.values(failed.tasks)[0]?.commit, undefined);
     assert.match(await readFile(join(Object.values(failed.tasks)[0]!.worktreePath!, 'feature.txt'), 'utf8'), /corrected F001/);
+    const failedRecord = Object.values(failed.tasks)[0]!.handoffRepairAttempts;
+    assert.equal(failedRecord.length, 1);
+    assert.equal(failedRecord[0]?.succeeded, false);
+    assert.equal(failedRecord[0]?.failureReason, 'evidence_insufficient');
     // The failed task intentionally preserves its dirty worktree for operator inspection.
+  } finally { await context.fixture.dispose(); }
+});
+
+test('a repair agent that cannot even be invoked classifies as agent_invocation_failed', async () => {
+  const context = await setup(['feature.txt']);
+  try {
+    const phaseFile = join(context.fixture.container, 'continuation.yaml');
+    await writeFile(phaseFile, continuationPhase(context.fixture.baseBranch, context.baseSha), 'utf8');
+    const codex = new SemanticRepairAgent('codex', true, 'throw');
+    const orchestrator = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: context.fixture.repository, runsRoot: context.runsRoot,
+      agents: { codex, claude: new SemanticRepairAgent('claude') },
+    });
+    const failed = await orchestrator.execute();
+    assert.equal(failed.status, 'FAILED');
+    assert.equal(codex.invocations.filter((request) => request.role === 'handoff_repair').length, 1);
+    assert.equal(Object.values(failed.tasks)[0]?.error?.code, 'HANDOFF_INVALID');
+    assert.equal(Object.values(failed.tasks)[0]?.commit, undefined);
+    const record = Object.values(failed.tasks)[0]!.handoffRepairAttempts;
+    assert.equal(record.length, 1);
+    assert.equal(record[0]?.succeeded, false);
+    assert.equal(record[0]?.failureReason, 'agent_invocation_failed');
+    assert.equal(record[0]?.method, 'none');
+  } finally { await context.fixture.dispose(); }
+});
+
+test('a repair agent that silently rewrites original handoff content classifies as contradiction_detected', async () => {
+  const context = await setup(['feature.txt']);
+  try {
+    const phaseFile = join(context.fixture.container, 'continuation.yaml');
+    await writeFile(phaseFile, continuationPhase(context.fixture.baseBranch, context.baseSha), 'utf8');
+    const codex = new SemanticRepairAgent('codex', true, 'contradict');
+    const orchestrator = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: context.fixture.repository, runsRoot: context.runsRoot,
+      agents: { codex, claude: new SemanticRepairAgent('claude') },
+    });
+    const failed = await orchestrator.execute();
+    assert.equal(failed.status, 'FAILED');
+    assert.equal(codex.invocations.filter((request) => request.role === 'handoff_repair').length, 1);
+    assert.equal(Object.values(failed.tasks)[0]?.error?.code, 'HANDOFF_INVALID');
+    assert.equal(Object.values(failed.tasks)[0]?.commit, undefined);
+    const record = Object.values(failed.tasks)[0]!.handoffRepairAttempts;
+    assert.equal(record.length, 1);
+    assert.equal(record[0]?.succeeded, false);
+    assert.equal(record[0]?.failureReason, 'contradiction_detected');
   } finally { await context.fixture.dispose(); }
 });

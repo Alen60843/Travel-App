@@ -47,6 +47,7 @@ import {
   withUpdatedTimestamp,
   type AgentAttemptState,
   type AgentFailureRecoveryState,
+  type HandoffRepairAttemptRecord,
   type RunEventName,
   type RunState,
   type StoredError,
@@ -126,8 +127,14 @@ const HANDOFF_REPAIR_TIMEOUT_MS = 5 * 60 * 1000;
 interface HandoffOutcomeRecord {
   readonly outcome: 'valid' | 'invalid';
   readonly repairAttempted: boolean;
-  readonly repairSucceeded?: boolean;
+  readonly repairRecord?: HandoffRepairAttemptRecord;
 }
+
+type HandoffRepairMethod = 'framing' | 'deterministic' | 'agent';
+type HandoffRepairFailureReason = 'agent_invocation_failed' | 'evidence_insufficient' | 'contradiction_detected';
+type RepairOutcome =
+  | { readonly ok: true; readonly handoff: StructuredHandoff; readonly method: HandoffRepairMethod }
+  | { readonly ok: false; readonly reason: HandoffRepairFailureReason };
 
 /** Result of recoverHandoffFailures: which persisted FAILED tasks were actually recovered, and why any others were left untouched. */
 export interface HandoffRecoveryResult {
@@ -1923,21 +1930,25 @@ export class AgentOrchestrator {
       const repaired = await this.repairHandoff(
         task, rawStructuredHandoff, rawStdout, requiredCanonicalFindings, taskDiff,
       );
+      const record: HandoffRepairAttemptRecord = repaired.ok
+        ? { method: repaired.method, succeeded: true, timestamp: this.clock().toISOString() }
+        : { method: 'none', succeeded: false, failureReason: repaired.reason, timestamp: this.clock().toISOString() };
       await this.event('HANDOFF_REPAIR_ATTEMPTED', task.id, {
-        method: repaired?.method ?? 'none',
-        succeeded: repaired !== null,
+        method: record.method,
+        succeeded: record.succeeded,
+        ...(record.failureReason === undefined ? {} : { failureReason: record.failureReason }),
       });
-      if (repaired === null) {
+      if (!repaired.ok) {
         return {
           handoff: null,
           error,
-          outcome: { outcome: 'invalid', repairAttempted: true, repairSucceeded: false },
+          outcome: { outcome: 'invalid', repairAttempted: true, repairRecord: record },
         };
       }
       return {
         handoff: repaired.handoff,
         error: null,
-        outcome: { outcome: 'valid', repairAttempted: true, repairSucceeded: true },
+        outcome: { outcome: 'valid', repairAttempted: true, repairRecord: record },
       };
     }
   }
@@ -1946,14 +1957,9 @@ export class AgentOrchestrator {
     await this.mutate((state) => updateTask(state, taskId, (task) => ({
       ...task,
       handoffOutcome: outcome.outcome,
-      ...(outcome.repairAttempted
-        ? {
-            handoffRepairAttempts: [
-              ...task.handoffRepairAttempts,
-              { method: 'none' as const, succeeded: outcome.repairSucceeded === true },
-            ],
-          }
-        : {}),
+      ...(outcome.repairRecord === undefined
+        ? {}
+        : { handoffRepairAttempts: [...task.handoffRepairAttempts, outcome.repairRecord] }),
     })));
   }
 
@@ -1979,9 +1985,7 @@ export class AgentOrchestrator {
     rawStdout: string | null,
     requiredCanonicalFindings: readonly RequiredCanonicalFinding[],
     taskDiff: string,
-  ): Promise<
-    { readonly handoff: StructuredHandoff; readonly method: 'framing' | 'deterministic' | 'agent' } | null
-  > {
+  ): Promise<RepairOutcome> {
     const validate = (value: unknown): StructuredHandoff => {
       const handoff = validateHandoff(value);
       validateCanonicalFindingResponses(handoff, requiredCanonicalFindings);
@@ -1989,10 +1993,10 @@ export class AgentOrchestrator {
     };
     const framed = extractStructuredPayload(rawStdout, validate);
     if (framed.ok) {
-      return { handoff: framed.value, method: 'framing' };
+      return { ok: true, handoff: framed.value, method: 'framing' };
     }
     if (framed.reason === 'ambiguous') {
-      return null;
+      return { ok: false, reason: 'evidence_insufficient' };
     }
 
     const deterministic = deterministicallyRepairHandoffKeys(rawStructuredHandoff);
@@ -2000,7 +2004,7 @@ export class AgentOrchestrator {
       try {
         const handoff = parseHandoff(deterministic.value);
         validateCanonicalFindingResponses(handoff, requiredCanonicalFindings);
-        return { handoff, method: 'deterministic' };
+        return { ok: true, handoff, method: 'deterministic' };
       } catch {
         // The rename didn't fully resolve it (e.g. a second, genuinely
         // unrecognized field) — fall through rather than guessing further.
@@ -2012,7 +2016,7 @@ export class AgentOrchestrator {
     const repaired = await this.repairHandoffViaAgent(
       task, rawStructuredHandoff, requiredCanonicalFindings, taskDiff, original,
     );
-    return repaired === null ? null : { handoff: repaired, method: 'agent' };
+    return repaired.ok ? { ok: true, handoff: repaired.handoff, method: 'agent' } : repaired;
   }
 
   /**
@@ -2028,7 +2032,10 @@ export class AgentOrchestrator {
     requiredCanonicalFindings: readonly RequiredCanonicalFinding[],
     taskDiff: string,
     originalHandoff?: StructuredHandoff,
-  ): Promise<StructuredHandoff | null> {
+  ): Promise<
+    { readonly ok: true; readonly handoff: StructuredHandoff }
+    | { readonly ok: false; readonly reason: HandoffRepairFailureReason }
+  > {
     const repairDirectory = join(this.stateStore.runDirectory, 'repairs', task.id);
     await mkdir(repairDirectory, { recursive: true, mode: 0o700 });
     const request: AgentRequest = {
@@ -2072,10 +2079,10 @@ export class AgentOrchestrator {
     try {
       result = await this.agents[task.owner].run(request);
     } catch {
-      return null;
+      return { ok: false, reason: 'agent_invocation_failed' };
     }
     if (result.status !== 'succeeded') {
-      return null;
+      return { ok: false, reason: 'agent_invocation_failed' };
     }
     try {
       const repaired = parseHandoff(result.structuredHandoff);
@@ -2086,17 +2093,17 @@ export class AgentOrchestrator {
           return rest;
         };
         if (JSON.stringify(withoutResponses(repaired)) !== JSON.stringify(withoutResponses(originalHandoff))) {
-          return null;
+          return { ok: false, reason: 'contradiction_detected' };
         }
         const claimsResolved = repaired.findingResponses?.some((response) =>
           response.decision === 'confirmed' && response.resolution === 'resolved');
         if (claimsResolved && (taskDiff.trim() === '' || !originalHandoff.tests.some((test) => test.result === 'pass'))) {
-          return null;
+          return { ok: false, reason: 'evidence_insufficient' };
         }
       }
-      return repaired;
+      return { ok: true, handoff: repaired };
     } catch {
-      return null;
+      return { ok: false, reason: 'evidence_insufficient' };
     }
   }
 
@@ -2139,21 +2146,25 @@ export class AgentOrchestrator {
         throw error;
       }
       const framed = extractStructuredPayload(rawStdout, validateReview);
+      const record: HandoffRepairAttemptRecord = framed.ok
+        ? { method: 'framing', succeeded: true, timestamp: this.clock().toISOString() }
+        : { method: 'none', succeeded: false, failureReason: 'evidence_insufficient', timestamp: this.clock().toISOString() };
       await this.event('HANDOFF_REPAIR_ATTEMPTED', task.id, {
-        method: 'framing',
-        succeeded: framed.ok,
+        method: record.method,
+        succeeded: record.succeeded,
+        ...(record.failureReason === undefined ? {} : { failureReason: record.failureReason }),
       });
       if (!framed.ok) {
         return {
           review: null,
           error,
-          outcome: { outcome: 'invalid', repairAttempted: true, repairSucceeded: false },
+          outcome: { outcome: 'invalid', repairAttempted: true, repairRecord: record },
         };
       }
       return {
         review: framed.value,
         error: null,
-        outcome: { outcome: 'valid', repairAttempted: true, repairSucceeded: true },
+        outcome: { outcome: 'valid', repairAttempted: true, repairRecord: record },
       };
     }
   }
