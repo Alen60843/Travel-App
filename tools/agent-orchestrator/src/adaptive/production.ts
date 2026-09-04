@@ -234,5 +234,6 @@ export function runtimePhaseConfig(
       .map((unit) => taskSpecForAdaptiveUnit(unit, state, config)),
     integration: config.integration,
     maxHandoffRepairAttempts: config.maxHandoffRepairAttempts,
+    salvage: config.salvage,
   };
 }

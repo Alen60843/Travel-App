@@ -7,9 +7,11 @@ import {
   nonEmptyString,
   parseIntegration,
   parseAgentWorktree,
+  parseSalvage,
   repositoryRelativePath,
   type AgentWorktreeConfig,
   type IntegrationConfig,
+  type SalvageConfig,
 } from '../config';
 import { OrchestratorError } from '../errors';
 import { AGENT_NAMES, EFFORT_LEVELS, type AgentName, type EffortLevel } from '../tasks/task-schema';
@@ -47,13 +49,15 @@ export interface AdaptivePhaseConfig {
   readonly continuation?: AdaptiveContinuationConfig;
   /** Generic recovery config, not adaptive-specific — see PhaseConfig.maxHandoffRepairAttempts in src/config.ts. */
   readonly maxHandoffRepairAttempts: number;
+  /** Generic recovery config, not adaptive-specific — see PhaseConfig.salvage in src/config.ts. */
+  readonly salvage: SalvageConfig;
 }
 
 const TOP_LEVEL_KEYS = new Set([
   'mode', 'phase', 'name', 'baseBranch', 'canonicalDesignDocument', 'goal',
   'constraints', 'policy', 'initialCandidates', 'executors', 'agentRetries',
   'agentTimeoutMs', 'agentWorktree', 'integration', 'continuation',
-  'maxHandoffRepairAttempts',
+  'maxHandoffRepairAttempts', 'salvage',
 ]);
 const EXECUTOR_KEYS = new Set(['id', 'adapter', 'capabilities', 'roles', 'effort', 'model', 'available']);
 const CONTINUATION_KEYS = new Set(['sourceRunId', 'sourceWorkUnitId', 'sourceArtifactType', 'expectedBaseSha', 'expectedArtifactSha256', 'mode']);
@@ -171,6 +175,7 @@ export function parseAdaptivePhaseConfig(value: unknown): AdaptivePhaseConfig {
     agentWorktree: parseAgentWorktree(value.agentWorktree),
     integration: parseIntegration(value.integration),
     maxHandoffRepairAttempts: boundedInteger(value.maxHandoffRepairAttempts ?? 2, 'maxHandoffRepairAttempts', 1, 100),
+    salvage: parseSalvage(value.salvage),
     ...(continuation === undefined ? {} : { continuation }),
   };
 }

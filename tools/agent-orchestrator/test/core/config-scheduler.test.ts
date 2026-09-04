@@ -134,6 +134,88 @@ tasks:
   );
 });
 
+test('salvage.verify defaults to an empty command list when absent', () => {
+  const config = parsePhaseConfigYaml(`
+phase: 5
+name: Explorer
+baseBranch: phase5/explorer
+tasks:
+  - id: query
+    title: Query
+    owner: codex
+    mode: implementation
+    effort: high
+    files:
+      - apps/api/src/explorer/**
+`);
+  assert.deepEqual(config.salvage, { verify: [] });
+});
+
+test('salvage.verify parses a configured command list using the same shape as integration.prepare', () => {
+  const config = parsePhaseConfigYaml(`
+phase: 5
+name: Explorer
+baseBranch: phase5/explorer
+salvage:
+  verify:
+    - command: echo verify
+      required: true
+      timeoutMs: 1000
+tasks:
+  - id: query
+    title: Query
+    owner: codex
+    mode: implementation
+    effort: high
+    files:
+      - apps/api/src/explorer/**
+`);
+  assert.deepEqual(config.salvage.verify, [{ command: 'echo verify', required: true, timeoutMs: 1000 }]);
+});
+
+test('salvage.verify commands default required to true, like integration.prepare/commands', () => {
+  const config = parsePhaseConfigYaml(`
+phase: 5
+name: Explorer
+baseBranch: phase5/explorer
+salvage:
+  verify:
+    - node --version
+tasks:
+  - id: query
+    title: Query
+    owner: codex
+    mode: implementation
+    effort: high
+    files:
+      - apps/api/src/explorer/**
+`);
+  assert.equal(config.salvage.verify[0]?.required, true);
+});
+
+test('an unknown salvage key is rejected rather than silently ignored', () => {
+  assert.throws(
+    () =>
+      parsePhaseConfigYaml(`
+phase: 5
+name: Explorer
+baseBranch: phase5/explorer
+salvage:
+  verify: []
+  bogus: true
+tasks:
+  - id: query
+    title: Query
+    owner: codex
+    mode: implementation
+    effort: high
+    files:
+      - apps/api/src/explorer/**
+`),
+    (error: unknown) => isOrchestratorError(error, 'CONFIG_INVALID'),
+  );
+});
+
 test('cycle detection reports a stable DAG_CYCLE error', () => {
   assert.throws(
     () =>

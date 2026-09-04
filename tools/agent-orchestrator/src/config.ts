@@ -22,6 +22,18 @@ export interface AgentWorktreeConfig {
   readonly prepare: readonly IntegrationCommand[];
 }
 
+/**
+ * Categorically separate from AgentWorktreeConfig.prepare: prepare answers
+ * "is this environment usable" (e.g. installing dependencies); verify
+ * answers "is the salvaged code actually correct" (e.g. running the real
+ * test suite). Never defaulted from, aliased to, or satisfied by prepare —
+ * a phase with agentWorktree.prepare configured but no salvage.verify has
+ * zero usable verification for salvage.
+ */
+export interface SalvageConfig {
+  readonly verify: readonly IntegrationCommand[];
+}
+
 export interface PhaseConfig {
   readonly phase: number | string;
   readonly name: string;
@@ -36,6 +48,7 @@ export interface PhaseConfig {
   readonly integration: IntegrationConfig;
   /** Generic recovery config: bounds how many bounded handoff-repair attempts (framing/deterministic/agent) recover-handoffs will make for a task before refusing further attempts. Applies to static and adaptive workflows alike — recover-handoffs is not adaptive-only. */
   readonly maxHandoffRepairAttempts: number;
+  readonly salvage: SalvageConfig;
 }
 
 const TOP_LEVEL_KEYS = new Set([
@@ -51,10 +64,12 @@ const TOP_LEVEL_KEYS = new Set([
   'tasks',
   'integration',
   'maxHandoffRepairAttempts',
+  'salvage',
 ]);
 const INTEGRATION_KEYS = new Set(['prepare', 'commands', 'diagnostics']);
 const COMMAND_KEYS = new Set(['command', 'required', 'timeoutMs']);
 const AGENT_WORKTREE_KEYS = new Set(['prepare']);
+const SALVAGE_KEYS = new Set(['verify']);
 
 // Exported (not just used internally) so src/workflow/solver-verifier.ts can
 // build a plain-object PhaseConfig shape with the same validation rules
@@ -197,6 +212,13 @@ export function parseAgentWorktree(value: unknown): AgentWorktreeConfig {
   return { prepare: parseCommandList(value.prepare, 'agentWorktree.prepare', true) };
 }
 
+export function parseSalvage(value: unknown): SalvageConfig {
+  if (value === undefined) return { verify: [] };
+  if (!isRecord(value)) invalid('salvage', 'must be an object');
+  assertKnownKeys(value, SALVAGE_KEYS, 'salvage');
+  return { verify: parseCommandList(value.verify, 'salvage.verify', true) };
+}
+
 /** Validate a decoded YAML/JSON value and apply conservative defaults. */
 export function parsePhaseConfig(value: unknown): PhaseConfig {
   if (!isRecord(value)) {
@@ -295,6 +317,7 @@ export function parsePhaseConfig(value: unknown): PhaseConfig {
       1,
       100,
     ),
+    salvage: parseSalvage(value.salvage),
   };
 }
 
