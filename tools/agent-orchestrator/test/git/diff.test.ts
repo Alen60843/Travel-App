@@ -5,6 +5,7 @@ import { afterEach, test } from 'node:test';
 
 import {
   changedFiles,
+  computeTrackedDiffFingerprint,
   diffSummary,
   ensureTaskCommit,
   inspectTaskCommits,
@@ -126,4 +127,26 @@ test('rejects multiple agent commits so integration cannot omit earlier work', a
     }),
     /exactly one auditable task commit/,
   );
+});
+
+test('computeTrackedDiffFingerprint is stable for identical tracked content and changes when tracked content changes', async () => {
+  const repository = await createTemporaryRepository();
+  repositories.push(repository);
+  await writeFile(join(repository.repository, 'shared.txt'), 'changed once\n', 'utf8');
+  const first = await computeTrackedDiffFingerprint(repository.git, repository.repository, repository.baseSha);
+  const firstAgain = await computeTrackedDiffFingerprint(repository.git, repository.repository, repository.baseSha);
+  assert.equal(first, firstAgain);
+
+  await writeFile(join(repository.repository, 'shared.txt'), 'changed twice\n', 'utf8');
+  const second = await computeTrackedDiffFingerprint(repository.git, repository.repository, repository.baseSha);
+  assert.notEqual(first, second);
+});
+
+test('computeTrackedDiffFingerprint ignores untracked files', async () => {
+  const repository = await createTemporaryRepository();
+  repositories.push(repository);
+  const before = await computeTrackedDiffFingerprint(repository.git, repository.repository, repository.baseSha);
+  await writeFile(join(repository.repository, 'untracked.txt'), 'new untracked file\n', 'utf8');
+  const after = await computeTrackedDiffFingerprint(repository.git, repository.repository, repository.baseSha);
+  assert.equal(before, after);
 });

@@ -1,4 +1,24 @@
+import { createHash } from 'node:crypto';
+
 import { GitClient, assertRevision, assertSha } from './git';
+
+/**
+ * A content fingerprint of exactly the tracked-file changes between
+ * worktreePath and baseSha — used both to detect a salvage.verify command
+ * silently mutating tracked source (compute before/after, compare) and to
+ * bind a SALVAGE_VERIFIED checkpoint to the exact diff it validated.
+ * Untracked files are not part of `git diff` and are therefore not
+ * fingerprinted.
+ */
+export async function computeTrackedDiffFingerprint(
+  git: GitClient,
+  worktreePath: string,
+  baseSha: string,
+): Promise<string> {
+  assertRevision(baseSha);
+  const result = await git.run(worktreePath, ['diff', '--no-ext-diff', '--no-color', baseSha]);
+  return createHash('sha256').update(result.stdout, 'utf8').digest('hex');
+}
 
 export interface FileDiffStat {
   readonly path: string;
