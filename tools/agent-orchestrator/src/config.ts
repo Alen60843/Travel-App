@@ -13,8 +13,13 @@ export interface IntegrationCommand {
 }
 
 export interface IntegrationConfig {
+  readonly prepare: readonly IntegrationCommand[];
   readonly commands: readonly IntegrationCommand[];
   readonly diagnostics: readonly IntegrationCommand[];
+}
+
+export interface AgentWorktreeConfig {
+  readonly prepare: readonly IntegrationCommand[];
 }
 
 export interface PhaseConfig {
@@ -26,8 +31,11 @@ export interface PhaseConfig {
   readonly maxReviewRounds: number;
   readonly agentRetries: number;
   readonly agentTimeoutMs: number;
+  readonly agentWorktree: AgentWorktreeConfig;
   readonly tasks: readonly TaskSpec[];
   readonly integration: IntegrationConfig;
+  /** Generic recovery config: bounds how many bounded handoff-repair attempts (framing/deterministic/agent) recover-handoffs will make for a task before refusing further attempts. Applies to static and adaptive workflows alike — recover-handoffs is not adaptive-only. */
+  readonly maxHandoffRepairAttempts: number;
 }
 
 const TOP_LEVEL_KEYS = new Set([
@@ -39,11 +47,14 @@ const TOP_LEVEL_KEYS = new Set([
   'maxReviewRounds',
   'agentRetries',
   'agentTimeoutMs',
+  'agentWorktree',
   'tasks',
   'integration',
+  'maxHandoffRepairAttempts',
 ]);
-const INTEGRATION_KEYS = new Set(['commands', 'diagnostics']);
+const INTEGRATION_KEYS = new Set(['prepare', 'commands', 'diagnostics']);
 const COMMAND_KEYS = new Set(['command', 'required', 'timeoutMs']);
+const AGENT_WORKTREE_KEYS = new Set(['prepare']);
 
 // Exported (not just used internally) so src/workflow/solver-verifier.ts can
 // build a plain-object PhaseConfig shape with the same validation rules
@@ -162,13 +173,14 @@ function parseCommandList(
 
 export function parseIntegration(value: unknown): IntegrationConfig {
   if (value === undefined) {
-    return { commands: [], diagnostics: [] };
+    return { prepare: [], commands: [], diagnostics: [] };
   }
   if (!isRecord(value)) {
     invalid('integration', 'must be an object');
   }
   assertKnownKeys(value, INTEGRATION_KEYS, 'integration');
   return {
+    prepare: parseCommandList(value.prepare, 'integration.prepare', true),
     commands: parseCommandList(value.commands, 'integration.commands', true),
     diagnostics: parseCommandList(
       value.diagnostics,
@@ -176,6 +188,13 @@ export function parseIntegration(value: unknown): IntegrationConfig {
       false,
     ),
   };
+}
+
+export function parseAgentWorktree(value: unknown): AgentWorktreeConfig {
+  if (value === undefined) return { prepare: [] };
+  if (!isRecord(value)) invalid('agentWorktree', 'must be an object');
+  assertKnownKeys(value, AGENT_WORKTREE_KEYS, 'agentWorktree');
+  return { prepare: parseCommandList(value.prepare, 'agentWorktree.prepare', true) };
 }
 
 /** Validate a decoded YAML/JSON value and apply conservative defaults. */
@@ -267,8 +286,15 @@ export function parsePhaseConfig(value: unknown): PhaseConfig {
       1_000,
       24 * 60 * 60 * 1_000,
     ),
+    agentWorktree: parseAgentWorktree(value.agentWorktree),
     tasks,
     integration: parseIntegration(value.integration),
+    maxHandoffRepairAttempts: boundedInteger(
+      value.maxHandoffRepairAttempts ?? 2,
+      'maxHandoffRepairAttempts',
+      1,
+      100,
+    ),
   };
 }
 
