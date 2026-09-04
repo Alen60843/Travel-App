@@ -137,7 +137,7 @@ export function repositoryRelativePath(value: unknown, path: string): string {
   return result;
 }
 
-function parseCommand(
+export function parseCommand(
   value: unknown,
   path: string,
   defaultRequired: boolean,
@@ -170,7 +170,7 @@ function parseCommand(
   };
 }
 
-function parseCommandList(
+export function parseCommandList(
   value: unknown,
   path: string,
   defaultRequired: boolean,
@@ -321,8 +321,14 @@ export function parsePhaseConfig(value: unknown): PhaseConfig {
   };
 }
 
-/** Parse strict YAML. Aliases are disabled to keep task files bounded and auditable. */
-export function parsePhaseConfigYaml(source: string): PhaseConfig {
+/**
+ * Parse strict YAML into a plain JS value. Aliases are disabled (maxAliasCount:
+ * 0) to keep any file parsed this way bounded and auditable — shared by every
+ * strict YAML entry point in this package (phase files, recovery policy
+ * overlays), so the same anti-DoS/alias-expansion posture applies everywhere,
+ * not just to phase files.
+ */
+export function parseStrictYaml(source: string): unknown {
   let document;
   try {
     document = parseDocument(source, {
@@ -337,7 +343,15 @@ export function parsePhaseConfigYaml(source: string): PhaseConfig {
     invalid('$', document.errors.map((error) => error.message).join('; '));
   }
   try {
-    return parsePhaseConfig(document.toJS({ maxAliasCount: 0 }));
+    return document.toJS({ maxAliasCount: 0 });
+  } catch (error) {
+    invalid('$', 'could not decode YAML', error);
+  }
+}
+
+export function parsePhaseConfigYaml(source: string): PhaseConfig {
+  try {
+    return parsePhaseConfig(parseStrictYaml(source));
   } catch (error) {
     if (error instanceof OrchestratorError) {
       throw error;
