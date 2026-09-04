@@ -130,6 +130,29 @@ interface HandoffOutcomeRecord {
   readonly repairRecord?: HandoffRepairAttemptRecord;
 }
 
+/**
+ * Stable, machine-readable eligibility-failure classification for
+ * recover-handoffs, distinct from HandoffRepairAttemptRecord.failureReason
+ * (which classifies an execution failure that happened AFTER dispatch).
+ * HANDOFF_REPAIR_ALREADY_RESOLVED is deliberately not included: a
+ * successful repair always transitions the task out of FAILED, so
+ * HANDOFF_TASK_NOT_FAILED already covers that case — there is no reachable
+ * branch where a task is still FAILED and its last repair succeeded.
+ */
+type HandoffRecoveryEligibilityReasonCode =
+  | 'HANDOFF_TASK_CONFIG_MISSING'
+  | 'HANDOFF_TASK_MODE_MISMATCH'
+  | 'HANDOFF_TASK_NOT_FAILED'
+  | 'HANDOFF_LAST_ATTEMPT_NOT_SUCCEEDED'
+  | 'HANDOFF_COMMIT_ALREADY_RECORDED'
+  | 'HANDOFF_WORKTREE_NOT_PRESERVED'
+  | 'HANDOFF_WORKTREE_NOT_REGISTERED'
+  | 'HANDOFF_WORKTREE_INVALID_DESCENDANT'
+  | 'HANDOFF_WORKTREE_HEAD_MOVED'
+  | 'HANDOFF_WORKTREE_HAS_FOREIGN_COMMITS'
+  | 'HANDOFF_ORIGINAL_LOG_MISSING'
+  | 'HANDOFF_REPAIR_BUDGET_EXHAUSTED';
+
 type HandoffRepairMethod = 'framing' | 'deterministic' | 'agent';
 type HandoffRepairFailureReason = 'agent_invocation_failed' | 'evidence_insufficient' | 'contradiction_detected';
 type RepairOutcome =
@@ -637,7 +660,11 @@ export class AgentOrchestrator {
             taskState,
             task: undefined,
             kind,
-            check: { eligible: false, reason: 'task id not found in the loaded phase config' },
+            check: {
+              eligible: false,
+              reason: 'task id not found in the loaded phase config',
+              reasonCode: 'HANDOFF_TASK_CONFIG_MISSING' as const,
+            },
           };
         }
         if (kind === 'review' && !REVIEW_MODES.has(task.mode)) {
@@ -645,7 +672,11 @@ export class AgentOrchestrator {
             taskState,
             task,
             kind,
-            check: { eligible: false, reason: `mode ${task.mode} is not a review/final_review task` },
+            check: {
+              eligible: false,
+              reason: `mode ${task.mode} is not a review/final_review task`,
+              reasonCode: 'HANDOFF_TASK_MODE_MISMATCH' as const,
+            },
           };
         }
         const check = await orchestrator.checkStructuredOutputRecoveryEligibility(
@@ -665,6 +696,7 @@ export class AgentOrchestrator {
             ineligible: ineligible.map((entry) => ({
               taskId: entry.taskState.id,
               reason: entry.check.reason,
+              reasonCode: entry.check.reasonCode,
             })),
           },
         },
@@ -2848,25 +2880,55 @@ export class AgentOrchestrator {
   private async checkStructuredOutputRecoveryEligibility(
     taskState: TaskRunState,
     expectedErrorCode: 'HANDOFF_INVALID' | 'REVIEW_BLOCKED',
-  ): Promise<{ readonly eligible: boolean; readonly reason: string }> {
+  ): Promise<{ readonly eligible: boolean; readonly reason: string; readonly reasonCode?: HandoffRecoveryEligibilityReasonCode }> {
     if (taskState.status !== 'FAILED' || taskState.error?.code !== expectedErrorCode) {
-      return { eligible: false, reason: `task is not currently FAILED with error code ${expectedErrorCode}` };
+      return {
+        eligible: false,
+        reason: `task is not currently FAILED with error code ${expectedErrorCode}`,
+        reasonCode: 'HANDOFF_TASK_NOT_FAILED',
+      };
+    }
+    if (
+      expectedErrorCode === 'HANDOFF_INVALID'
+      && taskState.handoffRepairAttempts.length >= this.config.maxHandoffRepairAttempts
+    ) {
+      return {
+        eligible: false,
+        reason: `handoff repair attempt budget (${this.config.maxHandoffRepairAttempts}) exhausted`,
+        reasonCode: 'HANDOFF_REPAIR_BUDGET_EXHAUSTED',
+      };
     }
     const lastAttempt = taskState.agentAttempts.at(-1);
     if (lastAttempt?.outcome !== 'succeeded') {
-      return { eligible: false, reason: 'the most recent recorded agent attempt did not succeed' };
+      return {
+        eligible: false,
+        reason: 'the most recent recorded agent attempt did not succeed',
+        reasonCode: 'HANDOFF_LAST_ATTEMPT_NOT_SUCCEEDED',
+      };
     }
     if (taskState.commit !== undefined) {
-      return { eligible: false, reason: 'a task commit is already recorded for this task' };
+      return {
+        eligible: false,
+        reason: 'a task commit is already recorded for this task',
+        reasonCode: 'HANDOFF_COMMIT_ALREADY_RECORDED',
+      };
     }
     if (taskState.worktreePath === undefined || taskState.preparedHeadSha === undefined) {
-      return { eligible: false, reason: 'no preserved worktree path / prepared SHA recorded for this task' };
+      return {
+        eligible: false,
+        reason: 'no preserved worktree path / prepared SHA recorded for this task',
+        reasonCode: 'HANDOFF_WORKTREE_NOT_PRESERVED',
+      };
     }
     let worktree: OwnedWorktree;
     try {
       worktree = await this.worktrees.assertRegistered(taskState.worktreePath);
     } catch (error) {
-      return { eligible: false, reason: `preserved worktree is not registered/present: ${errorText(error)}` };
+      return {
+        eligible: false,
+        reason: `preserved worktree is not registered/present: ${errorText(error)}`,
+        reasonCode: 'HANDOFF_WORKTREE_NOT_REGISTERED',
+      };
     }
     let inspection: Awaited<ReturnType<typeof inspectTaskCommits>>;
     try {
@@ -2875,18 +2937,31 @@ export class AgentOrchestrator {
       return {
         eligible: false,
         reason: `worktree is not a valid descendant of its own prepared SHA: ${errorText(error)}`,
+        reasonCode: 'HANDOFF_WORKTREE_INVALID_DESCENDANT',
       };
     }
     if (inspection.headSha !== taskState.preparedHeadSha) {
-      return { eligible: false, reason: 'worktree HEAD has moved past the SHA prepared for this task' };
+      return {
+        eligible: false,
+        reason: 'worktree HEAD has moved past the SHA prepared for this task',
+        reasonCode: 'HANDOFF_WORKTREE_HEAD_MOVED',
+      };
     }
     if (inspection.commits.length > 0) {
-      return { eligible: false, reason: 'worktree already has commits beyond the prepared SHA' };
+      return {
+        eligible: false,
+        reason: 'worktree already has commits beyond the prepared SHA',
+        reasonCode: 'HANDOFF_WORKTREE_HAS_FOREIGN_COMMITS',
+      };
     }
     try {
       await stat(this.taskAttemptStdoutLogPath(taskState.id, lastAttempt));
     } catch {
-      return { eligible: false, reason: 'original agent stdout log is missing' };
+      return {
+        eligible: false,
+        reason: 'original agent stdout log is missing',
+        reasonCode: 'HANDOFF_ORIGINAL_LOG_MISSING',
+      };
     }
     return { eligible: true, reason: '' };
   }
