@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
-import { writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
 
 import type { Agent, AgentName, AgentRequest, AgentResult } from '../../src/agents';
 import { isOrchestratorError } from '../../src/errors';
 import { WorktreeManager } from '../../src/git';
+import { computeTrackedDiffFingerprint } from '../../src/git/diff';
 import { AgentOrchestrator } from '../../src/orchestrator';
 import type { RunState } from '../../src/state';
 import { createTemporaryRepository, type TemporaryRepository } from '../git/helpers';
@@ -620,3 +622,171 @@ test('salvage fails closed if the repair cascade cannot produce a valid findingR
     await scenario.fixture.dispose();
   }
 });
+
+
+// --- Salvage verification checkpoint: crash-resume reuse/invalidation ---
+//
+// salvageTask has no externally observable pause point (authorize -> verify
+// -> commit runs as one synchronous call), so "resume after a crash between
+// verify and commit" is simulated the same way scenario 7 and others in
+// this codebase simulate a crash: pre-seed the run state file on disk with
+// exactly the shape a real crash at that point would leave — a task still
+// BLOCKED/AGENT_TIMEOUT (never SUCCEEDED, since that would make it
+// ineligible for salvage entirely) with a `salvage.verification` checkpoint
+// already recorded but no commit yet — then call salvageTask and observe
+// whether it reruns the verify command (counted via an absolute-path
+// counter file outside the worktree, so the counter itself never becomes
+// part of the tracked/untracked diff salvage eligibility inspects).
+
+async function countTicks(counterPath: string): Promise<number> {
+  try {
+    return (await readFile(counterPath, 'utf8')).split('\n').filter((line) => line.length > 0).length;
+  } catch {
+    return 0;
+  }
+}
+
+async function createCounterFile(): Promise<{ readonly path: string; readonly dispose: () => Promise<void> }> {
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const dir = await mkdtemp(join(tmpdir(), 'salvage-verify-count-'));
+  return { path: join(dir, 'verify-count.txt'), dispose: async () => rm(dir, { recursive: true, force: true }) };
+}
+
+test('a crash-resumed salvage reuses a valid SALVAGE_VERIFIED checkpoint without rerunning verify when the diff is unchanged', async () => {
+  const scenario = await createTimeoutScenario({ verifyCommand: 'true' });
+  try {
+    const before = await scenario.orchestrator.stateStore.load();
+    const preparedHeadSha = before.tasks['timed-out-task']!.preparedHeadSha!;
+    const trackedDiffFingerprint = await computeTrackedDiffFingerprint(
+      scenario.fixture.git, scenario.worktreePath, preparedHeadSha,
+    );
+    const verifyConfigFingerprint = createHash('sha256')
+      .update(JSON.stringify([{ command: 'true', required: true }]), 'utf8')
+      .digest('hex');
+    await scenario.orchestrator.stateStore.save({
+      ...before,
+      tasks: {
+        ...before.tasks,
+        'timed-out-task': {
+          ...before.tasks['timed-out-task']!,
+          salvage: {
+            authorizedAt: before.createdAt,
+            verification: { worktreeHeadSha: preparedHeadSha, trackedDiffFingerprint, verifyConfigFingerprint, result: 'passed' },
+          },
+        },
+      },
+    });
+
+    const result = await AgentOrchestrator.salvageTask(scenario.runId, 'timed-out-task', {
+      repositoryPath: scenario.fixture.repository,
+      runsRoot: scenario.runsRoot,
+      agents: { codex: new UnusedAgent('codex'), claude: new UnusedAgent('claude') },
+    });
+    assert.ok(result.commitSha);
+  } finally {
+    await scenario.fixture.dispose();
+  }
+});
+
+test('a crash-resumed salvage reruns verify when the tracked diff changed since the checkpoint was recorded', async () => {
+  const counter = await createCounterFile();
+  const scenario = await createTimeoutScenario({ verifyCommand: `sh -c "echo tick >> ${counter.path}"` });
+  try {
+    const before = await scenario.orchestrator.stateStore.load();
+    const preparedHeadSha = before.tasks['timed-out-task']!.preparedHeadSha!;
+    // Fingerprint computed for the diff as it existed BEFORE this further edit.
+    const staleTrackedDiffFingerprint = await computeTrackedDiffFingerprint(
+      scenario.fixture.git, scenario.worktreePath, preparedHeadSha,
+    );
+    const verifyConfigFingerprint = createHash('sha256')
+      .update(JSON.stringify([{ command: `sh -c "echo tick >> ${counter.path}"`, required: true }]), 'utf8')
+      .digest('hex');
+    await scenario.orchestrator.stateStore.save({
+      ...before,
+      tasks: {
+        ...before.tasks,
+        'timed-out-task': {
+          ...before.tasks['timed-out-task']!,
+          salvage: {
+            authorizedAt: before.createdAt,
+            verification: {
+              worktreeHeadSha: preparedHeadSha,
+              trackedDiffFingerprint: staleTrackedDiffFingerprint,
+              verifyConfigFingerprint,
+              result: 'passed',
+            },
+          },
+        },
+      },
+    });
+    // The worktree's tracked diff changes AFTER the checkpoint was recorded —
+    // exactly what a crash between an earlier verify and a later resume,
+    // with intervening worktree activity, would look like.
+    await writeFile(join(scenario.worktreePath, 'feature.txt'), 'salvageable work, further edited\n', 'utf8');
+
+    const result = await AgentOrchestrator.salvageTask(scenario.runId, 'timed-out-task', {
+      repositoryPath: scenario.fixture.repository,
+      runsRoot: scenario.runsRoot,
+      agents: { codex: new UnusedAgent('codex'), claude: new UnusedAgent('claude') },
+    });
+    assert.ok(result.commitSha);
+    assert.equal(await countTicks(counter.path), 1, 'verify must rerun once the diff fingerprint no longer matches the checkpoint');
+  } finally {
+    await scenario.fixture.dispose();
+    await counter.dispose();
+  }
+});
+
+test('a crash-resumed salvage reruns verify when salvage.verify config changed since the checkpoint was recorded', async () => {
+  const counter = await createCounterFile();
+  const scenario = await createTimeoutScenario({ verifyCommand: `sh -c "echo tick >> ${counter.path}"` });
+  try {
+    const before = await scenario.orchestrator.stateStore.load();
+    const preparedHeadSha = before.tasks['timed-out-task']!.preparedHeadSha!;
+    const trackedDiffFingerprint = await computeTrackedDiffFingerprint(
+      scenario.fixture.git, scenario.worktreePath, preparedHeadSha,
+    );
+    // A verifyConfigFingerprint that could only have come from some other
+    // (never-actually-configured) verify command list — simulating that the
+    // phase's salvage.verify config itself changed between the crash and
+    // this resume.
+    const staleVerifyConfigFingerprint = createHash('sha256')
+      .update(JSON.stringify([{ command: 'a different command that was never actually configured', required: true }]), 'utf8')
+      .digest('hex');
+    await scenario.orchestrator.stateStore.save({
+      ...before,
+      tasks: {
+        ...before.tasks,
+        'timed-out-task': {
+          ...before.tasks['timed-out-task']!,
+          salvage: {
+            authorizedAt: before.createdAt,
+            verification: {
+              worktreeHeadSha: preparedHeadSha,
+              trackedDiffFingerprint,
+              verifyConfigFingerprint: staleVerifyConfigFingerprint,
+              result: 'passed',
+            },
+          },
+        },
+      },
+    });
+
+    const result = await AgentOrchestrator.salvageTask(scenario.runId, 'timed-out-task', {
+      repositoryPath: scenario.fixture.repository,
+      runsRoot: scenario.runsRoot,
+      agents: { codex: new UnusedAgent('codex'), claude: new UnusedAgent('claude') },
+    });
+    assert.ok(result.commitSha);
+    assert.equal(await countTicks(counter.path), 1, 'verify must rerun once the verify-config fingerprint no longer matches the checkpoint');
+  } finally {
+    await scenario.fixture.dispose();
+    await counter.dispose();
+  }
+});
+
+// Duplicate-commit safety after a recorded commit is already proven by
+// 'a task with a recorded commit already cannot be salvaged again' above
+// (checkSalvageEligibility's SALVAGE_NOT_TIMED_OUT / SALVAGE_COMMIT_ALREADY_RECORDED
+// checks) — not repeated here to avoid a redundant test.
