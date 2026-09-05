@@ -1,6 +1,7 @@
 import { ERROR_CODES, OrchestratorError, type ErrorCode } from '../errors';
 import { parseAdaptiveRunState } from '../adaptive/state-validation';
 import type { AdaptiveRunState } from '../adaptive/types';
+import { parseRecoveryPolicyOverlay, type RecoveryPolicyOverlay } from '../recovery/policy';
 import { TASK_STATUSES, type TaskStatus } from '../tasks/scheduler';
 import type { AgentName, TaskSpec } from '../tasks/task-schema';
 
@@ -229,6 +230,25 @@ export interface RunState {
   readonly agentExecutables?: Readonly<Partial<Record<AgentName, string>>>;
   /** Optional adaptive topology. Static v1 run files remain valid without it. */
   readonly adaptive?: AdaptiveRunState;
+  /**
+   * Append-only, oldest first — never rewritten or removed. Each entry is an
+   * explicitly authorized (AgentOrchestrator.authorizeRecoveryPolicy),
+   * hashed recovery-only policy overlay for THIS run, layered on top of the
+   * run's immutable phase.yaml snapshot at load time (never editing it).
+   * Absent for a run that has never had a recovery policy authorized —
+   * every existing/modern run continues to load and recover exactly as
+   * before. The most recent entry is the one currently in effect.
+   */
+  readonly recoveryPolicyHistory?: readonly RecoveryPolicySnapshot[];
+}
+
+/** One authorized, hashed recovery-policy overlay snapshot — see RunState.recoveryPolicyHistory. */
+export interface RecoveryPolicySnapshot {
+  readonly authorizedAt: string;
+  /** sha256 of the canonical (normalized) policy representation — see hashRecoveryPolicy. Never a hash of raw YAML. */
+  readonly policyHash: string;
+  /** The normalized, validated overlay itself — not the raw YAML that produced it. */
+  readonly policy: RecoveryPolicyOverlay;
 }
 
 export const RUN_EVENT_NAMES = [
@@ -840,6 +860,24 @@ function parseTask(value: unknown, key: string): TaskRunState {
   };
 }
 
+function parseRecoveryPolicySnapshot(value: unknown, path: string): RecoveryPolicySnapshot {
+  if (!isObject(value)) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path} must be an object`);
+  }
+  const authorizedAt = timestamp(value.authorizedAt, `${path}.authorizedAt`);
+  const policyHash = string(value.policyHash, `${path}.policyHash`);
+  if (!/^[0-9a-f]{64}$/i.test(policyHash)) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path}.policyHash must be a sha256 hex digest`);
+  }
+  let policy: RecoveryPolicyOverlay;
+  try {
+    policy = parseRecoveryPolicyOverlay(value.policy);
+  } catch (error) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path}.policy is invalid`, { cause: error });
+  }
+  return { authorizedAt, policyHash, policy };
+}
+
 export function validateRunState(value: unknown): RunState {
   if (!isObject(value)) {
     throw new OrchestratorError('STATE_CORRUPT', 'Run state must be an object');
@@ -891,6 +929,15 @@ export function validateRunState(value: unknown): RunState {
     }
     integrationAttempts = value.integrationAttempts.map((entry, index) =>
       parseIntegrationState(entry, `integrationAttempts[${index}]`),
+    );
+  }
+  let recoveryPolicyHistory: RecoveryPolicySnapshot[] | undefined;
+  if (value.recoveryPolicyHistory !== undefined) {
+    if (!Array.isArray(value.recoveryPolicyHistory)) {
+      throw new OrchestratorError('STATE_CORRUPT', 'recoveryPolicyHistory must be an array');
+    }
+    recoveryPolicyHistory = value.recoveryPolicyHistory.map((entry, index) =>
+      parseRecoveryPolicySnapshot(entry, `recoveryPolicyHistory[${index}]`),
     );
   }
   const repositoryRoot = string(value.repositoryRoot, 'repositoryRoot');
@@ -961,6 +1008,7 @@ export function validateRunState(value: unknown): RunState {
     tasks,
     integration,
     ...(integrationAttempts === undefined ? {} : { integrationAttempts }),
+    ...(recoveryPolicyHistory === undefined ? {} : { recoveryPolicyHistory }),
     errors: value.errors.map((error, index) => parseStoredError(error, `errors[${index}]`)),
     ...(agentExecutables === undefined ? {} : { agentExecutables }),
     ...(adaptive === undefined ? {} : { adaptive }),
