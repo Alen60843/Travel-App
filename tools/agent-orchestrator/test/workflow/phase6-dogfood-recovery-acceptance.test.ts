@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import type { Agent, AgentRequest, AgentResult } from '../../src/agents';
+import type { Agent, AgentName, AgentRequest, AgentResult } from '../../src/agents';
 import { WorktreeManager } from '../../src/git';
 import { AgentOrchestrator } from '../../src/orchestrator';
 import type { RunState, TaskRunState } from '../../src/state';
@@ -11,31 +11,60 @@ import { createTemporaryRepository } from '../git/helpers';
 
 /**
  * A provider-neutral, fake-agent-only scenario shaped like the real Phase 6
- * dogfood state (run-20260904124350-dc56690c, never read or touched here):
+ * dogfood state (run-20260904124350-dc56690c, never read or touched here)
+ * AND the three additional real-recovery blockers found on top of it:
  *
  *   f001-task (~work-000001): BLOCKED/AGENT_TIMEOUT, an authorized dirty
- *     diff in an owned file, no commit -> salvaged via AgentOrchestrator.salvageTask.
+ *     diff in an owned file, no commit. The phase's OWN salvage config has
+ *     NO usable verify commands (salvage.verify: [] — the historical
+ *     phase.yaml predates salvage.verify entirely, matching the real run).
+ *     An authorized recovery-policy overlay supplies salvage.verify without
+ *     ever editing phase.yaml -> salvaged via AgentOrchestrator.salvageTask.
  *   f002-task (~work-000002): FAILED/HANDOFF_INVALID, a real preserved
- *     stdout log with a deterministically-repairable malformed key, PLUS a
- *     legacy handoffRepairAttempted=true/handoffRepairSucceeded=false shape
- *     (exactly the real run's persisted shape) -> recovered via
+ *     stdout log whose defect (a wrong-typed field) neither the framing nor
+ *     deterministic-key repair tier can fix, forcing the agent repair tier
+ *     — PLUS a legacy handoffRepairAttempted=true/handoffRepairSucceeded=false
+ *     shape (exactly the real run's persisted shape). The SAME authorized
+ *     overlay configures a recovery executor on claude; the original owner
+ *     (codex) is asserted to never be invoked during recovery, simulating
+ *     "original owner/quota unavailable" -> recovered via
  *     AgentOrchestrator.recoverHandoffFailures, exercising the legacy
- *     migration in the same call.
+ *     migration and provider-neutral routing in the same call, without
+ *     rerunning code generation (the diff is untouched).
  *   f003-task (~work-000003): already SUCCEEDED with a commit.
  *   work4-task (~work-000004, F003's targeted re-verification): already SUCCEEDED.
  *
- * Canonical-finding handling during salvage/recovery is deliberately NOT
- * exercised here — it's already proven in isolation by
- * test/workflow/agent-timeout-salvage.test.ts and
- * test/adaptive/adaptive-continuation.test.ts. This test's unique job is
- * the formal invariant: recovering f001/f002 in a single shared run must
- * never alter f003/work4's persisted state.
+ * This test's unique job is the formal invariant: authorizing a recovery
+ * policy and recovering f001/f002 in a single shared run must never alter
+ * f003/work4's persisted state, and must never edit the run's immutable
+ * phase.yaml snapshot.
  */
 
 class NeverAgent implements Agent {
-  constructor(readonly name: 'codex' | 'claude') {}
+  constructor(readonly name: AgentName) {}
   async run(request: AgentRequest): Promise<AgentResult> {
-    throw new Error(`unexpected agent invocation for role ${request.role} (task ${request.taskId})`);
+    throw new Error(`unexpected agent invocation for role ${request.role} (task ${request.taskId}, agent ${this.name})`);
+  }
+}
+
+/** The configured recovery executor for f002-task's handoff_repair — never the original owner (codex). */
+class MetadataRepairAgent implements Agent {
+  readonly invocations: AgentRequest[] = [];
+  constructor(readonly name: AgentName) {}
+  async run(request: AgentRequest): Promise<AgentResult> {
+    this.invocations.push(request);
+    const spec = request.taskSpecification as { malformedOutput: Record<string, unknown> };
+    const repaired = { ...spec.malformedOutput, tests: [] };
+    const now = new Date().toISOString();
+    return {
+      agent: this.name, runId: request.runId, taskId: request.taskId, status: 'succeeded', failureCode: null,
+      exitCode: 0, signal: null,
+      stdoutPath: join(request.artifactsDirectory, `${request.taskId}.stdout`),
+      stderrPath: join(request.artifactsDirectory, `${request.taskId}.stderr`),
+      structuredHandoff: repaired, changedFiles: [], gitDiffSummary: null, testsReported: [],
+      unresolvedQuestions: [], startedAt: now, endedAt: now, durationMs: 1, timedOut: false, aborted: false,
+      errorMessage: null,
+    };
   }
 }
 
@@ -49,9 +78,7 @@ concurrency: 4
 agentRetries: 0
 maxReviewRounds: 3
 salvage:
-  verify:
-    - command: "true"
-      required: true
+  verify: []
 tasks:
   - id: f001-task
     title: F001 correction (timed out)
@@ -81,23 +108,26 @@ tasks:
 `;
 }
 
-function malformedButDeterministicallyRepairableHandoff(): unknown {
+/**
+ * A defect neither framing (no prose wrapping — this is already bare JSON)
+ * nor deterministic key-rename (every key name is already exactly right)
+ * can fix: `tests` is the wrong TYPE. Only the bounded agent repair tier —
+ * here, the configured recovery executor, never the original owner — can
+ * plausibly correct it.
+ */
+function malformedRequiringAgentRepair(): unknown {
   return {
     status: 'complete',
     summary: 'corrected F002',
     filesChanged: ['f002.txt'],
-    // The exact real defect shape from the actual Phase 5/6 dogfood
-    // recovery this repair tier was hardened against: a description
-    // annotated onto the key itself, which deterministicallyRepairHandoffKeys
-    // renames back to the bare form without any agent call.
-    'decisions (non-obvious constraints)': ['reused existing helper'],
-    tests: [{ command: 'fake-test', result: 'pass', details: 'fake evidence' }],
+    decisions: [],
+    tests: null,
     openQuestions: [],
     reviewRequested: [],
   };
 }
 
-test('Phase6-shaped acceptance: salvaging f001-task and recovering f002-task leaves f003-task and work4-task provably unchanged', async () => {
+test('Phase6-shaped acceptance: authorizing a recovery policy, then salvaging f001-task and recovering f002-task via the configured recovery executor, leaves f003-task and work4-task provably unchanged', async () => {
   const fixture = await createTemporaryRepository();
   try {
     await writeFile(join(fixture.repository, 'design.md'), '# Design\n', 'utf8');
@@ -116,6 +146,7 @@ test('Phase6-shaped acceptance: salvaging f001-task and recovering f002-task lea
     });
     const runId = orchestrator.snapshot().runId;
     const before = orchestrator.snapshot();
+    const phaseSnapshotBefore = await readFile(join(orchestrator.stateStore.runDirectory, 'phase.yaml'), 'utf8');
 
     const worktrees = await WorktreeManager.create({ repositoryPath: fixture.repository });
 
@@ -128,9 +159,7 @@ test('Phase6-shaped acceptance: salvaging f001-task and recovering f002-task lea
     // f002-task: real registered worktree with the agent's uncommitted fix
     // still dirty (the Orchestrator, never the agent, creates the task
     // commit — only once a handoff is actually accepted) plus a real
-    // preserved stdout log containing a deterministically-repairable
-    // malformed handoff, matching how recoverHandoffInvalidTask actually
-    // re-reads evidence from disk.
+    // preserved stdout log containing the agent-tier-only malformed handoff.
     const f002Worktree = await worktrees.createTaskWorktree({
       runId, taskId: 'f002-task', baseBranch: fixture.baseBranch, baseSha: before.baseSha,
     });
@@ -139,7 +168,7 @@ test('Phase6-shaped acceptance: salvaging f001-task and recovering f002-task lea
     await mkdir(logsDir, { recursive: true });
     await writeFile(
       join(logsDir, `${runId}.f002-task.codex.attempt-1.stdout.log`),
-      JSON.stringify(malformedButDeterministicallyRepairableHandoff()),
+      JSON.stringify(malformedRequiringAgentRepair()),
       'utf8',
     );
 
@@ -169,15 +198,15 @@ test('Phase6-shaped acceptance: salvaging f001-task and recovering f002-task lea
       }],
       error: {
         code: 'HANDOFF_INVALID',
-        message: "handoff.decisions (non-obvious constraints): is not a supported field",
+        message: 'handoff.tests must be an array',
         at: before.createdAt,
       },
       // The real protected run's exact persisted legacy shape — proves the
       // migration (Task 2) and budget accounting (Task 4) both engage for
       // real inside this same recovery call. Omitting handoffRepairAttempts
-      // (set to undefined above, stripped below) is essential: its mere
-      // presence as [] would short-circuit normalizeHandoffRepairAttempts
-      // before it ever looks at these legacy booleans.
+      // (stripped below) is essential: its mere presence as [] would
+      // short-circuit normalizeHandoffRepairAttempts before it ever looks
+      // at these legacy booleans.
       handoffRepairAttempted: true,
       handoffRepairSucceeded: false,
     } as unknown as TaskRunState;
@@ -221,7 +250,23 @@ test('Phase6-shaped acceptance: salvaging f001-task and recovering f002-task lea
     const f003Before = structuredClone(f003State);
     const work4Before = structuredClone(work4State);
 
-    // --- Recover f001-task via real salvageTask -------------------------
+    // --- Authorize the one recovery-policy overlay this run needs --------
+    // Covers both new blockers at once: salvage.verify (the historical
+    // phase.yaml has none) and a handoff_repair executor on claude, NOT
+    // the original owner codex — simulating "Codex quota unavailable".
+    const authorization = await AgentOrchestrator.authorizeRecoveryPolicy(runId, {
+      salvage: { verify: [{ command: 'true', required: true }] },
+      executors: [{
+        id: 'metadata-repairer', adapter: 'claude', roles: ['handoff_repair'],
+        capabilities: [{ capability: 'handoff_repair' }], available: true,
+      }],
+    }, { repositoryPath: fixture.repository, runsRoot, agents: { codex: new NeverAgent('codex'), claude: new NeverAgent('claude') } });
+    assert.equal(authorization.orchestrator.snapshot().recoveryPolicyHistory?.length, 1);
+    // The overlay never touches the immutable phase.yaml snapshot.
+    const phaseSnapshotAfterAuthorization = await readFile(join(orchestrator.stateStore.runDirectory, 'phase.yaml'), 'utf8');
+    assert.equal(phaseSnapshotAfterAuthorization, phaseSnapshotBefore);
+
+    // --- Recover f001-task via real salvageTask (overlay supplies verify) -
     const salvageResult = await AgentOrchestrator.salvageTask(runId, 'f001-task', {
       repositoryPath: fixture.repository,
       runsRoot,
@@ -233,18 +278,33 @@ test('Phase6-shaped acceptance: salvaging f001-task and recovering f002-task lea
     assert.deepEqual(afterSalvage.tasks['f003-task'], f003Before, 'f003-task must be untouched by salvaging f001-task');
     assert.deepEqual(afterSalvage.tasks['work4-task'], work4Before, 'work4-task must be untouched by salvaging f001-task');
 
-    // --- Recover f002-task via real recoverHandoffFailures ---------------
+    // --- Recover f002-task via real recoverHandoffFailures, routed away
+    // from the original owner ---------------------------------------------
+    const codexDuringRecovery = new NeverAgent('codex');
+    const claudeDuringRecovery = new MetadataRepairAgent('claude');
     const recovery = await AgentOrchestrator.recoverHandoffFailures(runId, {
       repositoryPath: fixture.repository,
       runsRoot,
-      agents: { codex: new NeverAgent('codex'), claude: new NeverAgent('claude') },
+      agents: { codex: codexDuringRecovery, claude: claudeDuringRecovery },
     });
     assert.deepEqual(recovery.recovered, ['f002-task']);
+    // Codex (the original owner) was never invoked — the repair was routed
+    // to the configured executor instead, exactly as authorized.
+    assert.equal(claudeDuringRecovery.invocations.length, 1);
+    assert.equal(claudeDuringRecovery.invocations[0]?.role, 'handoff_repair');
+
     const afterRecovery = recovery.orchestrator.snapshot();
     assert.equal(afterRecovery.tasks['f002-task']?.status, 'SUCCEEDED');
-    assert.equal(afterRecovery.tasks['f002-task']?.handoffRepairAttempts.length, 2, 'the migrated legacy attempt plus the new deterministic-repair attempt');
+    assert.equal(afterRecovery.tasks['f002-task']?.handoffRepairAttempts.length, 2, 'the migrated legacy attempt plus the new agent-tier repair attempt');
     assert.equal(afterRecovery.tasks['f002-task']?.handoffRepairAttempts[0]?.method, 'legacy_unknown');
-    assert.equal(afterRecovery.tasks['f002-task']?.handoffRepairAttempts[1]?.method, 'deterministic');
+    assert.equal(afterRecovery.tasks['f002-task']?.handoffRepairAttempts[1]?.method, 'agent');
+    assert.equal(afterRecovery.tasks['f002-task']?.handoffRepairAttempts[1]?.repairExecutorId, 'metadata-repairer');
+    assert.equal(afterRecovery.tasks['f002-task']?.handoffRepairAttempts[1]?.repairAdapter, 'claude');
+    // The diff itself was never touched — recovery repaired metadata only.
+    assert.equal(
+      (await fixture.git.run(f002Worktree.path, ['show', 'HEAD:f002.txt'])).stdout,
+      'corrected F002\n',
+    );
 
     // --- Formal invariant: F003/work4 remain provably unchanged ----------
     assert.deepEqual(afterRecovery.tasks['f003-task'], f003Before, 'f003-task must remain unchanged after recovering f002-task');
@@ -252,6 +312,10 @@ test('Phase6-shaped acceptance: salvaging f001-task and recovering f002-task lea
     // ...and unchanged relative to the very first snapshot taken before
     // either recovery — the complete round trip touches no sibling task.
     assert.deepEqual(afterRecovery.tasks['f001-task'], afterSalvage.tasks['f001-task'], 'f001-task must be unaffected by the later f002-task recovery');
+
+    // The immutable phase.yaml snapshot was never edited at any point.
+    const phaseSnapshotFinal = await readFile(join(orchestrator.stateStore.runDirectory, 'phase.yaml'), 'utf8');
+    assert.equal(phaseSnapshotFinal, phaseSnapshotBefore);
   } finally {
     await fixture.dispose();
   }
