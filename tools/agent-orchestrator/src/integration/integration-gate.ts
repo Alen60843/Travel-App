@@ -44,6 +44,20 @@ export interface IntegrationGateOptions {
   readonly defaultTimeoutMs?: number;
   readonly terminationGraceMs?: number;
   readonly signal?: AbortSignal;
+  readonly onCommandFinished?: (result: IntegrationCommandResult, index: number) => void | Promise<void>;
+}
+
+export function canReuseIntegrationPreparation(
+  preparation: { readonly status: string; readonly worktreePath: string; readonly headSha: string } | undefined,
+  worktreePath: string,
+  headSha: string | undefined,
+  configuredCommandCount: number,
+): boolean {
+  return configuredCommandCount === 0 || (
+    preparation?.status === 'SUCCEEDED'
+    && preparation.worktreePath === worktreePath
+    && preparation.headSha === headSha
+  );
 }
 
 /**
@@ -116,14 +130,16 @@ export class IntegrationGate {
       const command = normalizeCommand(input, true, defaultTimeoutMs, true);
       const result = await this.runOne(command, index, options, terminationGraceMs);
       results.push(result);
+      await options.onCommandFinished?.(result, index);
       if (result.required && commandFailed(result)) return { passed: false, commands: results };
     }
 
     for (const [index, input] of (options.diagnostics ?? []).entries()) {
       const command = normalizeCommand(input, false, defaultTimeoutMs, false);
-      results.push(
-        await this.runOne(command, options.commands.length + index, options, terminationGraceMs),
-      );
+      const commandIndex = options.commands.length + index;
+      const result = await this.runOne(command, commandIndex, options, terminationGraceMs);
+      results.push(result);
+      await options.onCommandFinished?.(result, commandIndex);
     }
 
     return { passed: true, commands: results };

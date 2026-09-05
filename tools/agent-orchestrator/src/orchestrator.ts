@@ -571,7 +571,7 @@ export class AgentOrchestrator {
         maxHandoffRepairAttempts: config.maxHandoffRepairAttempts + latestRecoveryPolicy.handoffRepair.additionalAttempts,
       };
     }
-    return new AgentOrchestrator({
+    const orchestrator = new AgentOrchestrator({
       config,
       repositoryRoot,
       runsRoot,
@@ -595,6 +595,12 @@ export class AgentOrchestrator {
       ...(options.signal === undefined ? {} : { signal: options.signal }),
       ...(latestRecoveryPolicy?.executors === undefined ? {} : { recoveryExecutors: latestRecoveryPolicy.executors }),
     });
+    // §15 crash safety: heal any adaptive unit left stale by a recovery
+    // whose TaskRunState write landed but whose adaptive mirror didn't (see
+    // reconcileRecoveredAdaptiveUnits) — evidence-gated, so a genuinely
+    // unrecovered failure is never touched merely because it's loaded here.
+    await orchestrator.reconcileRecoveredAdaptiveUnits();
+    return orchestrator;
   }
 
   static async resume(runId: string, options: OrchestratorOptions): Promise<AgentOrchestrator> {
@@ -829,6 +835,11 @@ export class AgentOrchestrator {
         await orchestrator.recoverReviewBlockedTask(entry.task!, entry.taskState);
       }
       recovered.push(entry.taskState.id);
+      // §11: mirror this recovery into the adaptive layer immediately —
+      // never rerun the correction agent, never recreate the commit, never
+      // duplicate the handoff; just complete the same semantic lifecycle a
+      // live success would have run.
+      await orchestrator.completeRecoveredAdaptiveTask(entry.taskState.id, 'handoff_repair');
     }
     const unblocked = await orchestrator.unblockDependencyOnlyFailures();
     if (recovered.length > 0) {
@@ -1218,6 +1229,10 @@ export class AgentOrchestrator {
       parentSha: preparedHeadSha,
       changedFiles: [...ensured.changedFiles],
     });
+    // §12: same post-recovery adaptive completion lifecycle as handoff
+    // repair — no salvage.verify rerun, no second commit, no repeat repair;
+    // this only mirrors the already-accepted success into the adaptive layer.
+    await orchestrator.completeRecoveredAdaptiveTask(taskId, 'salvage');
 
     return { orchestrator, taskId, commitSha: ensured.commitSha };
   }
@@ -1459,6 +1474,7 @@ export class AgentOrchestrator {
       CORRECTION_REQUEST_CREATED: 'ADAPTIVE_CORRECTION_REQUEST_CREATED',
       CORRECTION_GRANTED: 'ADAPTIVE_CORRECTION_GRANTED',
       REVERIFICATION_CREATED: 'ADAPTIVE_REVERIFICATION_CREATED',
+      WORK_UNIT_RECOVERED: 'ADAPTIVE_WORK_UNIT_RECOVERED',
     };
     for (const entry of entries) {
       let name = names[entry.type];
@@ -1515,6 +1531,77 @@ export class AgentOrchestrator {
       return { ...current, adaptive };
     });
     await this.emitAdaptiveEvents(emitted);
+  }
+
+  /**
+   * The single shared post-recovery adaptive completion lifecycle, used by
+   * both recoverHandoffFailures and salvageTask (never duplicated between
+   * them) and by reconcileRecoveredAdaptiveUnits' crash-safety scan. A
+   * successfully recovered task must pass through the SAME semantic
+   * completion the live path uses — mirror the adaptive unit to SUCCEEDED,
+   * then run the identical reconcileAdaptiveCorrectionFlow/
+   * advanceAdaptiveScheduling pair finishParsedHandoff already runs after
+   * every live success, so a canonical correction's targeted re-verification
+   * is materialized exactly as it would be for a live completion.
+   *
+   * Guarded, in order: adaptive strategy in use; the task is actually
+   * SUCCEEDED; an adaptive unit exists for it; that unit is not already
+   * SUCCEEDED (idempotent no-op — never calls recoverFinishedUnit twice);
+   * the unit is a genuine terminal failure (FAILED/TIMED_OUT — a
+   * GRANTED/RUNNING/WAITING/REQUESTED/DENIED unit is never touched here,
+   * that's finishAdaptiveUnit's job); and finally the caller's claimed
+   * recoveryKind actually matches the strongest persisted evidence
+   * (recoveryEvidenceKind) — never inferred, never trusted from the caller
+   * alone. Any failed guard is a silent no-op, not a throw: this runs from
+   * a crash-safety scan over every adaptive unit on every load, where most
+   * units legitimately don't qualify.
+   */
+  private async completeRecoveredAdaptiveTask(
+    taskId: string,
+    recoveryKind: 'handoff_repair' | 'salvage',
+  ): Promise<void> {
+    if (this.state.adaptive === undefined) return;
+    const task = this.state.tasks[taskId];
+    if (task?.status !== 'SUCCEEDED') return;
+    const unit = this.state.adaptive.workUnits.find((candidate) => candidate.id === taskId);
+    if (unit === undefined || unit.status === 'SUCCEEDED') return;
+    if (!['FAILED', 'TIMED_OUT'].includes(unit.status)) return;
+    if (recoveryEvidenceKind(task) !== recoveryKind) return;
+    let emitted: readonly AdaptiveEvent[] = [];
+    await this.mutate((current) => {
+      const coordinator = this.adaptiveCoordinator(current);
+      const previousEvents = current.adaptive!.events.length;
+      coordinator.recoverFinishedUnit(taskId, recoveryKind);
+      const adaptive = coordinator.snapshot();
+      emitted = adaptive.events.slice(previousEvents);
+      return { ...current, adaptive };
+    });
+    await this.emitAdaptiveEvents(emitted);
+    await this.reconcileAdaptiveCorrectionFlow();
+    await this.advanceAdaptiveScheduling();
+  }
+
+  /**
+   * §15 crash safety: heals a run loaded after a crash that landed between
+   * a recovery flow's TaskRunState-SUCCEEDED write and its adaptive mirror.
+   * Deliberately NOT a broadening of the narrow GRANTED/RUNNING crash-window
+   * loop in loadRunForContinuation (that loop mirrors an ACTIVE unit forward
+   * to whatever terminal fact TaskRunState already recorded, which can only
+   * arise mid-flight); this instead heals a unit that is ALREADY terminal
+   * FAILED/TIMED_OUT into SUCCEEDED, which is only ever safe when
+   * recoveryEvidenceKind proves a real recovery flow produced that success —
+   * never merely because the two disagree. Reuses
+   * completeRecoveredAdaptiveTask, so the gating/idempotency logic exists in
+   * exactly one place.
+   */
+  private async reconcileRecoveredAdaptiveUnits(): Promise<void> {
+    if (this.state.adaptive === undefined) return;
+    for (const unit of this.state.adaptive.workUnits) {
+      if (!['FAILED', 'TIMED_OUT'].includes(unit.status)) continue;
+      const kind = recoveryEvidenceKind(this.state.tasks[unit.id]);
+      if (kind === undefined) continue;
+      await this.completeRecoveredAdaptiveTask(unit.id, kind);
+    }
   }
 
   private async authorizeAdaptiveRetry(
@@ -3888,6 +3975,22 @@ function createRunId(clock?: () => Date): string {
 
 function taskStatusRecord(state: RunState): Record<string, TaskStatus> {
   return Object.fromEntries(Object.entries(state.tasks).map(([id, task]) => [id, task.status]));
+}
+
+/**
+ * The strongest persisted proof that a SUCCEEDED task's success came from an
+ * explicit, authorized recovery flow rather than a normal live completion —
+ * used to gate recoverFinishedUnit so a stale adaptive/task mismatch is
+ * never "healed" merely because the two disagree (see
+ * completeRecoveredAdaptiveTask). A live completion never reaches this
+ * check at all, since its adaptive unit is GRANTED/RUNNING (mirrored
+ * normally by finishAdaptiveUnit), not FAILED/TIMED_OUT.
+ */
+function recoveryEvidenceKind(task: TaskRunState | undefined): 'handoff_repair' | 'salvage' | undefined {
+  if (task === undefined || task.status !== 'SUCCEEDED') return undefined;
+  if (task.handoffRepairAttempts.at(-1)?.succeeded === true) return 'handoff_repair';
+  if (task.salvage?.verification?.result === 'passed' && task.commit !== undefined) return 'salvage';
+  return undefined;
 }
 
 function ancestorTasks(task: TaskSpec, graph: TaskGraph): TaskSpec[] {

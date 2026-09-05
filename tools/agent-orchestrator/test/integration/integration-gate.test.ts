@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { IntegrationGate, parseCommand } from '../../src/integration/integration-gate';
+import { IntegrationGate, canReuseIntegrationPreparation, parseCommand } from '../../src/integration/integration-gate';
 
 test('parses quoted arguments without invoking a shell', () => {
   assert.deepEqual(parseCommand(`node -e "console.log('safe value')"`), [
@@ -153,4 +153,12 @@ test('rejects unbounded or invalid timeout configuration before running commands
     }),
     /timeoutMs must be an integer/,
   );
+});
+
+test('preparation reuse is bound to the exact successful worktree and integration head', () => {
+  const preparation = { status: 'SUCCEEDED', worktreePath: '/worktree/one', headSha: 'a'.repeat(40) };
+  assert.equal(canReuseIntegrationPreparation(preparation, '/worktree/one', 'a'.repeat(40), 1), true);
+  assert.equal(canReuseIntegrationPreparation(preparation, '/worktree/recreated', 'a'.repeat(40), 1), false);
+  assert.equal(canReuseIntegrationPreparation(preparation, '/worktree/one', 'b'.repeat(40), 1), false);
+  assert.equal(canReuseIntegrationPreparation(undefined, '/worktree/recreated', 'a'.repeat(40), 0), true);
 });

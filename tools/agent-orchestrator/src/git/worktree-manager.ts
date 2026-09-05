@@ -182,7 +182,7 @@ export class WorktreeManager {
     return entry;
   }
 
-  async cleanup(worktreePath: string): Promise<CleanupResult> {
+  async cleanup(worktreePath: string, options: { readonly allowUntrackedPreparationArtifacts?: boolean } = {}): Promise<CleanupResult> {
     return this.exclusive(async () => {
       const candidate = resolve(worktreePath);
       assertContained(this.ownedRoot, candidate, false);
@@ -223,8 +223,21 @@ export class WorktreeManager {
         );
       }
 
-      // No --force: dirty, locked, or otherwise unsafe worktrees are preserved.
-      await this.git.run(this.repositoryRoot, ['worktree', 'remove', candidate]);
+      if (options.allowUntrackedPreparationArtifacts) {
+        if (entry.kind !== 'integration') {
+          throw new WorktreeSafetyError('WORKTREE_REGISTRY_MISMATCH', 'Only integration worktrees may remove preparation artifacts');
+        }
+        const tracked = (await this.git.run(candidate, ['status', '--porcelain', '--untracked-files=no'])).stdout.trim();
+        if (tracked !== '') {
+          throw new WorktreeSafetyError('WORKTREE_REGISTRY_MISMATCH', `Integration worktree has tracked modifications: ${candidate}`);
+        }
+      }
+      // Force is narrowly allowed only for an integration worktree whose
+      // tracked source was proven clean; it removes configured preparation
+      // artifacts such as node_modules without weakening task-worktree safety.
+      await this.git.run(this.repositoryRoot, [
+        'worktree', 'remove', ...(options.allowUntrackedPreparationArtifacts ? ['--force'] : []), candidate,
+      ]);
       await this.writeRegistry(withoutEntry(registry, candidate));
       return { entry, alreadyMissing: false };
     });
