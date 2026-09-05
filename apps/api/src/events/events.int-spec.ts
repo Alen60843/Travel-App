@@ -105,23 +105,9 @@ describe('EventsService (real PostgreSQL/PostGIS)', () => {
     inactiveCategoryId = inactiveCategory.id;
   });
 
-  afterAll(async () => {
-    try {
-      if (AppDataSource.isInitialized) {
-        await AppDataSource.query(
-          `DELETE FROM events
-            WHERE host_user_id IN (SELECT id FROM users WHERE firebase_uid LIKE $1)`,
-          [`${UID_PREFIX}%`],
-        );
-        await AppDataSource.query(`DELETE FROM event_categories WHERE id = $1`, [
-          inactiveCategoryId,
-        ]);
-        await AppDataSource.query(`DELETE FROM users WHERE firebase_uid LIKE $1`, [
-          `${UID_PREFIX}%`,
-        ]);
-      }
-    } finally {
-      if (AppDataSource.isInitialized) await AppDataSource.destroy();
+    afterAll(async () => {
+    if (AppDataSource.isInitialized) {
+      await AppDataSource.destroy();
     }
   });
 
