@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 import type { Agent, AgentName, AgentRequest, AgentResult } from '../../src/agents';
+import { isOrchestratorError } from '../../src/errors';
 import { WorktreeManager } from '../../src/git';
 import { AgentOrchestrator } from '../../src/orchestrator';
 import type { RunState, TaskRunState } from '../../src/state';
@@ -314,6 +315,197 @@ test('Phase6-shaped acceptance: authorizing a recovery policy, then salvaging f0
     assert.deepEqual(afterRecovery.tasks['f001-task'], afterSalvage.tasks['f001-task'], 'f001-task must be unaffected by the later f002-task recovery');
 
     // The immutable phase.yaml snapshot was never edited at any point.
+    const phaseSnapshotFinal = await readFile(join(orchestrator.stateStore.runDirectory, 'phase.yaml'), 'utf8');
+    assert.equal(phaseSnapshotFinal, phaseSnapshotBefore);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+/**
+ * The configured recovery executor's response has the EXACT real F002
+ * dogfood defect: it prefaces its repaired JSON with prose and wraps it in
+ * a markdown fence, instead of the earlier MetadataRepairAgent's bare JSON.
+ */
+class ProseFencedRepairAgent implements Agent {
+  readonly invocations: AgentRequest[] = [];
+  constructor(readonly name: AgentName) {}
+  async run(request: AgentRequest): Promise<AgentResult> {
+    this.invocations.push(request);
+    const spec = request.taskSpecification as { malformedOutput: Record<string, unknown> };
+    const repaired = { ...spec.malformedOutput, tests: [] };
+    const now = new Date().toISOString();
+    return {
+      agent: this.name, runId: request.runId, taskId: request.taskId, status: 'succeeded', failureCode: null,
+      exitCode: 0, signal: null,
+      stdoutPath: join(request.artifactsDirectory, `${request.taskId}.stdout`),
+      stderrPath: join(request.artifactsDirectory, `${request.taskId}.stderr`),
+      structuredHandoff: null,
+      rawStdout: `I'll proceed directly to producing the repaired JSON.\n\n\`\`\`json\n${JSON.stringify(repaired)}\n\`\`\`\n`,
+      changedFiles: [], gitDiffSummary: null, testsReported: [],
+      unresolvedQuestions: [], startedAt: now, endedAt: now, durationMs: 1, timedOut: false, aborted: false,
+      errorMessage: null,
+    };
+  }
+}
+
+test('Phase6-shaped regression: F002 with 2 exhausted handoff-repair attempts (legacy_unknown + a failed Claude repair) recovers on a 3rd, budget-extended attempt via prose-fenced JSON framing, leaving F003/work4 untouched', async () => {
+  const fixture = await createTemporaryRepository();
+  try {
+    await writeFile(join(fixture.repository, 'design.md'), '# Design\n', 'utf8');
+    await writeFile(join(fixture.repository, 'f002.txt'), 'base\n', 'utf8');
+    await writeFile(join(fixture.repository, 'f003.txt'), 'base\n', 'utf8');
+    await fixture.git.run(fixture.repository, ['add', '--', 'design.md', 'f002.txt', 'f003.txt']);
+    await fixture.git.run(fixture.repository, ['commit', '-m', 'baseline']);
+    const runsRoot = join(fixture.container, 'runs');
+    const phaseFile = join(fixture.container, 'phase.yaml');
+    // Reuses the same F001/F002/F003/work4 shape as the acceptance test
+    // above; f001-task is left untouched (unregistered, never salvaged —
+    // out of scope here, matching the real run's deferred F001 salvage).
+    await writeFile(phaseFile, phaseYaml(fixture.baseBranch), 'utf8');
+
+    const orchestrator = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: fixture.repository,
+      runsRoot,
+      agents: { codex: new NeverAgent('codex'), claude: new NeverAgent('claude') },
+    });
+    const runId = orchestrator.snapshot().runId;
+    const before = orchestrator.snapshot();
+    const phaseSnapshotBefore = await readFile(join(orchestrator.stateStore.runDirectory, 'phase.yaml'), 'utf8');
+
+    const worktrees = await WorktreeManager.create({ repositoryPath: fixture.repository });
+    const f002Worktree = await worktrees.createTaskWorktree({
+      runId, taskId: 'f002-task', baseBranch: fixture.baseBranch, baseSha: before.baseSha,
+    });
+    await writeFile(join(f002Worktree.path, 'f002.txt'), 'corrected F002\n', 'utf8');
+    const logsDir = join(orchestrator.stateStore.runDirectory, 'logs');
+    await mkdir(logsDir, { recursive: true });
+    await writeFile(
+      join(logsDir, `${runId}.f002-task.codex.attempt-1.stdout.log`),
+      JSON.stringify(malformedRequiringAgentRepair()),
+      'utf8',
+    );
+
+    const f002State: TaskRunState = {
+      ...before.tasks['f002-task']!,
+      status: 'FAILED',
+      worktreePath: f002Worktree.path,
+      branch: f002Worktree.branch,
+      preparedHeadSha: before.baseSha,
+      startedAt: before.createdAt,
+      finishedAt: before.createdAt,
+      agentAttempts: [{
+        attempt: 1, agent: 'codex', startedAt: before.createdAt, finishedAt: before.createdAt, outcome: 'succeeded',
+      }],
+      error: { code: 'HANDOFF_INVALID', message: 'handoff.tests must be an array', at: before.createdAt },
+      // The real F002 shape: a migrated legacy attempt, then a native
+      // agent-tier attempt that failed with evidence_insufficient — the
+      // exact misclassification the framing bug caused before this fix,
+      // since the repair agent's prose+fence response was never actually
+      // evidence-insufficient, just unparsed.
+      handoffRepairAttempts: [
+        { method: 'legacy_unknown', succeeded: false, failureReason: 'legacy_unknown' },
+        {
+          method: 'agent', succeeded: false, failureReason: 'evidence_insufficient',
+          timestamp: before.createdAt, repairExecutorId: 'metadata-repairer', repairAdapter: 'claude',
+        },
+      ],
+    };
+    const f003State: TaskRunState = {
+      ...before.tasks['f003-task']!,
+      status: 'SUCCEEDED',
+      finishedAt: before.createdAt,
+      handoffPath: join(orchestrator.stateStore.runDirectory, 'handoffs', 'f003-task.json'),
+      handoffOutcome: 'valid',
+      commit: { sha: '2'.repeat(40), parentSha: before.baseSha, changedFiles: ['f003.txt'] },
+      agentAttempts: [{
+        attempt: 1, agent: 'codex', startedAt: before.createdAt, finishedAt: before.createdAt, outcome: 'succeeded',
+      }],
+    };
+    const work4State: TaskRunState = {
+      ...before.tasks['work4-task']!,
+      status: 'SUCCEEDED',
+      finishedAt: before.createdAt,
+      handoffPath: join(orchestrator.stateStore.runDirectory, 'handoffs', 'work4-task.json'),
+      handoffOutcome: 'valid',
+      reviewPaths: [join(orchestrator.stateStore.runDirectory, 'reviews', 'work4-task-1.json')],
+      agentAttempts: [{
+        attempt: 1, agent: 'claude', startedAt: before.createdAt, finishedAt: before.createdAt, outcome: 'succeeded',
+      }],
+    };
+    const initial: RunState = {
+      ...before,
+      status: 'FAILED',
+      tasks: { ...before.tasks, 'f002-task': f002State, 'f003-task': f003State, 'work4-task': work4State },
+    };
+    await orchestrator.stateStore.save(initial);
+    const f003Before = structuredClone(f003State);
+    const work4Before = structuredClone(work4State);
+
+    // --- Proof the fix is actually necessary: without any authorized
+    // policy, the base budget (2) is already exhausted by the two
+    // persisted attempts above, so recovery must still refuse. ------------
+    await assert.rejects(
+      () => AgentOrchestrator.recoverHandoffFailures(runId, {
+        repositoryPath: fixture.repository, runsRoot,
+        agents: { codex: new NeverAgent('codex'), claude: new NeverAgent('claude') },
+      }),
+      (error: unknown) => {
+        if (!isOrchestratorError(error, 'TASK_STATE_INVALID')) throw error;
+        const details = error.details as unknown as { ineligible: Array<{ taskId: string; reasonCode?: string }> };
+        assert.equal(details.ineligible[0]?.taskId, 'f002-task');
+        assert.equal(details.ineligible[0]?.reasonCode, 'HANDOFF_REPAIR_BUDGET_EXHAUSTED');
+        return true;
+      },
+    );
+
+    // --- Authorize the combined overlay: one additional attempt, plus the
+    // same claude recovery executor as before -----------------------------
+    const authorization = await AgentOrchestrator.authorizeRecoveryPolicy(runId, {
+      handoffRepair: { additionalAttempts: 1 },
+      executors: [{
+        id: 'metadata-repairer', adapter: 'claude', roles: ['handoff_repair'],
+        capabilities: [{ capability: 'handoff_repair' }], available: true,
+      }],
+    }, { repositoryPath: fixture.repository, runsRoot, agents: { codex: new NeverAgent('codex'), claude: new NeverAgent('claude') } });
+    assert.equal(authorization.orchestrator.snapshot().recoveryPolicyHistory?.length, 1);
+    assert.equal(
+      await readFile(join(orchestrator.stateStore.runDirectory, 'phase.yaml'), 'utf8'),
+      phaseSnapshotBefore,
+      'the overlay never touches the immutable phase.yaml snapshot',
+    );
+
+    // --- The 3rd attempt: the configured executor returns prose-fenced
+    // JSON (the real bug), which framing must extract deterministically --
+    const codexDuringRecovery = new NeverAgent('codex');
+    const claudeDuringRecovery = new ProseFencedRepairAgent('claude');
+    const recovery = await AgentOrchestrator.recoverHandoffFailures(runId, {
+      repositoryPath: fixture.repository, runsRoot,
+      agents: { codex: codexDuringRecovery, claude: claudeDuringRecovery },
+    });
+    assert.deepEqual(recovery.recovered, ['f002-task']);
+    assert.equal(claudeDuringRecovery.invocations.length, 1, 'exactly one bounded repair call — no second agent invocation');
+
+    const afterRecovery = recovery.orchestrator.snapshot();
+    assert.equal(afterRecovery.tasks['f002-task']?.status, 'SUCCEEDED');
+    assert.equal(afterRecovery.tasks['f002-task']?.handoffRepairAttempts.length, 3);
+    assert.equal(afterRecovery.tasks['f002-task']?.handoffRepairAttempts[0]?.method, 'legacy_unknown');
+    assert.equal(afterRecovery.tasks['f002-task']?.handoffRepairAttempts[1]?.failureReason, 'evidence_insufficient');
+    assert.equal(afterRecovery.tasks['f002-task']?.handoffRepairAttempts[2]?.method, 'agent');
+    assert.equal(afterRecovery.tasks['f002-task']?.handoffRepairAttempts[2]?.succeeded, true);
+    assert.equal(afterRecovery.tasks['f002-task']?.handoffRepairAttempts[2]?.repairExecutorId, 'metadata-repairer');
+    assert.equal(afterRecovery.tasks['f002-task']?.handoffRepairAttempts[2]?.repairAdapter, 'claude');
+    // No code regeneration occurred — the diff committed is exactly the
+    // agent's original (pre-recovery) uncommitted fix.
+    assert.equal(
+      (await fixture.git.run(f002Worktree.path, ['show', 'HEAD:f002.txt'])).stdout,
+      'corrected F002\n',
+    );
+
+    // --- Formal invariant: F003/work4 remain provably unchanged ----------
+    assert.deepEqual(afterRecovery.tasks['f003-task'], f003Before, 'f003-task must remain unchanged after recovering f002-task');
+    assert.deepEqual(afterRecovery.tasks['work4-task'], work4Before, 'work4-task must remain unchanged after recovering f002-task');
+
     const phaseSnapshotFinal = await readFile(join(orchestrator.stateStore.runDirectory, 'phase.yaml'), 'utf8');
     assert.equal(phaseSnapshotFinal, phaseSnapshotBefore);
   } finally {
