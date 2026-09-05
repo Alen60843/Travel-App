@@ -38,6 +38,12 @@ import {
   type StructuredHandoff,
 } from './handoff';
 import { IntegrationGate, canReuseIntegrationPreparation } from './integration/integration-gate';
+import {
+  hashRecoveryPolicy,
+  parseRecoveryPolicyOverlay,
+  type RecoveryExecutorConfig,
+  type RecoveryPolicyOverlay,
+} from './recovery/policy';
 import { extractStructuredPayload } from './protocol';
 import { parseReview, validateReview, type StructuredReview } from './review/findings';
 import {
@@ -49,6 +55,7 @@ import {
   type AgentAttemptState,
   type AgentFailureRecoveryState,
   type HandoffRepairAttemptRecord,
+  type RecoveryPolicySnapshot,
   type RunEventName,
   type RunState,
   type StoredError,
@@ -196,6 +203,12 @@ export interface SalvageResult {
   readonly orchestrator: AgentOrchestrator;
   readonly taskId: string;
   readonly commitSha: string;
+}
+
+/** Result of AgentOrchestrator.authorizeRecoveryPolicy. */
+export interface RecoveryPolicyAuthorizationResult {
+  readonly orchestrator: AgentOrchestrator;
+  readonly policyHash: string;
 }
 
 export async function planPhase(
@@ -655,6 +668,39 @@ export class AgentOrchestrator {
    * human review" means exactly that, not a partial silent recovery that
    * could leave the run in a confusing mixed state.
    */
+  /**
+   * Authorizes a recovery-only policy overlay for a historical run without
+   * ever editing its immutable phase.yaml snapshot. Validates and normalizes
+   * the raw policy, hashes the normalized representation (never raw YAML
+   * bytes — see hashRecoveryPolicy), and appends one immutable snapshot to
+   * recoveryPolicyHistory. Deliberately request -> grant, never request ->
+   * execute: this method invokes no agent, salvages no work, repairs no
+   * handoff, creates no task commit, and does not resume the run — it only
+   * authorizes and persists policy. A later agents:recover-handoffs or
+   * agents:salvage-task call picks up the most recently authorized snapshot
+   * the next time the run is loaded.
+   */
+  static async authorizeRecoveryPolicy(
+    runId: string,
+    rawPolicy: unknown,
+    options: OrchestratorOptions,
+  ): Promise<RecoveryPolicyAuthorizationResult> {
+    const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options);
+    const policy = parseRecoveryPolicyOverlay(rawPolicy);
+    const policyHash = hashRecoveryPolicy(policy);
+    const snapshot: RecoveryPolicySnapshot = {
+      authorizedAt: orchestrator.clock().toISOString(),
+      policyHash,
+      policy,
+    };
+    await orchestrator.mutate((state) => ({
+      ...state,
+      recoveryPolicyHistory: [...(state.recoveryPolicyHistory ?? []), snapshot],
+    }));
+    await orchestrator.event('RECOVERY_POLICY_AUTHORIZED', undefined, { policyHash });
+    return { orchestrator, policyHash };
+  }
+
   static async recoverHandoffFailures(
     runId: string,
     options: OrchestratorOptions,

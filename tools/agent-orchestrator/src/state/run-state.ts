@@ -301,6 +301,7 @@ export const RUN_EVENT_NAMES = [
   'SALVAGE_AUTHORIZED',
   'SALVAGE_VERIFIED',
   'SALVAGE_VERIFICATION_FAILED',
+  'RECOVERY_POLICY_AUTHORIZED',
 ] as const;
 export type RunEventName = (typeof RUN_EVENT_NAMES)[number];
 

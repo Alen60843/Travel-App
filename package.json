@@ -21,6 +21,7 @@
     "agents:recover-handoffs": "pnpm --filter @tripwith/agent-orchestrator recover-handoffs",
     "agents:retry-agent": "pnpm --filter @tripwith/agent-orchestrator retry-agent",
     "agents:salvage-task": "pnpm --filter @tripwith/agent-orchestrator salvage-task",
+    "agents:authorize-recovery-policy": "pnpm --filter @tripwith/agent-orchestrator authorize-recovery-policy",
     "agents:retry-integration": "pnpm --filter @tripwith/agent-orchestrator retry-integration",
     "agents:apply-integration-fix": "pnpm --filter @tripwith/agent-orchestrator apply-integration-fix",
     "check:enums": "node scripts/check-enum-parity.mjs",

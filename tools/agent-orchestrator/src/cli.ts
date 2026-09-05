@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 
+import { readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
+import { parseStrictYaml } from './config';
 import { GitClient, WorktreeManager } from './git';
 import { computeRunMetrics } from './metrics/compute-metrics';
 import { AgentOrchestrator, planOrchestrationPhase, type AnyPlanResult, type PlanResult } from './orchestrator';
@@ -21,6 +23,7 @@ Usage:
   pnpm agents:recover-handoffs <run-id>
   pnpm agents:retry-agent <run-id> <task-id>
   pnpm agents:salvage-task <run-id> <task-id>
+  pnpm agents:authorize-recovery-policy <run-id> <policy-file>
   pnpm agents:retry-integration <run-id>
   pnpm agents:apply-integration-fix <run-id> <summary> <ownership-glob> [more-globs...]
 
@@ -48,6 +51,16 @@ then the Orchestrator itself creates the commit, the same way agents:apply-integ
 does. It never invokes an agent for the base flow; a task with a required canonical finding
 still needs one bounded, evidence-only repair call to complete its findingResponses, exactly
 like recover-handoffs. Run agents:resume afterward to continue the run.
+authorize-recovery-policy loads and validates a recovery-only policy overlay (YAML file,
+salvage.verify and/or executors only) and appends one immutable, hashed snapshot to the run's
+recoveryPolicyHistory -- it NEVER edits the run's immutable phase.yaml snapshot, NEVER invokes
+an agent, salvages no work, repairs no handoff, creates no task commit, and does not resume the
+run. It only authorizes and persists policy, the same request/grant-before-execute separation
+the rest of this Orchestrator already follows. The most recently authorized snapshot is applied
+the next time the run is loaded by recover-handoffs, salvage-task, or resume. Recovery-executor
+routing is limited honestly to this Orchestrator's two existing adapters (codex, claude); if
+executors are explicitly configured and none is eligible for a given repair, that repair fails
+closed rather than silently falling back to the original task owner.
 retry-integration retries ONLY the deterministic integration gate for a run that is BLOCKED
 specifically with INTEGRATION_TEST_FAILED (never for any other blocking reason); it archives
 the failed attempt (never overwrites it) and does not invoke any agent or move any task. Run
@@ -121,6 +134,25 @@ async function main(argv: readonly string[]): Promise<number> {
       taskId: result.taskId,
       commitSha: result.commitSha,
       manualNextStep: 'Inspect the salvaged commit above, then run `pnpm agents:resume <run-id>` to continue the run.',
+    }, null, 2)}\n`);
+    return 0;
+  }
+  if (command === 'authorize-recovery-policy') {
+    const [policyFile] = extra;
+    if (argument === undefined || policyFile === undefined || extra.length !== 1) {
+      process.stderr.write(`${USAGE}\n`);
+      return 1;
+    }
+    const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
+    const source = await readFile(resolve(policyFile), 'utf8');
+    const rawPolicy = parseStrictYaml(source);
+    const result = await AgentOrchestrator.authorizeRecoveryPolicy(argument, rawPolicy, {
+      repositoryPath,
+    });
+    process.stdout.write(`${JSON.stringify({
+      runId: result.orchestrator.snapshot().runId,
+      policyHash: result.policyHash,
+      manualNextStep: 'Run `pnpm agents:recover-handoffs <run-id>` or `pnpm agents:salvage-task <run-id> <task-id>` to use this authorized policy.',
     }, null, 2)}\n`);
     return 0;
   }
