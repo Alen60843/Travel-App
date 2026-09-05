@@ -48,15 +48,29 @@ export interface IntegrationGateOptions {
 }
 
 export function canReuseIntegrationPreparation(
-  preparation: { readonly status: string; readonly worktreePath: string; readonly headSha: string } | undefined,
+  preparation: {
+    readonly status: string;
+    readonly worktreePath: string;
+    readonly headSha: string;
+    readonly prepareConfigFingerprint?: string;
+  } | undefined,
   worktreePath: string,
   headSha: string | undefined,
   configuredCommandCount: number,
+  // Omitted entirely (both here and on a legacy-shaped `preparation`)
+  // preserves prior behavior exactly (undefined === undefined). Once a
+  // caller starts passing this, any mismatch — including a persisted
+  // checkpoint that predates this field — fails closed to NOT reusable:
+  // a checkpoint must never be trusted to have run commands that were
+  // never actually configured when it ran (e.g. an authorized
+  // integrationRecovery.prepare overlay changing the effective list).
+  prepareConfigFingerprint?: string,
 ): boolean {
   return configuredCommandCount === 0 || (
     preparation?.status === 'SUCCEEDED'
     && preparation.worktreePath === worktreePath
     && preparation.headSha === headSha
+    && preparation.prepareConfigFingerprint === prepareConfigFingerprint
   );
 }
 

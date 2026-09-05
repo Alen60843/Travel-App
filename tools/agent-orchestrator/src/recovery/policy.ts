@@ -57,14 +57,16 @@ export interface RecoveryPolicyOverlay {
   readonly executors?: readonly RecoveryExecutorConfig[];
   readonly handoffRepair?: { readonly additionalAttempts: number };
   readonly recoveryBudget?: { readonly maxWallClockMs: number };
+  readonly integrationRecovery?: { readonly prepare: readonly IntegrationCommand[] };
 }
 
-const TOP_LEVEL_KEYS = new Set(['salvage', 'executors', 'handoffRepair', 'recoveryBudget']);
+const TOP_LEVEL_KEYS = new Set(['salvage', 'executors', 'handoffRepair', 'recoveryBudget', 'integrationRecovery']);
 const SALVAGE_KEYS = new Set(['verify']);
 const EXECUTOR_KEYS = new Set(['id', 'adapter', 'roles', 'capabilities', 'model', 'available']);
 const CAPABILITY_KEYS = new Set(['capability', 'minimumLevel']);
 const HANDOFF_REPAIR_KEYS = new Set(['additionalAttempts']);
 const RECOVERY_BUDGET_KEYS = new Set(['maxWallClockMs']);
+const INTEGRATION_RECOVERY_KEYS = new Set(['prepare']);
 
 /**
  * Bounded well above any realistic authorized extension — this is an
@@ -173,11 +175,18 @@ export function parseRecoveryPolicyOverlay(value: unknown): RecoveryPolicyOverla
     );
     recoveryBudget = { maxWallClockMs };
   }
+  let integrationRecovery: { readonly prepare: readonly IntegrationCommand[] } | undefined;
+  if (value.integrationRecovery !== undefined) {
+    if (!isRecord(value.integrationRecovery)) invalid('integrationRecovery', 'must be an object');
+    assertKnownKeys(value.integrationRecovery, INTEGRATION_RECOVERY_KEYS, 'integrationRecovery');
+    integrationRecovery = { prepare: parseCommandList(value.integrationRecovery.prepare, 'integrationRecovery.prepare', true) };
+  }
   return {
     ...(salvage === undefined ? {} : { salvage }),
     ...(executors === undefined ? {} : { executors }),
     ...(handoffRepair === undefined ? {} : { handoffRepair }),
     ...(recoveryBudget === undefined ? {} : { recoveryBudget }),
+    ...(integrationRecovery === undefined ? {} : { integrationRecovery }),
   };
 }
 

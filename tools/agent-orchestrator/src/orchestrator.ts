@@ -571,6 +571,21 @@ export class AgentOrchestrator {
         maxHandoffRepairAttempts: config.maxHandoffRepairAttempts + latestRecoveryPolicy.handoffRepair.additionalAttempts,
       };
     }
+    // Replacement, not concatenation: the historical phase.yaml's own
+    // integration.prepare remains truthful, immutable history (still
+    // exactly what attempt 1 actually ran, in integrationAttempts). An
+    // authorized integrationRecovery.prepare entirely REPLACES the
+    // effective list for every later attempt — accidentally re-running the
+    // original (already-passing) `pnpm install` twice is harmless, but
+    // concatenation semantics would silently couple this run's recovery
+    // policy to whatever order/count the original phase file happened to
+    // use, which is not what "explicitly authorized preparation" means.
+    if (latestRecoveryPolicy?.integrationRecovery !== undefined) {
+      config = {
+        ...config,
+        integration: { ...config.integration, prepare: latestRecoveryPolicy.integrationRecovery.prepare },
+      };
+    }
     const orchestrator = new AgentOrchestrator({
       config,
       repositoryRoot,
@@ -3071,11 +3086,22 @@ export class AgentOrchestrator {
       }
     }
 
+    // Included in the checkpoint so a later attempt whose EFFECTIVE
+    // integration.prepare differs (e.g. an authorized
+    // integrationRecovery.prepare overlay) can never wrongly reuse a
+    // checkpoint that ran a different — and here, incomplete — command
+    // list. A legacy checkpoint persisted before this field existed has no
+    // fingerprint at all, which also fails the comparison (undefined !==
+    // a real hash) and correctly forces one safe re-run.
+    const prepareConfigFingerprint = createHash('sha256')
+      .update(JSON.stringify(this.config.integration.prepare), 'utf8')
+      .digest('hex');
     const preparationReusable = canReuseIntegrationPreparation(
       this.state.integration.preparation,
       worktree.path,
       this.state.integration.headSha,
       this.config.integration.prepare.length,
+      prepareConfigFingerprint,
     );
     if (!preparationReusable) {
       const startedAt = this.clock().toISOString();
@@ -3089,7 +3115,7 @@ export class AgentOrchestrator {
           ...state.integration,
           preparation: {
             status: 'RUNNING', worktreePath: worktree.path, headSha: state.integration.headSha!,
-            commands: [], startedAt,
+            commands: [], startedAt, prepareConfigFingerprint,
           },
         },
       }));

@@ -206,6 +206,16 @@ export interface IntegrationPreparationState {
   readonly commands: readonly IntegrationCommandState[];
   readonly startedAt: string;
   readonly finishedAt?: string;
+  /**
+   * SHA-256 of the exact configured `integration.prepare` command list this
+   * checkpoint ran under — absent only for a run persisted before this
+   * field existed. canReuseIntegrationPreparation treats an absent or
+   * mismatched fingerprint as NOT reusable (fail closed): a legacy
+   * checkpoint, or one computed under a different prepare list (e.g. after
+   * an authorized integrationRecovery.prepare overlay), must never be
+   * silently trusted to have run commands it never actually ran.
+   */
+  readonly prepareConfigFingerprint?: string;
 }
 
 export interface RunState {
@@ -630,6 +640,9 @@ function parseIntegrationState(value: unknown, path: string): IntegrationRunStat
       }),
       startedAt: timestamp(prep.startedAt, `${path}.preparation.startedAt`),
       ...(prep.finishedAt === undefined ? {} : { finishedAt: timestamp(prep.finishedAt, `${path}.preparation.finishedAt`) }),
+      ...(prep.prepareConfigFingerprint === undefined
+        ? {}
+        : { prepareConfigFingerprint: string(prep.prepareConfigFingerprint, `${path}.preparation.prepareConfigFingerprint`) }),
     };
   }
   return {

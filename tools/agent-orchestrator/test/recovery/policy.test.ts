@@ -271,3 +271,87 @@ test('no recoveryBudget field preserves current behavior (absent, not defaulted)
   const overlay = parseRecoveryPolicyOverlay({ handoffRepair: { additionalAttempts: 1 } });
   assert.equal(overlay.recoveryBudget, undefined);
 });
+
+// --- integrationRecovery.prepare (integration recovery preparation overlay) ---
+
+test('integrationRecovery.prepare parses using the same shape/defaults as other integration commands', () => {
+  const overlay = parseRecoveryPolicyOverlay({
+    integrationRecovery: {
+      prepare: [
+        { command: 'pnpm install --frozen-lockfile', required: true, timeoutMs: 900000 },
+        { command: 'pnpm --filter @tripwith/shared build', required: true, timeoutMs: 300000 },
+      ],
+    },
+  });
+  assert.deepEqual(overlay.integrationRecovery, {
+    prepare: [
+      { command: 'pnpm install --frozen-lockfile', required: true, timeoutMs: 900000 },
+      { command: 'pnpm --filter @tripwith/shared build', required: true, timeoutMs: 300000 },
+    ],
+  });
+});
+
+test('integrationRecovery.prepare commands default required to true', () => {
+  const overlay = parseRecoveryPolicyOverlay({ integrationRecovery: { prepare: ['pnpm install'] } });
+  assert.equal(overlay.integrationRecovery?.prepare[0]?.required, true);
+});
+
+test('a malformed integrationRecovery.prepare command fails closed', () => {
+  assert.throws(
+    () => parseRecoveryPolicyOverlay({ integrationRecovery: { prepare: [{ command: '' }] } }),
+    (error: unknown) => isOrchestratorError(error, 'CONFIG_INVALID'),
+  );
+});
+
+test('integrationRecovery.prepare must be an array', () => {
+  assert.throws(
+    () => parseRecoveryPolicyOverlay({ integrationRecovery: { prepare: 'pnpm install' } }),
+    (error: unknown) => isOrchestratorError(error, 'CONFIG_INVALID'),
+  );
+});
+
+test('an unknown integrationRecovery key is rejected', () => {
+  assert.throws(
+    () => parseRecoveryPolicyOverlay({ integrationRecovery: { prepare: ['pnpm install'], commands: ['pnpm build'] } }),
+    (error: unknown) => isOrchestratorError(error, 'CONFIG_INVALID'),
+  );
+});
+
+test('integrationRecovery.prepare participates in the semantic policy hash', () => {
+  const a = parseRecoveryPolicyOverlay({ integrationRecovery: { prepare: ['pnpm install', 'pnpm --filter @tripwith/shared build'] } });
+  const b = parseRecoveryPolicyOverlay({ integrationRecovery: { prepare: ['pnpm install', 'pnpm --filter @tripwith/shared test'] } });
+  const withoutOverlay = parseRecoveryPolicyOverlay({});
+  assert.notEqual(hashRecoveryPolicy(a), hashRecoveryPolicy(b));
+  assert.notEqual(hashRecoveryPolicy(a), hashRecoveryPolicy(withoutOverlay));
+});
+
+test('integrationRecovery.prepare order is semantically significant for the hash', () => {
+  const a = parseRecoveryPolicyOverlay({ integrationRecovery: { prepare: ['pnpm install', 'pnpm --filter @tripwith/shared build'] } });
+  const b = parseRecoveryPolicyOverlay({ integrationRecovery: { prepare: ['pnpm --filter @tripwith/shared build', 'pnpm install'] } });
+  assert.notEqual(hashRecoveryPolicy(a), hashRecoveryPolicy(b));
+});
+
+test('integrationRecovery.prepare timeout changes the hash', () => {
+  const a = parseRecoveryPolicyOverlay({ integrationRecovery: { prepare: [{ command: 'pnpm install', required: true, timeoutMs: 900000 }] } });
+  const b = parseRecoveryPolicyOverlay({ integrationRecovery: { prepare: [{ command: 'pnpm install', required: true, timeoutMs: 60000 }] } });
+  assert.notEqual(hashRecoveryPolicy(a), hashRecoveryPolicy(b));
+});
+
+test('integrationRecovery.prepare hashes identically regardless of surrounding key order/formatting', () => {
+  const a = parseRecoveryPolicyOverlay({
+    salvage: { verify: [] },
+    integrationRecovery: { prepare: [{ command: 'pnpm install', required: true, timeoutMs: 900000 }] },
+    handoffRepair: { additionalAttempts: 1 },
+  });
+  const b = parseRecoveryPolicyOverlay({
+    handoffRepair: { additionalAttempts: 1 },
+    integrationRecovery: { prepare: [{ timeoutMs: 900000, command: 'pnpm install', required: true }] },
+    salvage: { verify: [] },
+  });
+  assert.equal(hashRecoveryPolicy(a), hashRecoveryPolicy(b));
+});
+
+test('no integrationRecovery field preserves current behavior (absent, not defaulted)', () => {
+  const overlay = parseRecoveryPolicyOverlay({ handoffRepair: { additionalAttempts: 1 } });
+  assert.equal(overlay.integrationRecovery, undefined);
+});
