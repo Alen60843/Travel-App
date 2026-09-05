@@ -89,9 +89,10 @@ test('CodexAgent builds the canonical argv: -C/-s/-a before exec (required — e
 });
 
 /**
- * Real, no-network, no-paid parser-level smoke check (best-effort — only
- * runs when a real Codex binary is actually resolvable on this machine,
- * exactly like this run's `agents:plan` preflight did). It proves the
+ * Optional real, no-network, no-paid parser-level smoke check. Normal test
+ * runs never invoke a provider CLI; a human must explicitly opt in with
+ * ORCHESTRATOR_REAL_CLI_SMOKE=1, after which this still runs only when a real
+ * Codex binary is resolvable. It proves the
  * production argv is genuinely ACCEPTED by the installed CLI's argument
  * parser, not merely internally self-consistent: the trailing stdin marker
  * `-` is replaced with `--help`, which clap only reaches — and only prints
@@ -99,6 +100,9 @@ test('CodexAgent builds the canonical argv: -C/-s/-a before exec (required — e
  * successfully. No model task starts and no network call is made.
  */
 test('the real installed Codex CLI parser accepts the exact constructed argv (no network, no paid call)', async () => {
+  if (process.env.ORCHESTRATOR_REAL_CLI_SMOKE !== '1') {
+    return;
+  }
   const resolution = await resolveAgentExecutable('codex');
   if (resolution === null) {
     return; // no real Codex binary on this machine; the unit test above still covers argv shape.
