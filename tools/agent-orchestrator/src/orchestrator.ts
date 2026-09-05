@@ -181,6 +181,7 @@ type SalvageEligibilityReasonCode =
 type HandoffRepairMethod = 'framing' | 'deterministic' | 'agent';
 type HandoffRepairFailureReason =
   | 'agent_invocation_failed'
+  | 'repair_output_invalid'
   | 'evidence_insufficient'
   | 'contradiction_detected'
   | 'no_eligible_recovery_executor';
@@ -193,7 +194,13 @@ type RepairOutcome =
       readonly executorId?: string;
       readonly adapter?: AgentName;
     }
-  | { readonly ok: false; readonly reason: HandoffRepairFailureReason };
+  | {
+      readonly ok: false;
+      readonly reason: HandoffRepairFailureReason;
+      /** Present only once routing resolved an executor (i.e. not for no_eligible_recovery_executor) — see resolveHandoffRepairExecutor. */
+      readonly executorId?: string;
+      readonly adapter?: AgentName;
+    };
 
 /** Result of recoverHandoffFailures: which persisted FAILED tasks were actually recovered, and why any others were left untouched. */
 export interface HandoffRecoveryResult {
@@ -2266,7 +2273,17 @@ export class AgentOrchestrator {
             ...(repaired.executorId === undefined ? {} : { repairExecutorId: repaired.executorId }),
             ...(repaired.adapter === undefined ? {} : { repairAdapter: repaired.adapter }),
           }
-        : { method: 'none', succeeded: false, failureReason: repaired.reason, timestamp: this.clock().toISOString() };
+        : {
+            method: 'none',
+            succeeded: false,
+            failureReason: repaired.reason,
+            timestamp: this.clock().toISOString(),
+            // Recorded even on failure whenever routing genuinely resolved
+            // an executor before the output turned out unusable — distinct
+            // from no_eligible_recovery_executor, where none ever was.
+            ...(repaired.executorId === undefined ? {} : { repairExecutorId: repaired.executorId }),
+            ...(repaired.adapter === undefined ? {} : { repairAdapter: repaired.adapter }),
+          };
       await this.event('HANDOFF_REPAIR_ATTEMPTED', task.id, {
         method: record.method,
         succeeded: record.succeeded,
@@ -2409,7 +2426,7 @@ export class AgentOrchestrator {
     originalHandoff?: StructuredHandoff,
   ): Promise<
     { readonly ok: true; readonly handoff: StructuredHandoff; readonly executorId: string; readonly adapter: AgentName }
-    | { readonly ok: false; readonly reason: HandoffRepairFailureReason }
+    | { readonly ok: false; readonly reason: HandoffRepairFailureReason; readonly executorId?: string; readonly adapter?: AgentName }
   > {
     const routing = this.resolveHandoffRepairExecutor(task);
     if (!routing.ok) {
@@ -2466,27 +2483,56 @@ export class AgentOrchestrator {
     if (result.status !== 'succeeded') {
       return { ok: false, reason: 'agent_invocation_failed' };
     }
+
+    const validate = (value: unknown): StructuredHandoff => {
+      const handoff = parseHandoff(value);
+      validateCanonicalFindingResponses(handoff, requiredCanonicalFindings);
+      return handoff;
+    };
+    // The repair agent's OWN output goes through the exact same
+    // deterministic framing/structured-output extraction every ordinary
+    // agent's output already gets (extractStructuredPayload,
+    // src/protocol/structured-output.ts) — a repair response can suffer the
+    // identical transport-shape problem (a prose preface, a markdown fence
+    // around the JSON) the original agent's response can, and is not
+    // exempt from the same fix. Direct validation of the already-parsed
+    // value is tried first (the common case, and what every existing
+    // fake/real adapter that already returns a clean object continues to
+    // hit); only on failure does this fall back to re-extracting from the
+    // raw text. Framing here can only do the SAME deterministic structural
+    // cleanup it always does — remove prose, find the one unambiguous JSON
+    // object — it never invents or reinterprets findingResponses, and the
+    // exact same strict validate() runs either way, so nothing here loosens
+    // what a valid canonical response means.
+    let repaired: StructuredHandoff;
     try {
-      const repaired = parseHandoff(result.structuredHandoff);
-      validateCanonicalFindingResponses(repaired, requiredCanonicalFindings);
-      if (originalHandoff !== undefined) {
-        const withoutResponses = (handoff: StructuredHandoff): unknown => {
-          const { findingResponses: _responses, ...rest } = handoff;
-          return rest;
-        };
-        if (JSON.stringify(withoutResponses(repaired)) !== JSON.stringify(withoutResponses(originalHandoff))) {
-          return { ok: false, reason: 'contradiction_detected' };
-        }
-        const claimsResolved = repaired.findingResponses?.some((response) =>
-          response.decision === 'confirmed' && response.resolution === 'resolved');
-        if (claimsResolved && (taskDiff.trim() === '' || !originalHandoff.tests.some((test) => test.result === 'pass'))) {
-          return { ok: false, reason: 'evidence_insufficient' };
-        }
-      }
-      return { ok: true, handoff: repaired, executorId: routing.executorId, adapter: routing.adapter };
+      repaired = validate(result.structuredHandoff);
     } catch {
-      return { ok: false, reason: 'evidence_insufficient' };
+      if (result.rawStdout === undefined || result.rawStdout === null) {
+        return { ok: false, reason: 'repair_output_invalid', executorId: routing.executorId, adapter: routing.adapter };
+      }
+      const framed = extractStructuredPayload(result.rawStdout, validate);
+      if (!framed.ok) {
+        return { ok: false, reason: 'repair_output_invalid', executorId: routing.executorId, adapter: routing.adapter };
+      }
+      repaired = framed.value;
     }
+
+    if (originalHandoff !== undefined) {
+      const withoutResponses = (handoff: StructuredHandoff): unknown => {
+        const { findingResponses: _responses, ...rest } = handoff;
+        return rest;
+      };
+      if (JSON.stringify(withoutResponses(repaired)) !== JSON.stringify(withoutResponses(originalHandoff))) {
+        return { ok: false, reason: 'contradiction_detected', executorId: routing.executorId, adapter: routing.adapter };
+      }
+      const claimsResolved = repaired.findingResponses?.some((response) =>
+        response.decision === 'confirmed' && response.resolution === 'resolved');
+      if (claimsResolved && (taskDiff.trim() === '' || !originalHandoff.tests.some((test) => test.result === 'pass'))) {
+        return { ok: false, reason: 'evidence_insufficient', executorId: routing.executorId, adapter: routing.adapter };
+      }
+    }
+    return { ok: true, handoff: repaired, executorId: routing.executorId, adapter: routing.adapter };
   }
 
   private async finishReview(prepared: PreparedTask, result: AgentResult): Promise<void> {

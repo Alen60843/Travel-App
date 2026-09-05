@@ -268,7 +268,9 @@ class ContinuationAgent implements Agent {
   }
 }
 
-type RepairBehavior = 'succeed' | 'throw' | 'contradict';
+type RepairBehavior =
+  | 'succeed' | 'throw' | 'contradict'
+  | 'prose-fence' | 'whitespace-fence' | 'ambiguous' | 'invalid-json' | 'schema-invalid';
 
 class SemanticRepairAgent implements Agent {
   readonly invocations: AgentRequest[] = [];
@@ -282,6 +284,7 @@ class SemanticRepairAgent implements Agent {
     this.invocations.push(request);
     await request.onStarted?.(process.pid);
     let structuredHandoff: unknown;
+    let rawStdout: string | undefined;
     if (request.role === 'correction' || request.role === 'testing') {
       await writeFile(join(request.worktreePath, request.allowedFileOwnership[0]!), 'corrected F001\n', 'utf8');
       structuredHandoff = {
@@ -304,17 +307,44 @@ class SemanticRepairAgent implements Agent {
       if (this.repairBehavior === 'throw') {
         throw new Error('simulated agent-invocation-layer failure (e.g. empty/crashed process output)');
       }
-      structuredHandoff = {
+      const validRepaired = {
         ...spec.malformedOutput,
-        // 'contradict' rewrites a field OTHER than findingResponses, which the
-        // real repair path must detect and reject as a silent semantic rewrite.
-        ...(this.repairBehavior === 'contradict' ? { summary: 'a different, unrequested summary' } : {}),
         findingResponses: [{
           findingId: 'F001', canonicalFindingKey: spec.requiredCanonicalFindings[0]!.canonicalFindingKey,
           decision: 'confirmed', resolution: 'resolved', evidence: 'task diff contains correction',
           fix: 'updated feature', verification: 'focused-test passed 1/1',
         }],
       };
+      if (this.repairBehavior === 'succeed') {
+        structuredHandoff = validRepaired;
+      } else if (this.repairBehavior === 'contradict') {
+        // Rewrites a field OTHER than findingResponses, which the real
+        // repair path must detect and reject as a silent semantic rewrite.
+        structuredHandoff = { ...validRepaired, summary: 'a different, unrequested summary' };
+      } else if (this.repairBehavior === 'prose-fence') {
+        // The real F002 dogfood failure shape: Claude prefaces its final
+        // JSON with explanatory prose and wraps it in a markdown fence.
+        structuredHandoff = null;
+        rawStdout = `I'll proceed directly to producing the repaired JSON.\n\n\`\`\`json\n${JSON.stringify(validRepaired)}\n\`\`\`\n`;
+      } else if (this.repairBehavior === 'whitespace-fence') {
+        structuredHandoff = null;
+        rawStdout = `   \n\n\`\`\`json\n${JSON.stringify(validRepaired)}\n\`\`\`\n   `;
+      } else if (this.repairBehavior === 'ambiguous') {
+        structuredHandoff = null;
+        const variantB = {
+          ...validRepaired,
+          findingResponses: [{ ...validRepaired.findingResponses[0], verification: 'a different but still valid verification note' }],
+        };
+        rawStdout = `${JSON.stringify(validRepaired)}\n\nAlternatively:\n${JSON.stringify(variantB)}`;
+      } else if (this.repairBehavior === 'invalid-json') {
+        structuredHandoff = null;
+        rawStdout = 'this is not JSON at all, just prose with no braces whatsoever';
+      } else if (this.repairBehavior === 'schema-invalid') {
+        structuredHandoff = null;
+        const missingRequiredField: Record<string, unknown> = { ...(validRepaired as Record<string, unknown>) };
+        delete missingRequiredField.filesChanged;
+        rawStdout = JSON.stringify(missingRequiredField);
+      }
     } else {
       structuredHandoff = { status: 'approved', findings: [] };
     }
@@ -323,6 +353,7 @@ class SemanticRepairAgent implements Agent {
       agent: this.name, runId: request.runId, taskId: request.taskId, status: 'succeeded', failureCode: null,
       exitCode: 0, signal: null, stdoutPath: join(request.artifactsDirectory, 'fake.stdout'),
       stderrPath: join(request.artifactsDirectory, 'fake.stderr'), structuredHandoff,
+      ...(rawStdout === undefined ? {} : { rawStdout }),
       changedFiles: [], gitDiffSummary: null, testsReported: [], unresolvedQuestions: [],
       startedAt: now, endedAt: now, durationMs: 1, timedOut: false, aborted: false, errorMessage: null,
     };
@@ -801,5 +832,127 @@ test('a configured executor whose declared capabilities omit handoff_repair is a
     assert.equal(codex.invocations.filter((request) => request.role === 'handoff_repair').length, 0);
     const correction = Object.values(failed.tasks).find((task) => task.error?.code === 'HANDOFF_INVALID')!;
     assert.equal(correction.handoffRepairAttempts.at(-1)?.failureReason, 'no_eligible_recovery_executor');
+  } finally { await context.fixture.dispose(); }
+});
+
+
+// --- Repair-output framing: deterministic extraction of the repair
+// agent's OWN response, reusing the exact same structured-output helper
+// the live handoff-repair cascade already applies to the ORIGINAL agent's
+// output ---
+
+test('repair output framing: prose followed by a single fenced JSON object is extracted deterministically and succeeds', async () => {
+  const context = await setup(['feature.txt']);
+  try {
+    const phaseFile = join(context.fixture.container, 'continuation.yaml');
+    await writeFile(phaseFile, continuationPhase(context.fixture.baseBranch, context.baseSha), 'utf8');
+    const codex = new SemanticRepairAgent('codex', true, 'prose-fence');
+    const claude = new SemanticRepairAgent('claude');
+    const orchestrator = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: context.fixture.repository, runsRoot: context.runsRoot, agents: { codex, claude },
+    });
+    const completed = await orchestrator.execute();
+    assert.equal(completed.status, 'COMPLETED', JSON.stringify(completed.errors));
+    assert.equal(codex.invocations.filter((request) => request.role === 'handoff_repair').length, 1, 'no second repair attempt — one bounded call only');
+    const correction = Object.values(completed.tasks).find((task) => task.commit !== undefined)!;
+    const record = correction.handoffRepairAttempts.at(-1);
+    assert.equal(record?.succeeded, true);
+    assert.equal(record?.method, 'agent');
+    // Framing extraction never touches the worktree — the diff codex wrote
+    // during the (unrelated) correction step is exactly what it was.
+    assert.equal(await readFile(join(correction.worktreePath!, 'feature.txt'), 'utf8'), 'corrected F001\n');
+  } finally { await context.fixture.dispose(); }
+});
+
+test('repair output framing: surrounding whitespace plus a fenced JSON object still succeeds', async () => {
+  const context = await setup(['feature.txt']);
+  try {
+    const phaseFile = join(context.fixture.container, 'continuation.yaml');
+    await writeFile(phaseFile, continuationPhase(context.fixture.baseBranch, context.baseSha), 'utf8');
+    const codex = new SemanticRepairAgent('codex', true, 'whitespace-fence');
+    const orchestrator = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: context.fixture.repository, runsRoot: context.runsRoot,
+      agents: { codex, claude: new SemanticRepairAgent('claude') },
+    });
+    const completed = await orchestrator.execute();
+    assert.equal(completed.status, 'COMPLETED', JSON.stringify(completed.errors));
+    const correction = Object.values(completed.tasks).find((task) => task.commit !== undefined)!;
+    assert.equal(correction.handoffRepairAttempts.at(-1)?.succeeded, true);
+  } finally { await context.fixture.dispose(); }
+});
+
+test('repair output framing: two plausible JSON candidates is genuine ambiguity and fails closed as repair_output_invalid', async () => {
+  const context = await setup(['feature.txt']);
+  try {
+    const phaseFile = join(context.fixture.container, 'continuation.yaml');
+    await writeFile(phaseFile, continuationPhase(context.fixture.baseBranch, context.baseSha), 'utf8');
+    const codex = new SemanticRepairAgent('codex', true, 'ambiguous');
+    const orchestrator = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: context.fixture.repository, runsRoot: context.runsRoot,
+      agents: { codex, claude: new SemanticRepairAgent('claude') },
+    });
+    const failed = await orchestrator.execute();
+    assert.equal(failed.status, 'FAILED');
+    assert.equal(codex.invocations.filter((request) => request.role === 'handoff_repair').length, 1);
+    const correction = Object.values(failed.tasks).find((task) => task.error?.code === 'HANDOFF_INVALID')!;
+    assert.equal(correction.commit, undefined);
+    assert.equal(correction.handoffRepairAttempts.at(-1)?.failureReason, 'repair_output_invalid');
+  } finally { await context.fixture.dispose(); }
+});
+
+test('repair output framing: non-JSON prose with no braces fails closed as repair_output_invalid', async () => {
+  const context = await setup(['feature.txt']);
+  try {
+    const phaseFile = join(context.fixture.container, 'continuation.yaml');
+    await writeFile(phaseFile, continuationPhase(context.fixture.baseBranch, context.baseSha), 'utf8');
+    const codex = new SemanticRepairAgent('codex', true, 'invalid-json');
+    const orchestrator = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: context.fixture.repository, runsRoot: context.runsRoot,
+      agents: { codex, claude: new SemanticRepairAgent('claude') },
+    });
+    const failed = await orchestrator.execute();
+    assert.equal(failed.status, 'FAILED');
+    const correction = Object.values(failed.tasks).find((task) => task.error?.code === 'HANDOFF_INVALID')!;
+    assert.equal(correction.commit, undefined);
+    assert.equal(correction.handoffRepairAttempts.at(-1)?.failureReason, 'repair_output_invalid');
+  } finally { await context.fixture.dispose(); }
+});
+
+test('repair output framing: structurally valid JSON missing a required field fails closed as repair_output_invalid, not evidence_insufficient', async () => {
+  const context = await setup(['feature.txt']);
+  try {
+    const phaseFile = join(context.fixture.container, 'continuation.yaml');
+    await writeFile(phaseFile, continuationPhase(context.fixture.baseBranch, context.baseSha), 'utf8');
+    const codex = new SemanticRepairAgent('codex', true, 'schema-invalid');
+    const orchestrator = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: context.fixture.repository, runsRoot: context.runsRoot,
+      agents: { codex, claude: new SemanticRepairAgent('claude') },
+    });
+    const failed = await orchestrator.execute();
+    assert.equal(failed.status, 'FAILED');
+    const correction = Object.values(failed.tasks).find((task) => task.error?.code === 'HANDOFF_INVALID')!;
+    assert.equal(correction.handoffRepairAttempts.at(-1)?.failureReason, 'repair_output_invalid');
+  } finally { await context.fixture.dispose(); }
+});
+
+test('repair output framing: routing/executor identity is still recorded on a failed agent-tier attempt', async () => {
+  const context = await setup(['feature.txt']);
+  try {
+    const phaseFile = join(context.fixture.container, 'continuation.yaml');
+    await writeFile(phaseFile, continuationPhase(context.fixture.baseBranch, context.baseSha), 'utf8');
+    const codex = new SemanticRepairAgent('codex', true, 'invalid-json');
+    const orchestrator = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: context.fixture.repository, runsRoot: context.runsRoot,
+      agents: { codex, claude: new SemanticRepairAgent('claude') },
+    });
+    const failed = await orchestrator.execute();
+    const correction = Object.values(failed.tasks).find((task) => task.error?.code === 'HANDOFF_INVALID')!;
+    const record = correction.handoffRepairAttempts.at(-1);
+    // No recovery policy was authorized, so routing fell back to the
+    // original owner (codex) — but the identity is still recorded, even
+    // though the attempt failed, because routing genuinely resolved an
+    // executor before the output turned out to be unusable.
+    assert.equal(record?.repairExecutorId, 'codex');
+    assert.equal(record?.repairAdapter, 'codex');
   } finally { await context.fixture.dispose(); }
 });

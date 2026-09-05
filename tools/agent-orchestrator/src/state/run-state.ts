@@ -60,6 +60,7 @@ export interface HandoffRepairAttemptRecord {
   readonly method: 'framing' | 'deterministic' | 'agent' | 'none' | 'legacy_unknown';
   readonly failureReason?:
     | 'agent_invocation_failed'
+    | 'repair_output_invalid'
     | 'evidence_insufficient'
     | 'contradiction_detected'
     | 'no_eligible_recovery_executor'
@@ -655,7 +656,7 @@ function parseIntegrationState(value: unknown, path: string): IntegrationRunStat
 
 const HANDOFF_REPAIR_METHODS = new Set(['framing', 'deterministic', 'agent', 'none', 'legacy_unknown']);
 const HANDOFF_REPAIR_FAILURE_REASONS = new Set([
-  'agent_invocation_failed', 'evidence_insufficient', 'contradiction_detected',
+  'agent_invocation_failed', 'repair_output_invalid', 'evidence_insufficient', 'contradiction_detected',
   'no_eligible_recovery_executor', 'legacy_unknown',
 ]);
 
