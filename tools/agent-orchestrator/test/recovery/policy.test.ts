@@ -1,12 +1,27 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import type { PhaseConfig } from '../../src/config';
 import { isOrchestratorError } from '../../src/errors';
 import {
+  applyRecoveryPolicyOverlay,
   canonicalizeRecoveryPolicy,
   hashRecoveryPolicy,
   parseRecoveryPolicyOverlay,
 } from '../../src/recovery/policy';
+
+function baseConfig(overrides: Partial<PhaseConfig> = {}): PhaseConfig {
+  return {
+    phase: 'test', name: 'test', baseBranch: 'main', canonicalDesignDocument: 'design.md',
+    concurrency: 1, maxReviewRounds: 3, agentRetries: 0, agentTimeoutMs: 60000,
+    agentWorktree: { prepare: [] },
+    tasks: [],
+    integration: { prepare: [{ command: 'pnpm install --frozen-lockfile', required: true }], commands: [], diagnostics: [] },
+    maxHandoffRepairAttempts: 2,
+    salvage: { verify: [] },
+    ...overrides,
+  };
+}
 
 test('an empty overlay parses to an object with no salvage/executors', () => {
   const overlay = parseRecoveryPolicyOverlay({});
@@ -354,4 +369,67 @@ test('integrationRecovery.prepare hashes identically regardless of surrounding k
 test('no integrationRecovery field preserves current behavior (absent, not defaulted)', () => {
   const overlay = parseRecoveryPolicyOverlay({ handoffRepair: { additionalAttempts: 1 } });
   assert.equal(overlay.integrationRecovery, undefined);
+});
+
+// --- applyRecoveryPolicyOverlay: the single effective-config implementation ---
+
+test('A: an integrationRecovery.prepare with two commands is fully present in the effective config', () => {
+  const overlay = parseRecoveryPolicyOverlay({
+    integrationRecovery: { prepare: ['pnpm install --frozen-lockfile', 'pnpm --filter @tripwith/shared build'] },
+  });
+  const base = baseConfig();
+  const effective = applyRecoveryPolicyOverlay(base, overlay);
+  assert.deepEqual(effective.integration.prepare.map((c) => c.command), [
+    'pnpm install --frozen-lockfile', 'pnpm --filter @tripwith/shared build',
+  ]);
+  // Only `prepare` is replaced — the historical deterministic commands/diagnostics are untouched.
+  assert.equal(effective.integration.commands, base.integration.commands);
+});
+
+test('D: a salvage override survives being applied on top of an unrelated base config change', () => {
+  const overlay = parseRecoveryPolicyOverlay({ salvage: { verify: ['pnpm test'] } });
+  const effective = applyRecoveryPolicyOverlay(baseConfig({ concurrency: 4 }), overlay);
+  assert.deepEqual(effective.salvage.verify.map((c) => c.command), ['pnpm test']);
+  assert.equal(effective.concurrency, 4, 'unrelated base fields pass through unchanged');
+});
+
+test('applyRecoveryPolicyOverlay: no policy returns the base config unchanged (identity)', () => {
+  const base = baseConfig();
+  assert.equal(applyRecoveryPolicyOverlay(base, undefined), base);
+});
+
+test('applyRecoveryPolicyOverlay: handoffRepair.additionalAttempts is always computed from the given base, proving repeated application never stacks', () => {
+  const overlay = parseRecoveryPolicyOverlay({ handoffRepair: { additionalAttempts: 1 } });
+  const base = baseConfig({ maxHandoffRepairAttempts: 2 });
+  const first = applyRecoveryPolicyOverlay(base, overlay);
+  assert.equal(first.maxHandoffRepairAttempts, 3);
+  // Applying the SAME overlay again to the SAME fresh base (exactly what a
+  // correct caller does on every scheduling pass) yields the identical
+  // effective value — never 4, 5, 6...
+  const second = applyRecoveryPolicyOverlay(base, overlay);
+  assert.equal(second.maxHandoffRepairAttempts, 3);
+  // Misuse — applying the overlay to an ALREADY-overlaid config — is
+  // exactly the bug this discipline exists to prevent; documented here so
+  // the failure mode is explicit, not applied anywhere in production code.
+  const misused = applyRecoveryPolicyOverlay(first, overlay);
+  assert.equal(misused.maxHandoffRepairAttempts, 4, 'misuse stacks — this is why every real caller must pass a FRESH base');
+});
+
+test('applyRecoveryPolicyOverlay: recoveryBudget is never copied into PhaseConfig (it governs adaptive epoch state only)', () => {
+  const overlay = parseRecoveryPolicyOverlay({ recoveryBudget: { maxWallClockMs: 3_600_000 } });
+  const effective = applyRecoveryPolicyOverlay(baseConfig(), overlay);
+  assert.deepEqual(effective, baseConfig(), 'recoveryBudget alone produces no PhaseConfig change whatsoever');
+});
+
+test('applyRecoveryPolicyOverlay: all three PhaseConfig-affecting fields apply together, independently', () => {
+  const overlay = parseRecoveryPolicyOverlay({
+    salvage: { verify: ['pnpm test'] },
+    handoffRepair: { additionalAttempts: 2 },
+    integrationRecovery: { prepare: ['pnpm install', 'pnpm --filter @tripwith/shared build'] },
+    recoveryBudget: { maxWallClockMs: 3_600_000 },
+  });
+  const effective = applyRecoveryPolicyOverlay(baseConfig({ maxHandoffRepairAttempts: 2 }), overlay);
+  assert.deepEqual(effective.salvage.verify.map((c) => c.command), ['pnpm test']);
+  assert.equal(effective.maxHandoffRepairAttempts, 4);
+  assert.deepEqual(effective.integration.prepare.map((c) => c.command), ['pnpm install', 'pnpm --filter @tripwith/shared build']);
 });

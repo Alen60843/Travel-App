@@ -39,6 +39,7 @@ import {
 } from './handoff';
 import { IntegrationGate, canReuseIntegrationPreparation } from './integration/integration-gate';
 import {
+  applyRecoveryPolicyOverlay,
   hashRecoveryPolicy,
   parseRecoveryPolicyOverlay,
   type RecoveryExecutorConfig,
@@ -549,43 +550,15 @@ export class AgentOrchestrator {
     assertResumeBaseUnmoved(loadedState.baseSha, actualBaseSha);
     // The most recently authorized recovery-policy snapshot (if any) is
     // applied here, at every load — never by editing the immutable
-    // phase.yaml snapshot on disk. salvage.verify, when the overlay
-    // supplies it, replaces the phase's own entirely for the duration of
-    // this load; recovery executors are resolved solely from the overlay
+    // phase.yaml snapshot on disk. `config` here is still the FRESH,
+    // un-overlaid value computed above (runtimePhaseConfig or
+    // loadAnyPhaseConfig), exactly what applyRecoveryPolicyOverlay
+    // requires. Recovery executors are resolved solely from the overlay
     // (see resolveHandoffRepairExecutor) since no adaptive role is ever
     // 'handoff_repair'. A run that has never had a policy authorized
     // behaves exactly as before — recoveryPolicyHistory is simply absent.
     const latestRecoveryPolicy = loadedState.recoveryPolicyHistory?.at(-1)?.policy;
-    if (latestRecoveryPolicy?.salvage !== undefined) {
-      config = { ...config, salvage: latestRecoveryPolicy.salvage };
-    }
-    // Effective budget = the phase's own base maxHandoffRepairAttempts plus
-    // whatever additionalAttempts an operator has explicitly, auditably
-    // authorized via agents:authorize-recovery-policy. STATE semantics, not
-    // transaction semantics: this reads the latest authorized snapshot's
-    // value directly, so re-authorizing the same additionalAttempts twice
-    // never stacks — the effective budget is base + that one number, always.
-    if (latestRecoveryPolicy?.handoffRepair !== undefined) {
-      config = {
-        ...config,
-        maxHandoffRepairAttempts: config.maxHandoffRepairAttempts + latestRecoveryPolicy.handoffRepair.additionalAttempts,
-      };
-    }
-    // Replacement, not concatenation: the historical phase.yaml's own
-    // integration.prepare remains truthful, immutable history (still
-    // exactly what attempt 1 actually ran, in integrationAttempts). An
-    // authorized integrationRecovery.prepare entirely REPLACES the
-    // effective list for every later attempt — accidentally re-running the
-    // original (already-passing) `pnpm install` twice is harmless, but
-    // concatenation semantics would silently couple this run's recovery
-    // policy to whatever order/count the original phase file happened to
-    // use, which is not what "explicitly authorized preparation" means.
-    if (latestRecoveryPolicy?.integrationRecovery !== undefined) {
-      config = {
-        ...config,
-        integration: { ...config.integration, prepare: latestRecoveryPolicy.integrationRecovery.prepare },
-      };
-    }
+    config = applyRecoveryPolicyOverlay(config, latestRecoveryPolicy);
     const orchestrator = new AgentOrchestrator({
       config,
       repositoryRoot,
@@ -1456,9 +1429,19 @@ export class AgentOrchestrator {
       routeGrantedWork(coordinator, this.adaptiveConfig!);
       const adaptive = coordinator.snapshot();
       emitted = adaptive.events.slice(previousEvents);
-      const runtime = runtimePhaseConfig(this.adaptiveConfig!, adaptive);
+      // Always re-derive from the FRESH, un-overlaid runtimePhaseConfig,
+      // then reapply the currently-authorized recovery policy on top —
+      // never reuse `this.config` here, which may already be overlaid: a
+      // repeated overlay of an already-overlaid config is exactly how
+      // handoffRepair.additionalAttempts (or a re-applied
+      // integrationRecovery.prepare) would silently stack across every
+      // scheduling pass instead of staying pinned to the latest
+      // authorization's own value.
+      const runtimeBase = runtimePhaseConfig(this.adaptiveConfig!, adaptive);
+      const latestRecoveryPolicy = current.recoveryPolicyHistory?.at(-1)?.policy;
+      const effectiveRuntime = applyRecoveryPolicyOverlay(runtimeBase, latestRecoveryPolicy);
       const tasks = { ...current.tasks };
-      for (const spec of runtime.tasks) {
+      for (const spec of effectiveRuntime.tasks) {
         if (tasks[spec.id] !== undefined) continue;
         tasks[spec.id] = {
           id: spec.id,
@@ -1469,7 +1452,7 @@ export class AgentOrchestrator {
         };
         added.push(spec.id);
       }
-      this.config = runtime;
+      this.config = effectiveRuntime;
       return { ...current, adaptive, tasks };
     });
     await this.emitAdaptiveEvents(emitted);

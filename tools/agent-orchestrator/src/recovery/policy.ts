@@ -7,6 +7,7 @@ import {
   nonEmptyString,
   parseCommandList,
   type IntegrationCommand,
+  type PhaseConfig,
 } from '../config';
 import { AGENT_NAMES, type AgentName } from '../tasks/task-schema';
 
@@ -218,4 +219,57 @@ export function canonicalizeRecoveryPolicy(policy: RecoveryPolicyOverlay): strin
 /** SHA-256 of the canonical (normalized, key-sorted) policy representation — never of raw YAML bytes. */
 export function hashRecoveryPolicy(policy: RecoveryPolicyOverlay): string {
   return createHash('sha256').update(canonicalizeRecoveryPolicy(policy), 'utf8').digest('hex');
+}
+
+/**
+ * The single implementation of "what an authorized RecoveryPolicyOverlay
+ * does to a PhaseConfig" — every caller that needs an effective,
+ * recovery-aware config (loadRunForContinuation at load time,
+ * advanceAdaptiveScheduling on every adaptive re-scheduling pass) must go
+ * through this, so there is exactly one place these semantics can drift.
+ *
+ * `baseConfig` MUST be a fresh, un-overlaid config (the historical
+ * phase.yaml's own values, or a freshly-computed runtimePhaseConfig() for
+ * an adaptive run) — never the result of a previous call to this function.
+ * handoffRepair.additionalAttempts is STATE semantics (base + additional),
+ * not transaction semantics: applying this function to an already-overlaid
+ * config would silently stack the extension on every call
+ * (base + additional + additional + ...), which is exactly the bug this
+ * discipline exists to prevent.
+ *
+ * recoveryBudget is deliberately never applied here — it governs adaptive
+ * wall-clock epoch state (AdaptiveRunState.recoveryEpochs), not anything
+ * PhaseConfig carries, so copying it in would be meaningless at best and
+ * misleading at worst.
+ */
+export function applyRecoveryPolicyOverlay(
+  baseConfig: PhaseConfig,
+  policy: RecoveryPolicyOverlay | undefined,
+): PhaseConfig {
+  if (policy === undefined) return baseConfig;
+  let config = baseConfig;
+  // salvage.verify, when the overlay supplies it, replaces the phase's own
+  // entirely for the duration of this load — never merged/concatenated.
+  if (policy.salvage !== undefined) {
+    config = { ...config, salvage: policy.salvage };
+  }
+  // Always computed from baseConfig's own value, never from `config` —
+  // config only ever diverges from baseConfig in fields this function
+  // itself just set, so reading baseConfig here vs. config makes no
+  // observable difference today, but it makes the non-stacking invariant
+  // self-evident regardless of how this function's body is reordered later.
+  if (policy.handoffRepair !== undefined) {
+    config = {
+      ...config,
+      maxHandoffRepairAttempts: baseConfig.maxHandoffRepairAttempts + policy.handoffRepair.additionalAttempts,
+    };
+  }
+  // Replacement, not concatenation: the historical phase.yaml's own
+  // integration.prepare remains truthful, immutable history. An authorized
+  // integrationRecovery.prepare entirely replaces the effective list for
+  // every later attempt.
+  if (policy.integrationRecovery !== undefined) {
+    config = { ...config, integration: { ...config.integration, prepare: policy.integrationRecovery.prepare } };
+  }
+  return config;
 }
