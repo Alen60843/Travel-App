@@ -305,6 +305,8 @@ export class AgentOrchestrator {
   private readonly clock: () => Date;
   private readonly signal: AbortSignal | undefined;
   private readonly adaptiveConfig: AdaptivePhaseConfig | undefined;
+  /** Resolved solely from the most recently authorized recovery-policy overlay — see loadRunForContinuation and resolveHandoffRepairExecutor. */
+  private readonly recoveryExecutors: readonly RecoveryExecutorConfig[] | undefined;
   private stateQueue: Promise<void> = Promise.resolve();
 
   private constructor(options: {
@@ -319,6 +321,7 @@ export class AgentOrchestrator {
     readonly clock: () => Date;
     readonly signal?: AbortSignal;
     readonly adaptiveConfig?: AdaptivePhaseConfig;
+    readonly recoveryExecutors?: readonly RecoveryExecutorConfig[];
   }) {
     this.config = options.config;
     this.repositoryRoot = options.repositoryRoot;
@@ -331,6 +334,7 @@ export class AgentOrchestrator {
     this.clock = options.clock;
     this.signal = options.signal;
     this.adaptiveConfig = options.adaptiveConfig;
+    this.recoveryExecutors = options.recoveryExecutors;
   }
 
   static async start(phaseFile: string, options: OrchestratorOptions): Promise<AgentOrchestrator> {
@@ -524,6 +528,18 @@ export class AgentOrchestrator {
     // recovery must refuse just as loudly as a normal resume would if
     // phase5/explorer (or any other run's base branch) moved underneath it.
     assertResumeBaseUnmoved(loadedState.baseSha, actualBaseSha);
+    // The most recently authorized recovery-policy snapshot (if any) is
+    // applied here, at every load — never by editing the immutable
+    // phase.yaml snapshot on disk. salvage.verify, when the overlay
+    // supplies it, replaces the phase's own entirely for the duration of
+    // this load; recovery executors are resolved solely from the overlay
+    // (see resolveHandoffRepairExecutor) since no adaptive role is ever
+    // 'handoff_repair'. A run that has never had a policy authorized
+    // behaves exactly as before — recoveryPolicyHistory is simply absent.
+    const latestRecoveryPolicy = loadedState.recoveryPolicyHistory?.at(-1)?.policy;
+    if (latestRecoveryPolicy?.salvage !== undefined) {
+      config = { ...config, salvage: latestRecoveryPolicy.salvage };
+    }
     return new AgentOrchestrator({
       config,
       repositoryRoot,
@@ -546,6 +562,7 @@ export class AgentOrchestrator {
       clock: options.clock ?? (() => new Date()),
       ...(adaptiveConfig === undefined ? {} : { adaptiveConfig }),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
+      ...(latestRecoveryPolicy?.executors === undefined ? {} : { recoveryExecutors: latestRecoveryPolicy.executors }),
     });
   }
 

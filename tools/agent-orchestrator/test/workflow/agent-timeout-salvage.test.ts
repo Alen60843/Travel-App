@@ -790,3 +790,95 @@ test('a crash-resumed salvage reruns verify when salvage.verify config changed s
 // 'a task with a recorded commit already cannot be salvaged again' above
 // (checkSalvageEligibility's SALVAGE_NOT_TIMED_OUT / SALVAGE_COMMIT_ALREADY_RECORDED
 // checks) — not repeated here to avoid a redundant test.
+
+
+// --- Recovery policy overlay: salvage.verify applies without editing phase.yaml ---
+
+test('an authorized recovery-policy overlay supplies salvage.verify for a historical run whose phase.yaml has none, without editing phase.yaml', async () => {
+  const scenario = await createTimeoutScenario({ verify: [] });
+  try {
+    // Confirm the historical phase.yaml snapshot genuinely has no salvage.verify.
+    const phaseSnapshotBefore = await readFile(join(scenario.orchestrator.stateStore.runDirectory, 'phase.yaml'), 'utf8');
+    assert.match(phaseSnapshotBefore, /verify: \[\]/, 'the historical phase.yaml snapshot genuinely has no usable verify commands');
+
+    await assert.rejects(
+      () => AgentOrchestrator.salvageTask(scenario.runId, 'timed-out-task', {
+        repositoryPath: scenario.fixture.repository, runsRoot: scenario.runsRoot,
+        agents: { codex: new UnusedAgent('codex'), claude: new UnusedAgent('claude') },
+      }),
+      (error: unknown) => isOrchestratorError(error, 'SALVAGE_VERIFICATION_FAILED'),
+    );
+
+    const authorization = await AgentOrchestrator.authorizeRecoveryPolicy(
+      scenario.runId,
+      { salvage: { verify: [{ command: 'true', required: true }] } },
+      { repositoryPath: scenario.fixture.repository, runsRoot: scenario.runsRoot, agents: { codex: new UnusedAgent('codex'), claude: new UnusedAgent('claude') } },
+    );
+    assert.equal(authorization.orchestrator.snapshot().recoveryPolicyHistory?.length, 1);
+
+    const result = await AgentOrchestrator.salvageTask(scenario.runId, 'timed-out-task', {
+      repositoryPath: scenario.fixture.repository, runsRoot: scenario.runsRoot,
+      agents: { codex: new UnusedAgent('codex'), claude: new UnusedAgent('claude') },
+    });
+    assert.ok(result.commitSha);
+    assert.equal(result.orchestrator.snapshot().tasks['timed-out-task']?.status, 'SUCCEEDED');
+
+    const phaseSnapshotAfter = await readFile(join(scenario.orchestrator.stateStore.runDirectory, 'phase.yaml'), 'utf8');
+    assert.equal(phaseSnapshotAfter, phaseSnapshotBefore, 'phase.yaml must never be edited by an authorized recovery policy');
+  } finally {
+    await scenario.fixture.dispose();
+  }
+});
+
+test('changing the external source phase file after authorization does not change what a resumed recovery uses', async () => {
+  const scenario = await createTimeoutScenario({ verify: [] });
+  try {
+    await AgentOrchestrator.authorizeRecoveryPolicy(
+      scenario.runId,
+      { salvage: { verify: [{ command: 'true', required: true }] } },
+      { repositoryPath: scenario.fixture.repository, runsRoot: scenario.runsRoot, agents: { codex: new UnusedAgent('codex'), claude: new UnusedAgent('claude') } },
+    );
+    // Mutating the run's own persisted phase.yaml snapshot directly simulates
+    // "the external policy file changed after authorization" — the snapshot,
+    // not this file, is what a real operator could NOT safely hand-edit
+    // either; the point is that recovery is bound to the authorized overlay,
+    // not to whatever the snapshot says at read time.
+    const snapshotPath = join(scenario.orchestrator.stateStore.runDirectory, 'phase.yaml');
+    const originalSnapshot = await readFile(snapshotPath, 'utf8');
+    assert.match(originalSnapshot, /verify: \[\]/);
+    await writeFile(
+      snapshotPath,
+      originalSnapshot.replace('verify: []', 'verify:\n    - command: "false"\n      required: true'),
+      'utf8',
+    );
+    const result = await AgentOrchestrator.salvageTask(scenario.runId, 'timed-out-task', {
+      repositoryPath: scenario.fixture.repository, runsRoot: scenario.runsRoot,
+      agents: { codex: new UnusedAgent('codex'), claude: new UnusedAgent('claude') },
+    });
+    // If the snapshot's own (newly-added, "false") verify command had taken
+    // priority over the authorized overlay's "true", this would have thrown
+    // SALVAGE_VERIFICATION_FAILED instead of succeeding.
+    assert.ok(result.commitSha);
+  } finally {
+    await scenario.fixture.dispose();
+  }
+});
+
+test('a run without any authorized recovery policy still fails no_verify_configured exactly as before', async () => {
+  const scenario = await createTimeoutScenario({ verify: [] });
+  try {
+    await assert.rejects(
+      () => AgentOrchestrator.salvageTask(scenario.runId, 'timed-out-task', {
+        repositoryPath: scenario.fixture.repository, runsRoot: scenario.runsRoot,
+        agents: { codex: new UnusedAgent('codex'), claude: new UnusedAgent('claude') },
+      }),
+      (error: unknown) => {
+        if (!isOrchestratorError(error, 'SALVAGE_VERIFICATION_FAILED')) throw error;
+        assert.equal((error.details as unknown as { reason?: string }).reason, 'no_verify_configured');
+        return true;
+      },
+    );
+  } finally {
+    await scenario.fixture.dispose();
+  }
+});
