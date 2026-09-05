@@ -1,4 +1,7 @@
 import { ERROR_CODES, OrchestratorError, type ErrorCode } from '../errors';
+import { parseAdaptiveRunState } from '../adaptive/state-validation';
+import type { AdaptiveRunState } from '../adaptive/types';
+import { parseRecoveryPolicyOverlay, type RecoveryPolicyOverlay } from '../recovery/policy';
 import { TASK_STATUSES, type TaskStatus } from '../tasks/scheduler';
 import type { AgentName, TaskSpec } from '../tasks/task-schema';
 
@@ -37,12 +40,66 @@ export interface AgentAttemptState {
   readonly pid?: number;
   readonly outcome?: 'succeeded' | 'failed' | 'timed_out' | 'aborted';
   readonly error?: StoredError;
+  /** Effective configured budget and observed runtime, persisted for timeout diagnosis. */
+  readonly timeoutMs?: number;
+  readonly durationMs?: number;
+}
+
+/**
+ * One recorded attempt at repairing a task's structured handoff output
+ * (framing extraction, deterministic key repair, or a bounded read-only
+ * agent call). Append-only — never rewritten or removed — so a task's
+ * repair history remains an auditable trail rather than a single flag.
+ * `method: 'legacy_unknown'` and `failureReason: 'legacy_unknown'` are used
+ * only when normalizing a persisted state written before this array
+ * existed (the old handoffRepairAttempted/handoffRepairSucceeded booleans),
+ * where the exact method/reason were never actually recorded — never
+ * fabricated for a native attempt.
+ */
+export interface HandoffRepairAttemptRecord {
+  readonly method: 'framing' | 'deterministic' | 'agent' | 'none' | 'legacy_unknown';
+  readonly failureReason?:
+    | 'agent_invocation_failed'
+    | 'repair_output_invalid'
+    | 'evidence_insufficient'
+    | 'contradiction_detected'
+    | 'no_eligible_recovery_executor'
+    | 'legacy_unknown';
+  readonly succeeded: boolean;
+  /** Absent only for a migrated legacy attempt that predates this field — its real time was never persisted. */
+  readonly timestamp?: string;
+  /**
+   * The identity of the executor that actually ran a method:'agent' repair
+   * attempt — separate from, and never a substitute for, the task's own
+   * `owner` (which continues to truthfully record who produced the
+   * original code). Present only for method:'agent' attempts that reached
+   * dispatch (i.e. not 'no_eligible_recovery_executor', which fails closed
+   * before any executor is chosen).
+   */
+  readonly repairExecutorId?: string;
+  readonly repairAdapter?: AgentName;
 }
 
 export interface TaskCommitState {
   readonly sha: string;
   readonly parentSha: string;
   readonly changedFiles: readonly string[];
+}
+
+/**
+ * Append-only evidence captured when a human explicitly authorizes retrying a
+ * task that stopped at the agent/process boundary. The original
+ * `agentAttempts` entry also remains in place; this snapshot preserves the
+ * task/run terminal context that is cleared when the task becomes READY.
+ */
+export interface AgentFailureRecoveryState {
+  readonly recovery: number;
+  readonly authorizedAt: string;
+  readonly previousRunStatus: 'FAILED' | 'BLOCKED';
+  readonly previousTaskStatus: 'FAILED';
+  readonly error: StoredError;
+  readonly attempt: AgentAttemptState;
+  readonly reopenedTaskIds: readonly string[];
 }
 
 export interface TaskRunState {
@@ -52,6 +109,7 @@ export interface TaskRunState {
   readonly branch?: string;
   /** HEAD after dependency commits are prepared, before this task agent starts. */
   readonly preparedHeadSha?: string;
+  readonly preparation?: IntegrationPreparationState;
   readonly commit?: TaskCommitState;
   readonly agentAttempts: readonly AgentAttemptState[];
   readonly reviewRounds: number;
@@ -71,10 +129,40 @@ export interface TaskRunState {
    * that far (e.g. the agent process itself failed, or the task is SKIPPED).
    */
   readonly handoffOutcome?: 'valid' | 'invalid';
-  /** Whether a bounded handoff-repair attempt (deterministic and/or a single read-only agent call) was made for this task's most recent structured output. */
-  readonly handoffRepairAttempted?: boolean;
-  /** Present only when handoffRepairAttempted is true: whether that attempt produced a schema-valid result. */
-  readonly handoffRepairSucceeded?: boolean;
+  /**
+   * Append-only history of bounded handoff-repair attempts for this task's
+   * structured output. Replaces the old handoffRepairAttempted/
+   * handoffRepairSucceeded booleans (still accepted on read and migrated —
+   * see normalizeHandoffRepairAttempts).
+   */
+  readonly handoffRepairAttempts: readonly HandoffRepairAttemptRecord[];
+  /** Explicit agent/process failure recoveries, oldest first; never rewritten or removed. */
+  readonly agentFailureRecoveries?: readonly AgentFailureRecoveryState[];
+  /**
+   * Crash-safety checkpoints for salvaging a timed-out writer's dirty
+   * worktree (AgentOrchestrator.salvageTask). Present only once salvage has
+   * been authorized for this task. `verification` is present only once
+   * salvage.verify has actually passed, and is bound to the exact diff/
+   * config it validated — see SalvageVerificationCheckpoint.
+   */
+  readonly salvage?: {
+    readonly authorizedAt: string;
+    readonly verification?: SalvageVerificationCheckpoint;
+  };
+}
+
+/**
+ * Binds a passing salvage.verify result to the exact tracked-file diff and
+ * verify command list it validated, so a crash-resumed salvage only reuses
+ * this checkpoint (skipping a costly re-run) when nothing relevant has
+ * changed since it was recorded — never against a since-mutated worktree or
+ * a since-edited config.
+ */
+export interface SalvageVerificationCheckpoint {
+  readonly worktreeHeadSha: string;
+  readonly trackedDiffFingerprint: string;
+  readonly verifyConfigFingerprint: string;
+  readonly result: 'passed';
 }
 
 export interface IntegrationRunState {
@@ -95,6 +183,39 @@ export interface IntegrationRunState {
   readonly integrationFixCommits?: readonly string[];
   readonly currentCommand?: number;
   readonly error?: StoredError;
+  readonly preparation?: IntegrationPreparationState;
+}
+
+export interface IntegrationCommandState {
+  readonly command: string;
+  readonly required: boolean;
+  readonly timeoutMs: number;
+  readonly termination: 'timeout' | 'aborted' | null;
+  readonly timedOut: boolean;
+  readonly exitCode: number | null;
+  readonly signal: string | null;
+  readonly durationMs: number;
+  readonly stdoutPath: string;
+  readonly stderrPath: string;
+}
+
+export interface IntegrationPreparationState {
+  readonly status: 'RUNNING' | 'SUCCEEDED' | 'FAILED';
+  readonly worktreePath: string;
+  readonly headSha: string;
+  readonly commands: readonly IntegrationCommandState[];
+  readonly startedAt: string;
+  readonly finishedAt?: string;
+  /**
+   * SHA-256 of the exact configured `integration.prepare` command list this
+   * checkpoint ran under — absent only for a run persisted before this
+   * field existed. canReuseIntegrationPreparation treats an absent or
+   * mismatched fingerprint as NOT reusable (fail closed): a legacy
+   * checkpoint, or one computed under a different prepare list (e.g. after
+   * an authorized integrationRecovery.prepare overlay), must never be
+   * silently trusted to have run commands it never actually ran.
+   */
+  readonly prepareConfigFingerprint?: string;
 }
 
 export interface RunState {
@@ -107,6 +228,8 @@ export interface RunState {
   readonly baseBranch: string;
   readonly baseSha: string;
   readonly status: RunStatus;
+  /** Absent means the original static strategy, preserving existing run JSON byte shape. */
+  readonly strategy?: 'adaptive';
   readonly tasks: Readonly<Record<string, TaskRunState>>;
   readonly integration: IntegrationRunState;
   /**
@@ -131,6 +254,27 @@ export interface RunState {
    * this phase's tasks.
    */
   readonly agentExecutables?: Readonly<Partial<Record<AgentName, string>>>;
+  /** Optional adaptive topology. Static v1 run files remain valid without it. */
+  readonly adaptive?: AdaptiveRunState;
+  /**
+   * Append-only, oldest first — never rewritten or removed. Each entry is an
+   * explicitly authorized (AgentOrchestrator.authorizeRecoveryPolicy),
+   * hashed recovery-only policy overlay for THIS run, layered on top of the
+   * run's immutable phase.yaml snapshot at load time (never editing it).
+   * Absent for a run that has never had a recovery policy authorized —
+   * every existing/modern run continues to load and recover exactly as
+   * before. The most recent entry is the one currently in effect.
+   */
+  readonly recoveryPolicyHistory?: readonly RecoveryPolicySnapshot[];
+}
+
+/** One authorized, hashed recovery-policy overlay snapshot — see RunState.recoveryPolicyHistory. */
+export interface RecoveryPolicySnapshot {
+  readonly authorizedAt: string;
+  /** sha256 of the canonical (normalized) policy representation — see hashRecoveryPolicy. Never a hash of raw YAML. */
+  readonly policyHash: string;
+  /** The normalized, validated overlay itself — not the raw YAML that produced it. */
+  readonly policy: RecoveryPolicyOverlay;
 }
 
 export const RUN_EVENT_NAMES = [
@@ -140,8 +284,13 @@ export const RUN_EVENT_NAMES = [
   'TASK_STARTED',
   'AGENT_STARTED',
   'AGENT_FINISHED',
+  'AGENT_WORKTREE_PREPARATION_STARTED',
+  'AGENT_WORKTREE_PREPARATION_COMMAND_FINISHED',
+  'AGENT_WORKTREE_PREPARATION_FAILED',
   'HANDOFF_WRITTEN',
   'HANDOFF_REPAIR_ATTEMPTED',
+  'AGENT_RETRY_AUTHORIZED',
+  'TASK_DEPENDENCY_REOPENED',
   'REVIEW_STARTED',
   'FINDING_REPORTED',
   'TASK_COMMITTED',
@@ -154,6 +303,34 @@ export const RUN_EVENT_NAMES = [
   'RUN_BLOCKED',
   'RUN_CANCELLED',
   'RUN_COMPLETED',
+  'ADAPTIVE_REQUEST_CREATED',
+  'ADAPTIVE_GRANT_DECIDED',
+  'ADAPTIVE_REQUEST_GRANTED',
+  'ADAPTIVE_REQUEST_WAITING',
+  'ADAPTIVE_REQUEST_DENIED',
+  'ADAPTIVE_WORK_UNIT_CREATED',
+  'ADAPTIVE_WORK_UNIT_READY',
+  'ADAPTIVE_WORK_UNIT_STARTED',
+  'ADAPTIVE_WORK_UNIT_FINISHED',
+  'ADAPTIVE_WORK_UNIT_SUCCEEDED',
+  'ADAPTIVE_WORK_UNIT_FAILED',
+  'ADAPTIVE_RESOURCE_RELEASED',
+  'ADAPTIVE_SYNTHESIS_CREATED',
+  'ADAPTIVE_CANONICAL_FINDINGS_IMPORTED',
+  'ADAPTIVE_CORRECTION_PLAN_CREATED',
+  'ADAPTIVE_CORRECTION_REQUEST_CREATED',
+  'ADAPTIVE_CORRECTION_GRANTED',
+  'ADAPTIVE_REVERIFICATION_CREATED',
+  'ADAPTIVE_WORK_UNIT_RECOVERED',
+  'ADAPTIVE_RECOVERY_EPOCH_AUTHORIZED',
+  'RUN_RECOVERY_REACTIVATED',
+  'INTEGRATION_PREPARATION_STARTED',
+  'INTEGRATION_PREPARATION_COMMAND_FINISHED',
+  'INTEGRATION_PREPARATION_FAILED',
+  'SALVAGE_AUTHORIZED',
+  'SALVAGE_VERIFIED',
+  'SALVAGE_VERIFICATION_FAILED',
+  'RECOVERY_POLICY_AUTHORIZED',
 ] as const;
 export type RunEventName = (typeof RUN_EVENT_NAMES)[number];
 
@@ -178,6 +355,8 @@ export function createRunState(options: {
   readonly tasks: readonly TaskSpec[];
   readonly clock?: () => Date;
   readonly agentExecutables?: Readonly<Partial<Record<AgentName, string>>>;
+  readonly strategy?: 'adaptive';
+  readonly adaptive?: AdaptiveRunState;
 }): RunState {
   assertSafeRunId(options.runId);
   assertFullSha(options.baseSha, 'baseSha');
@@ -193,6 +372,7 @@ export function createRunState(options: {
       agentAttempts: [],
       reviewRounds: 0,
       reviewPaths: [],
+      handoffRepairAttempts: [],
     };
   }
   return {
@@ -205,6 +385,7 @@ export function createRunState(options: {
     baseBranch: options.baseBranch,
     baseSha: options.baseSha,
     status: 'CREATED',
+    ...(options.strategy === undefined ? {} : { strategy: options.strategy }),
     tasks,
     integration: {
       status: 'PENDING',
@@ -212,6 +393,7 @@ export function createRunState(options: {
     },
     errors: [],
     ...(options.agentExecutables === undefined ? {} : { agentExecutables: options.agentExecutables }),
+    ...(options.adaptive === undefined ? {} : { adaptive: options.adaptive }),
   };
 }
 
@@ -318,6 +500,81 @@ function parseAttempt(value: unknown, path: string): AgentAttemptState {
     ...(value.error === undefined
       ? {}
       : { error: parseStoredError(value.error, `${path}.error`) }),
+    ...(value.timeoutMs === undefined
+      ? {}
+      : { timeoutMs: integer(value.timeoutMs, `${path}.timeoutMs`, 1) }),
+    ...(value.durationMs === undefined
+      ? {}
+      : { durationMs: integer(value.durationMs, `${path}.durationMs`) }),
+  };
+}
+
+function parseTaskPreparation(value: unknown, path: string): IntegrationPreparationState {
+  if (!isObject(value)) throw new OrchestratorError('STATE_CORRUPT', `${path} must be an object`);
+  const status = string(value.status, `${path}.status`);
+  if (!['RUNNING', 'SUCCEEDED', 'FAILED'].includes(status)) throw new OrchestratorError('STATE_CORRUPT', `${path}.status is invalid`);
+  if (!Array.isArray(value.commands)) throw new OrchestratorError('STATE_CORRUPT', `${path}.commands must be an array`);
+  const headSha = string(value.headSha, `${path}.headSha`);
+  assertFullSha(headSha, `${path}.headSha`);
+  return {
+    status: status as IntegrationPreparationState['status'],
+    worktreePath: string(value.worktreePath, `${path}.worktreePath`), headSha,
+    commands: value.commands.map((entry, index) => {
+      const commandPath = `${path}.commands[${index}]`;
+      if (!isObject(entry)) throw new OrchestratorError('STATE_CORRUPT', `${commandPath} must be an object`);
+      const termination = entry.termination;
+      if (termination !== null && termination !== 'timeout' && termination !== 'aborted') throw new OrchestratorError('STATE_CORRUPT', `${commandPath}.termination is invalid`);
+      const exitCode = entry.exitCode;
+      if (exitCode !== null && (!Number.isSafeInteger(exitCode) || (exitCode as number) < 0)) throw new OrchestratorError('STATE_CORRUPT', `${commandPath}.exitCode is invalid`);
+      const signal = entry.signal;
+      if (signal !== null && typeof signal !== 'string') throw new OrchestratorError('STATE_CORRUPT', `${commandPath}.signal is invalid`);
+      if (typeof entry.required !== 'boolean' || typeof entry.timedOut !== 'boolean') throw new OrchestratorError('STATE_CORRUPT', `${commandPath} booleans are invalid`);
+      return {
+        command: string(entry.command, `${commandPath}.command`), required: entry.required,
+        timeoutMs: integer(entry.timeoutMs, `${commandPath}.timeoutMs`, 1), termination,
+        timedOut: entry.timedOut, exitCode: exitCode as number | null, signal: signal as string | null,
+        durationMs: integer(entry.durationMs, `${commandPath}.durationMs`),
+        stdoutPath: string(entry.stdoutPath, `${commandPath}.stdoutPath`), stderrPath: string(entry.stderrPath, `${commandPath}.stderrPath`),
+      };
+    }),
+    startedAt: timestamp(value.startedAt, `${path}.startedAt`),
+    ...(value.finishedAt === undefined ? {} : { finishedAt: timestamp(value.finishedAt, `${path}.finishedAt`) }),
+  };
+}
+
+function parseAgentFailureRecovery(
+  value: unknown,
+  path: string,
+  expectedRecovery: number,
+): AgentFailureRecoveryState {
+  if (!isObject(value)) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path} must be an object`);
+  }
+  const recovery = integer(value.recovery, `${path}.recovery`, 1);
+  if (recovery !== expectedRecovery) {
+    throw new OrchestratorError(
+      'STATE_CORRUPT',
+      `${path}.recovery must be the append-only sequence number ${expectedRecovery}`,
+    );
+  }
+  const previousRunStatus = string(value.previousRunStatus, `${path}.previousRunStatus`);
+  if (previousRunStatus !== 'FAILED' && previousRunStatus !== 'BLOCKED') {
+    throw new OrchestratorError(
+      'STATE_CORRUPT',
+      `${path}.previousRunStatus must be FAILED or BLOCKED`,
+    );
+  }
+  if (value.previousTaskStatus !== 'FAILED') {
+    throw new OrchestratorError('STATE_CORRUPT', `${path}.previousTaskStatus must be FAILED`);
+  }
+  return {
+    recovery,
+    authorizedAt: timestamp(value.authorizedAt, `${path}.authorizedAt`),
+    previousRunStatus,
+    previousTaskStatus: 'FAILED',
+    error: parseStoredError(value.error, `${path}.error`),
+    attempt: parseAttempt(value.attempt, `${path}.attempt`),
+    reopenedTaskIds: stringArray(value.reopenedTaskIds, `${path}.reopenedTaskIds`),
   };
 }
 
@@ -350,6 +607,44 @@ function parseIntegrationState(value: unknown, path: string): IntegrationRunStat
       assertFullSha(sha, `${path}.integrationFixCommits[${index}]`),
     );
   }
+  let preparation: IntegrationPreparationState | undefined;
+  if (value.preparation !== undefined) {
+    const prep = value.preparation;
+    if (!isObject(prep)) throw new OrchestratorError('STATE_CORRUPT', `${path}.preparation must be an object`);
+    const prepStatus = string(prep.status, `${path}.preparation.status`);
+    if (!['RUNNING', 'SUCCEEDED', 'FAILED'].includes(prepStatus)) throw new OrchestratorError('STATE_CORRUPT', `${path}.preparation.status is invalid`);
+    if (!Array.isArray(prep.commands)) throw new OrchestratorError('STATE_CORRUPT', `${path}.preparation.commands must be an array`);
+    const headSha = string(prep.headSha, `${path}.preparation.headSha`);
+    assertFullSha(headSha, `${path}.preparation.headSha`);
+    preparation = {
+      status: prepStatus as IntegrationPreparationState['status'],
+      worktreePath: string(prep.worktreePath, `${path}.preparation.worktreePath`),
+      headSha,
+      commands: prep.commands.map((entry, index) => {
+        const commandPath = `${path}.preparation.commands[${index}]`;
+        if (!isObject(entry)) throw new OrchestratorError('STATE_CORRUPT', `${commandPath} must be an object`);
+        const termination = entry.termination;
+        if (termination !== null && termination !== 'timeout' && termination !== 'aborted') throw new OrchestratorError('STATE_CORRUPT', `${commandPath}.termination is invalid`);
+        const exitCode = entry.exitCode;
+        if (exitCode !== null && (!Number.isSafeInteger(exitCode) || (exitCode as number) < 0)) throw new OrchestratorError('STATE_CORRUPT', `${commandPath}.exitCode is invalid`);
+        const signal = entry.signal;
+        if (signal !== null && typeof signal !== 'string') throw new OrchestratorError('STATE_CORRUPT', `${commandPath}.signal is invalid`);
+        if (typeof entry.required !== 'boolean' || typeof entry.timedOut !== 'boolean') throw new OrchestratorError('STATE_CORRUPT', `${commandPath} booleans are invalid`);
+        return {
+          command: string(entry.command, `${commandPath}.command`), required: entry.required,
+          timeoutMs: integer(entry.timeoutMs, `${commandPath}.timeoutMs`, 1), termination,
+          timedOut: entry.timedOut, exitCode: exitCode as number | null, signal: signal as string | null,
+          durationMs: integer(entry.durationMs, `${commandPath}.durationMs`),
+          stdoutPath: string(entry.stdoutPath, `${commandPath}.stdoutPath`), stderrPath: string(entry.stderrPath, `${commandPath}.stderrPath`),
+        };
+      }),
+      startedAt: timestamp(prep.startedAt, `${path}.preparation.startedAt`),
+      ...(prep.finishedAt === undefined ? {} : { finishedAt: timestamp(prep.finishedAt, `${path}.preparation.finishedAt`) }),
+      ...(prep.prepareConfigFingerprint === undefined
+        ? {}
+        : { prepareConfigFingerprint: string(prep.prepareConfigFingerprint, `${path}.preparation.prepareConfigFingerprint`) }),
+    };
+  }
   return {
     status: integrationStatus as IntegrationStatus,
     ...(value.worktreePath === undefined
@@ -371,6 +666,122 @@ function parseIntegrationState(value: unknown, path: string): IntegrationRunStat
       ? {}
       : { currentCommand: integer(value.currentCommand, `${path}.currentCommand`) }),
     ...(value.error === undefined ? {} : { error: parseStoredError(value.error, `${path}.error`) }),
+    ...(preparation === undefined ? {} : { preparation }),
+  };
+}
+
+const HANDOFF_REPAIR_METHODS = new Set(['framing', 'deterministic', 'agent', 'none', 'legacy_unknown']);
+const HANDOFF_REPAIR_FAILURE_REASONS = new Set([
+  'agent_invocation_failed', 'repair_output_invalid', 'evidence_insufficient', 'contradiction_detected',
+  'no_eligible_recovery_executor', 'legacy_unknown',
+]);
+
+function parseHandoffRepairAttemptRecord(value: unknown, path: string): HandoffRepairAttemptRecord {
+  if (!isObject(value)) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path} must be an object`);
+  }
+  const method = string(value.method, `${path}.method`);
+  if (!HANDOFF_REPAIR_METHODS.has(method)) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path}.method is invalid`);
+  }
+  const succeeded = value.succeeded;
+  if (typeof succeeded !== 'boolean') {
+    throw new OrchestratorError('STATE_CORRUPT', `${path}.succeeded must be a boolean`);
+  }
+  let failureReason: HandoffRepairAttemptRecord['failureReason'];
+  if (value.failureReason !== undefined) {
+    const reason = string(value.failureReason, `${path}.failureReason`);
+    if (!HANDOFF_REPAIR_FAILURE_REASONS.has(reason)) {
+      throw new OrchestratorError('STATE_CORRUPT', `${path}.failureReason is invalid`);
+    }
+    failureReason = reason as HandoffRepairAttemptRecord['failureReason'];
+  }
+  const repairExecutorId = value.repairExecutorId === undefined
+    ? undefined
+    : string(value.repairExecutorId, `${path}.repairExecutorId`);
+  let repairAdapter: AgentName | undefined;
+  if (value.repairAdapter !== undefined) {
+    const adapter = string(value.repairAdapter, `${path}.repairAdapter`);
+    if (adapter !== 'codex' && adapter !== 'claude') {
+      throw new OrchestratorError('STATE_CORRUPT', `${path}.repairAdapter is invalid`);
+    }
+    repairAdapter = adapter;
+  }
+  return {
+    method: method as HandoffRepairAttemptRecord['method'],
+    succeeded,
+    ...(failureReason === undefined ? {} : { failureReason }),
+    ...(value.timestamp === undefined ? {} : { timestamp: timestamp(value.timestamp, `${path}.timestamp`) }),
+    ...(repairExecutorId === undefined ? {} : { repairExecutorId }),
+    ...(repairAdapter === undefined ? {} : { repairAdapter }),
+  };
+}
+
+/**
+ * Legacy compatibility: a persisted TaskRunState written before
+ * handoffRepairAttempts existed carries handoffRepairAttempted/
+ * handoffRepairSucceeded booleans instead. Normalize both shapes to the
+ * same array representation so old run state keeps loading without a
+ * manual migration. Never fabricates a method, failureReason, or timestamp
+ * beyond what the booleans themselves proved — a migrated record uses
+ * 'legacy_unknown' for method (and failureReason, when failed) and omits
+ * timestamp entirely, because the boolean-only shape never persisted one.
+ */
+function normalizeHandoffRepairAttempts(
+  value: Record<string, unknown>,
+  path: string,
+): readonly HandoffRepairAttemptRecord[] {
+  if (value.handoffRepairAttempts !== undefined) {
+    if (!Array.isArray(value.handoffRepairAttempts)) {
+      throw new OrchestratorError('STATE_CORRUPT', `${path}.handoffRepairAttempts must be an array`);
+    }
+    return value.handoffRepairAttempts.map((entry, index) =>
+      parseHandoffRepairAttemptRecord(entry, `${path}.handoffRepairAttempts[${index}]`));
+  }
+  const attempted = optionalBoolean(value.handoffRepairAttempted, `${path}.handoffRepairAttempted`);
+  if (attempted !== true) {
+    return [];
+  }
+  const succeeded = optionalBoolean(value.handoffRepairSucceeded, `${path}.handoffRepairSucceeded`) === true;
+  return [{
+    method: 'legacy_unknown',
+    succeeded,
+    ...(succeeded ? {} : { failureReason: 'legacy_unknown' as const }),
+  }];
+}
+
+function parseSalvageVerificationCheckpoint(value: unknown, path: string): SalvageVerificationCheckpoint {
+  if (!isObject(value)) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path} must be an object`);
+  }
+  const result = string(value.result, `${path}.result`);
+  if (result !== 'passed') {
+    throw new OrchestratorError('STATE_CORRUPT', `${path}.result is invalid`);
+  }
+  return {
+    worktreeHeadSha: (() => {
+      const sha = string(value.worktreeHeadSha, `${path}.worktreeHeadSha`);
+      assertFullSha(sha, `${path}.worktreeHeadSha`);
+      return sha;
+    })(),
+    trackedDiffFingerprint: string(value.trackedDiffFingerprint, `${path}.trackedDiffFingerprint`),
+    verifyConfigFingerprint: string(value.verifyConfigFingerprint, `${path}.verifyConfigFingerprint`),
+    result: 'passed',
+  };
+}
+
+function parseSalvageState(
+  value: unknown,
+  path: string,
+): { readonly authorizedAt: string; readonly verification?: SalvageVerificationCheckpoint } {
+  if (!isObject(value)) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path} must be an object`);
+  }
+  return {
+    authorizedAt: timestamp(value.authorizedAt, `${path}.authorizedAt`),
+    ...(value.verification === undefined
+      ? {}
+      : { verification: parseSalvageVerificationCheckpoint(value.verification, `${path}.verification`) }),
   };
 }
 
@@ -423,6 +834,22 @@ function parseTask(value: unknown, key: string): TaskRunState {
       ),
     };
   }
+  let agentFailureRecoveries: AgentFailureRecoveryState[] | undefined;
+  if (value.agentFailureRecoveries !== undefined) {
+    if (!Array.isArray(value.agentFailureRecoveries)) {
+      throw new OrchestratorError(
+        'STATE_CORRUPT',
+        `${path}.agentFailureRecoveries must be an array`,
+      );
+    }
+    agentFailureRecoveries = value.agentFailureRecoveries.map((recovery, index) =>
+      parseAgentFailureRecovery(
+        recovery,
+        `${path}.agentFailureRecoveries[${index}]`,
+        index + 1,
+      ),
+    );
+  }
   return {
     id,
     status: status as TaskStatus,
@@ -440,6 +867,9 @@ function parseTask(value: unknown, key: string): TaskRunState {
           })(),
         }),
     ...(commit === undefined ? {} : { commit }),
+    ...(value.preparation === undefined
+      ? {}
+      : { preparation: parseTaskPreparation(value.preparation, `${path}.preparation`) }),
     agentAttempts: value.agentAttempts.map((attempt, index) =>
       parseAttempt(attempt, `${path}.agentAttempts[${index}]`),
     ),
@@ -471,15 +901,28 @@ function parseTask(value: unknown, key: string): TaskRunState {
             return outcome;
           })(),
         }),
-    ...((): { handoffRepairAttempted?: boolean } => {
-      const parsed = optionalBoolean(value.handoffRepairAttempted, `${path}.handoffRepairAttempted`);
-      return parsed === undefined ? {} : { handoffRepairAttempted: parsed };
-    })(),
-    ...((): { handoffRepairSucceeded?: boolean } => {
-      const parsed = optionalBoolean(value.handoffRepairSucceeded, `${path}.handoffRepairSucceeded`);
-      return parsed === undefined ? {} : { handoffRepairSucceeded: parsed };
-    })(),
+    handoffRepairAttempts: normalizeHandoffRepairAttempts(value, path),
+    ...(agentFailureRecoveries === undefined ? {} : { agentFailureRecoveries }),
+    ...(value.salvage === undefined ? {} : { salvage: parseSalvageState(value.salvage, `${path}.salvage`) }),
   };
+}
+
+function parseRecoveryPolicySnapshot(value: unknown, path: string): RecoveryPolicySnapshot {
+  if (!isObject(value)) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path} must be an object`);
+  }
+  const authorizedAt = timestamp(value.authorizedAt, `${path}.authorizedAt`);
+  const policyHash = string(value.policyHash, `${path}.policyHash`);
+  if (!/^[0-9a-f]{64}$/i.test(policyHash)) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path}.policyHash must be a sha256 hex digest`);
+  }
+  let policy: RecoveryPolicyOverlay;
+  try {
+    policy = parseRecoveryPolicyOverlay(value.policy);
+  } catch (error) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path}.policy is invalid`, { cause: error });
+  }
+  return { authorizedAt, policyHash, policy };
 }
 
 export function validateRunState(value: unknown): RunState {
@@ -503,7 +946,11 @@ export function validateRunState(value: unknown): RunState {
   const tasks = Object.fromEntries(
     Object.entries(value.tasks).map(([key, task]) => [key, parseTask(task, key)]),
   );
-  if (Object.keys(tasks).length === 0) {
+  const strategy = value.strategy === undefined ? undefined : string(value.strategy, 'strategy');
+  if (strategy !== undefined && strategy !== 'adaptive') {
+    throw new OrchestratorError('STATE_CORRUPT', 'strategy must be adaptive when present');
+  }
+  if (Object.keys(tasks).length === 0 && strategy !== 'adaptive') {
     throw new OrchestratorError('STATE_CORRUPT', 'tasks must not be empty');
   }
   if (!Array.isArray(value.errors)) {
@@ -531,6 +978,15 @@ export function validateRunState(value: unknown): RunState {
       parseIntegrationState(entry, `integrationAttempts[${index}]`),
     );
   }
+  let recoveryPolicyHistory: RecoveryPolicySnapshot[] | undefined;
+  if (value.recoveryPolicyHistory !== undefined) {
+    if (!Array.isArray(value.recoveryPolicyHistory)) {
+      throw new OrchestratorError('STATE_CORRUPT', 'recoveryPolicyHistory must be an array');
+    }
+    recoveryPolicyHistory = value.recoveryPolicyHistory.map((entry, index) =>
+      parseRecoveryPolicySnapshot(entry, `recoveryPolicyHistory[${index}]`),
+    );
+  }
   const repositoryRoot = string(value.repositoryRoot, 'repositoryRoot');
   if (!repositoryRoot.startsWith('/')) {
     throw new OrchestratorError('STATE_CORRUPT', 'repositoryRoot must be absolute');
@@ -548,6 +1004,43 @@ export function validateRunState(value: unknown): RunState {
       agentExecutables[agentName] = string(path, `agentExecutables.${agentName}`);
     }
   }
+  const adaptive = value.adaptive === undefined
+    ? undefined
+    : parseAdaptiveRunState(value.adaptive);
+  if (strategy === 'adaptive' && adaptive === undefined) {
+    throw new OrchestratorError(
+      'STATE_CORRUPT',
+      'adaptive strategy requires a persisted adaptive topology',
+    );
+  }
+  if (adaptive !== undefined) {
+    for (const request of adaptive.workRequests) {
+      const authorization = request.authorization;
+      if (authorization === undefined) continue;
+      if (authorization.importedSource !== undefined) {
+        const imported = adaptive.continuation?.findings.find(
+          (finding) => finding.canonicalFindingKey === authorization.canonicalFindingKey,
+        );
+        if (authorization.purpose !== 'correction' || imported === undefined
+          || authorization.findingReference !== imported.finding.id
+          || authorization.artifactPath !== imported.sourceArtifactPath
+          || authorization.sourceWorkUnitId !== imported.sourceWorkUnitId
+          || authorization.importedSource.sourceRunId !== imported.sourceRunId
+          || authorization.importedSource.sourceBaseSha !== imported.sourceBaseSha
+          || authorization.importedSource.artifactSha256 !== imported.sourceArtifactSha256) {
+          throw new OrchestratorError('STATE_CORRUPT', `${request.id} imported authorization does not match persisted continuation evidence`);
+        }
+        continue;
+      }
+      const sourceTask = tasks[authorization.sourceWorkUnitId];
+      const artifactMatches = authorization.purpose === 'correction'
+        ? sourceTask?.reviewPaths.includes(authorization.artifactPath) === true
+        : sourceTask?.handoffPath === authorization.artifactPath;
+      if (!artifactMatches) {
+        throw new OrchestratorError('STATE_CORRUPT', `${request.id} canonical authorization does not match its persisted source artifact`);
+      }
+    }
+  }
   return {
     schemaVersion: 1,
     runId,
@@ -558,11 +1051,14 @@ export function validateRunState(value: unknown): RunState {
     baseBranch: string(value.baseBranch, 'baseBranch'),
     baseSha,
     status: status as RunStatus,
+    ...(strategy === undefined ? {} : { strategy: 'adaptive' as const }),
     tasks,
     integration,
     ...(integrationAttempts === undefined ? {} : { integrationAttempts }),
+    ...(recoveryPolicyHistory === undefined ? {} : { recoveryPolicyHistory }),
     errors: value.errors.map((error, index) => parseStoredError(error, `errors[${index}]`)),
     ...(agentExecutables === undefined ? {} : { agentExecutables }),
+    ...(adaptive === undefined ? {} : { adaptive }),
   };
 }
 

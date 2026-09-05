@@ -49,6 +49,8 @@ tasks:
     effort: high
     dependsOn: [query]
 integration:
+  prepare:
+    - node --version
   commands:
     - pnpm test
 `);
@@ -59,6 +61,159 @@ integration:
   assert.equal(config.tasks[1]?.writer, false);
   assert.deepEqual(config.tasks[1]?.dependsOn, ['query']);
   assert.equal(config.integration.commands[0]?.required, true);
+  assert.equal(config.integration.prepare[0]?.command, 'node --version');
+});
+
+test('integration preparation is optional and static phases retain empty defaults', () => {
+  const config = parsePhaseConfigYaml(`
+phase: 1
+name: static compatibility
+baseBranch: main
+tasks:
+  - id: work
+    title: work
+    owner: codex
+    mode: review
+`);
+  assert.deepEqual(config.integration, { prepare: [], commands: [], diagnostics: [] });
+});
+
+test('maxHandoffRepairAttempts defaults to 2 when absent from phase YAML', () => {
+  const config = parsePhaseConfigYaml(`
+phase: 5
+name: Explorer
+baseBranch: phase5/explorer
+tasks:
+  - id: query
+    title: Query
+    owner: codex
+    mode: implementation
+    effort: high
+    files:
+      - apps/api/src/explorer/**
+`);
+  assert.equal(config.maxHandoffRepairAttempts, 2);
+});
+
+test('maxHandoffRepairAttempts honors an explicit positive integer', () => {
+  const config = parsePhaseConfigYaml(`
+phase: 5
+name: Explorer
+baseBranch: phase5/explorer
+maxHandoffRepairAttempts: 5
+tasks:
+  - id: query
+    title: Query
+    owner: codex
+    mode: implementation
+    effort: high
+    files:
+      - apps/api/src/explorer/**
+`);
+  assert.equal(config.maxHandoffRepairAttempts, 5);
+});
+
+test('maxHandoffRepairAttempts rejects a non-positive value', () => {
+  assert.throws(
+    () =>
+      parsePhaseConfigYaml(`
+phase: 5
+name: Explorer
+baseBranch: phase5/explorer
+maxHandoffRepairAttempts: 0
+tasks:
+  - id: query
+    title: Query
+    owner: codex
+    mode: implementation
+    effort: high
+    files:
+      - apps/api/src/explorer/**
+`),
+    (error: unknown) => isOrchestratorError(error, 'CONFIG_INVALID'),
+  );
+});
+
+test('salvage.verify defaults to an empty command list when absent', () => {
+  const config = parsePhaseConfigYaml(`
+phase: 5
+name: Explorer
+baseBranch: phase5/explorer
+tasks:
+  - id: query
+    title: Query
+    owner: codex
+    mode: implementation
+    effort: high
+    files:
+      - apps/api/src/explorer/**
+`);
+  assert.deepEqual(config.salvage, { verify: [] });
+});
+
+test('salvage.verify parses a configured command list using the same shape as integration.prepare', () => {
+  const config = parsePhaseConfigYaml(`
+phase: 5
+name: Explorer
+baseBranch: phase5/explorer
+salvage:
+  verify:
+    - command: echo verify
+      required: true
+      timeoutMs: 1000
+tasks:
+  - id: query
+    title: Query
+    owner: codex
+    mode: implementation
+    effort: high
+    files:
+      - apps/api/src/explorer/**
+`);
+  assert.deepEqual(config.salvage.verify, [{ command: 'echo verify', required: true, timeoutMs: 1000 }]);
+});
+
+test('salvage.verify commands default required to true, like integration.prepare/commands', () => {
+  const config = parsePhaseConfigYaml(`
+phase: 5
+name: Explorer
+baseBranch: phase5/explorer
+salvage:
+  verify:
+    - node --version
+tasks:
+  - id: query
+    title: Query
+    owner: codex
+    mode: implementation
+    effort: high
+    files:
+      - apps/api/src/explorer/**
+`);
+  assert.equal(config.salvage.verify[0]?.required, true);
+});
+
+test('an unknown salvage key is rejected rather than silently ignored', () => {
+  assert.throws(
+    () =>
+      parsePhaseConfigYaml(`
+phase: 5
+name: Explorer
+baseBranch: phase5/explorer
+salvage:
+  verify: []
+  bogus: true
+tasks:
+  - id: query
+    title: Query
+    owner: codex
+    mode: implementation
+    effort: high
+    files:
+      - apps/api/src/explorer/**
+`),
+    (error: unknown) => isOrchestratorError(error, 'CONFIG_INVALID'),
+  );
 });
 
 test('cycle detection reports a stable DAG_CYCLE error', () => {

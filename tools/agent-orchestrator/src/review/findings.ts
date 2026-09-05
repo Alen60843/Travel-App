@@ -1,4 +1,5 @@
 import { OrchestratorError } from '../errors';
+import { parseWorkRequestDraft, type WorkRequestDraft } from '../adaptive';
 
 export const REVIEW_STATUSES = ['approved', 'changes_requested', 'blocked'] as const;
 export type ReviewStatus = (typeof REVIEW_STATUSES)[number];
@@ -48,10 +49,11 @@ export interface ReviewFinding {
 export interface StructuredReview {
   readonly status: ReviewStatus;
   readonly findings: readonly ReviewFinding[];
+  readonly additionalWorkRequests?: readonly WorkRequestDraft[];
 }
 
 /** Exported so tests can assert the real prompt-facing schema uses these exact bare keys, never a description-annotated variant. */
-export const REVIEW_KEYS = new Set(['status', 'findings']);
+export const REVIEW_KEYS = new Set(['status', 'findings', 'additionalWorkRequests']);
 export const FINDING_KEYS = new Set([
   'id',
   'severity',
@@ -191,7 +193,16 @@ export function validateReview(value: unknown): StructuredReview {
   ) {
     invalid('review.status', 'approved may contain only non-blocking low findings');
   }
-  return { status: status as ReviewStatus, findings };
+  let additionalWorkRequests: WorkRequestDraft[] | undefined;
+  if (candidate.additionalWorkRequests !== undefined) {
+    if (!Array.isArray(candidate.additionalWorkRequests)) invalid('review.additionalWorkRequests', 'must be an array');
+    try {
+      additionalWorkRequests = candidate.additionalWorkRequests.map(parseWorkRequestDraft);
+    } catch (error) {
+      invalid('review.additionalWorkRequests', error instanceof Error ? error.message : String(error), error);
+    }
+  }
+  return { status: status as ReviewStatus, findings, ...(additionalWorkRequests === undefined ? {} : { additionalWorkRequests }) };
 }
 
 /** Parse exactly one JSON review object; freeform prose is intentionally rejected. */

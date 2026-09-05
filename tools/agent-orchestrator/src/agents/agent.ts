@@ -4,6 +4,8 @@ export type AgentRole =
   | 'implementation'
   | 'review'
   | 'correction'
+  | 'testing'
+  | 'synthesis'
   | 'final_review'
   | 'escalation'
   | 'integration'
@@ -49,6 +51,7 @@ export interface AgentRequest {
   readonly worktreePath: string;
   readonly baseSha: string;
   readonly taskSpecification: unknown;
+  readonly adaptive?: boolean;
   readonly canonicalDesignDocumentPath: string;
   readonly allowedFileOwnership: readonly string[];
   readonly dependencyHandoffs: readonly unknown[];
@@ -106,6 +109,7 @@ export interface Agent {
 
 export function defaultAccessForRole(role: AgentRole): AgentAccess {
   return role === 'review'
+    || role === 'synthesis'
     || role === 'final_review'
     || role === 'escalation'
     || role === 'debate'
@@ -132,15 +136,18 @@ export function buildAgentPrompt(request: AgentRequest): string {
     '- Never modify a path outside the allowed ownership list.',
     access === 'read_only'
       ? '- This is a read-only task. Do not modify files, create commits, or change Git state.'
-      : '- Work only in the assigned worktree. Do not push, merge, force-push, or rewrite branch history.',
+      : '- Work only in the assigned worktree. Do not run git commit, push, merge, force-push, or rewrite branch history. The orchestrator validates and creates the task commit.',
     access === 'read_only'
       ? '- Inspect the supplied actual diff and relevant repository files as evidence.'
-      : '- Produce at most one local task commit. Leave no mixture of committed and uncommitted task changes.',
+      : '- Edit files, run bounded verification, and emit the structured handoff; leave commit creation to the orchestrator.',
     '- Do not reveal private chain-of-thought. Return conclusions, evidence, decisions, diffs, and test outcomes only.',
     '- Do not print credentials, tokens, private keys, or complete environment dumps.',
+    ...(request.adaptive === true
+      ? ['- You may only propose additionalWorkRequests in the structured response. You cannot grant or directly launch another agent.']
+      : []),
     '',
     'Role contract:',
-    roleContract(request.role),
+    roleContract(request),
     '',
     'Task specification:',
     stringifyPromptValue(request.taskSpecification),
@@ -155,25 +162,51 @@ export function buildAgentPrompt(request: AgentRequest): string {
   ].join('\n');
 }
 
-function roleContract(role: AgentRole): string {
+function roleContract(request: AgentRequest): string {
+  const role = request.role;
   switch (role) {
     case 'implementation':
       return 'Implement the smallest complete change, verify it proportionately, and report only the structured handoff evidence.';
     case 'review':
-      return 'Independently review the supplied actual diff read-only. Findings require concrete evidence and material impact; omit style-only preferences.';
+      return `Independently and adversarially verify the implementation read-only. ${boundedVerificationContract('Approve when no material defect is found; otherwise return only material evidence-backed findings.')}`;
     case 'correction':
-      return 'Do not apply findings blindly. In decisions, classify every finding as CONFIRMED or REJECTED with evidence. For confirmed findings report Finding -> Evidence -> Fix -> Verification; for rejected findings report why it is incorrect and the supporting evidence.';
+      return 'Do not apply findings blindly. For every assigned canonical finding, emit exactly one findingResponses entry using the strict decision and resolution enums. Generic summary text is not sufficient. For confirmed/resolved findings report evidence, fix, and verification; for rejected findings report evidence, reason, and not_applicable.';
+    case 'testing':
+      return 'Execute only the bounded verification objective. Do not broaden into implementation unless the owned task explicitly requires a test artifact change. When canonical findings are assigned, answer every assigned ID in findingResponses; generic summary text is not sufficient.';
+    case 'synthesis':
+      return `Synthesize only the supplied structured findings: deduplicate, normalize severity, preserve disagreements, and return one canonical verdict. Do not restart repository exploration. ${boundedVerificationContract('Return the canonical review result supported by the supplied shard evidence.')}`;
     case 'final_review':
-      return 'Review the corrected actual diff, prior findings, correction responses, and tests read-only. Approve only if no material issue remains; otherwise return evidence-backed remaining findings.';
+      return `Independently and adversarially verify the corrected implementation, prior findings, correction responses, and tests read-only. ${boundedVerificationContract('Approve when no material defect remains; otherwise return only material evidence-backed remaining findings.')}`;
     case 'escalation':
-      return 'You are the Judge. This task runs whenever a corrected diff has been re-reviewed, whether or not that re-review actually found a remaining disagreement — the orchestrator has no cheaper way to know in advance. If the re-review approved the diff, there is nothing to arbitrate: say so plainly and return status "complete" immediately. Do not invent objections to justify your own involvement. If it did not approve, read the disputed findings, the correction responses, and the actual diff read-only, and decide with evidence whether the disagreement is resolved. Report your ruling in decisions. Return status "complete" if resolved (state exactly what is and is not confirmed, so a following task can act on it) or status "blocked" if it is not (state precisely what remains unresolved and why a human must decide). This is a single bounded arbitration, not a new review round: do not request another round of review.';
+      return `You are the Judge. This task runs whenever a corrected diff has been re-reviewed, whether or not that re-review actually found a remaining disagreement — the orchestrator has no cheaper way to know in advance. If the re-review approved the diff, there is nothing to arbitrate: say so plainly and return status "complete" immediately. Do not invent objections to justify your own involvement. If it did not approve, decide with evidence whether the disputed findings are resolved. Report your ruling in decisions. Return status "complete" if resolved (state exactly what is and is not confirmed, so a following task can act on it) or status "blocked" if it is not (state precisely what remains unresolved and why a human must decide). This is a single bounded arbitration, not a new review round: do not request another round of review. ${boundedVerificationContract('Finish with status "complete" when no material dispute remains; use "blocked" only for a concrete unresolved dispute requiring a human.')}`;
     case 'integration':
       return 'Perform only the explicitly owned Lead composition work. If bounded debate artifacts are supplied, record an explicit A, B, HYBRID, or BLOCKED selection in decisions. Do not merge the phase branch or push; the orchestrator performs deterministic integration and verification later.';
     case 'debate':
       return 'If no peer proposal is supplied, produce one bounded proposal. If one peer proposal is supplied, critique that proposal once. Do not start an open-ended conversation.';
     case 'handoff_repair':
-      return 'You are performing a bounded HANDOFF REPAIR, not the original task. The task specification\'s malformedOutput field is a previous, real result that failed strict schema validation for a formatting/key-naming reason only — it was not rejected as incorrect work. Preserve every value exactly as given: do not invent, remove, or alter any factual content. Your only job is to re-emit it with the correct property names and shape, matching responseSchema exactly. Do not implement anything, run any tools or commands, or modify any file. Return only the corrected JSON object.';
+      return isRecord(request.taskSpecification)
+        && request.taskSpecification.repairKind === 'canonical_finding_metadata'
+        ? 'You are performing one bounded semantic HANDOFF REPAIR, not the original task. Preserve every original handoff field and value, adding only the required findingResponses metadata. Use only requiredCanonicalFindings and deterministicTaskEvidence supplied in the task specification. Never invent a test, diff, fix, or success; when evidence does not support resolution, use unresolved or fail. Do not implement anything, run tools/commands, modify files, or change Git state. Return only the repaired JSON object.'
+        : 'You are performing a bounded HANDOFF REPAIR, not the original task. Preserve every value exactly as given: do not invent, remove, or alter factual content. Re-emit it with the correct property names and shape. Do not implement anything, run tools/commands, modify files, or change Git state. Return only the corrected JSON object.';
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Shared provider-neutral scope contract for every role that verifies rather than implements. */
+function boundedVerificationContract(conclusion: string): string {
+  return [
+    'Start from taskSpecification.actualDependencyDiff and the explicit task invariants.',
+    'Attempt to falsify those invariants deeply, but keep the investigation targeted.',
+    'Inspect extra repository files only to prove or disprove a concrete suspicion raised by the changed files, directly referenced schema/contracts, or immediately relevant existing code.',
+    'Do not perform broad speculative repository exploration, rediscover or redesign the complete architecture, review unrelated modules, or mentally re-implement the task.',
+    'Prefer evidence from changed files, directly referenced schema/contracts, and immediately relevant existing code.',
+    'Report only material findings supported by concrete evidence and impact; omit style-only or hypothetical concerns.',
+    conclusion,
+    'Finish within the allocated execution budget.',
+  ].join(' ');
 }
 
 function stringifyPromptValue(value: unknown): string {

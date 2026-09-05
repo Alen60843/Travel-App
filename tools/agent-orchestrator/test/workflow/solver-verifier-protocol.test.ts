@@ -5,6 +5,7 @@ import test from 'node:test';
 
 import type { Agent, AgentName, AgentRequest, AgentResult } from '../../src/agents';
 import { HANDOFF_KEYS, FINDING_RESPONSE_KEYS } from '../../src/handoff';
+import { isOrchestratorError } from '../../src/errors';
 import { AgentOrchestrator } from '../../src/orchestrator';
 import { FINDING_KEYS, REVIEW_KEYS } from '../../src/review/findings';
 import type { RunState } from '../../src/state';
@@ -838,8 +839,8 @@ test('scenario 12: a description-annotated handoff key is repaired deterministic
     assert.equal(completed.status, 'COMPLETED');
     assert.equal(completed.tasks.solve?.status, 'SUCCEEDED');
     assert.equal(completed.tasks.solve?.handoffOutcome, 'valid');
-    assert.equal(completed.tasks.solve?.handoffRepairAttempted, true);
-    assert.equal(completed.tasks.solve?.handoffRepairSucceeded, true);
+    assert.equal(completed.tasks.solve?.handoffRepairAttempts.length > 0, true);
+    assert.equal(completed.tasks.solve?.handoffRepairAttempts.at(-1)?.succeeded, true);
     assert.deepEqual(codex.invocations, ['solve']);
   } finally {
     await fixture.dispose();
@@ -889,8 +890,8 @@ test('scenario 13: a handoff repair-agent failure fails closed without rerunning
     assert.equal(completed.tasks.solve?.error?.code, 'HANDOFF_INVALID');
     assert.match(completed.tasks.solve?.error?.message ?? '', /somethingGenuinelyUnknown/);
     assert.equal(completed.tasks.solve?.handoffOutcome, 'invalid');
-    assert.equal(completed.tasks.solve?.handoffRepairAttempted, true);
-    assert.equal(completed.tasks.solve?.handoffRepairSucceeded, false);
+    assert.equal(completed.tasks.solve?.handoffRepairAttempts.length > 0, true);
+    assert.equal(completed.tasks.solve?.handoffRepairAttempts.at(-1)?.succeeded, false);
     // The Solver ran once; the repair agent ran once; neither looped or reran.
     assert.deepEqual(codex.invocations, ['solve', 'solve-handoff-repair']);
   } finally {
@@ -943,7 +944,7 @@ test('scenario 14: a real agent process failure never triggers handoff repair', 
     assert.equal(completed.tasks.solve?.status, 'FAILED');
     assert.equal(completed.tasks.solve?.error?.code, 'AGENT_FAILED');
     assert.equal(completed.tasks.solve?.handoffOutcome ?? null, null);
-    assert.equal(completed.tasks.solve?.handoffRepairAttempted ?? false, false);
+    assert.equal(completed.tasks.solve?.handoffRepairAttempts.length, 0);
     assert.deepEqual(invocations, ['solve']);
   } finally {
     await fixture.dispose();
@@ -973,7 +974,7 @@ test('scenario 15: an ownership violation still blocks the task; unaffected by h
     assert.equal(completed.tasks.solve?.error?.code, 'OWNERSHIP_VIOLATION');
     // The handoff itself was perfectly valid; nothing here needed repair.
     assert.equal(completed.tasks.solve?.handoffOutcome, 'valid');
-    assert.equal(completed.tasks.solve?.handoffRepairAttempted, false);
+    assert.equal(completed.tasks.solve?.handoffRepairAttempts.length, 0);
   } finally {
     await fixture.dispose();
   }
@@ -1076,8 +1077,8 @@ test('scenario 16: a persisted FAILED/HANDOFF_INVALID task recovers via recoverH
     const afterRecovery = orchestrator.snapshot();
     assert.equal(afterRecovery.tasks.solve?.status, 'SUCCEEDED');
     assert.equal(afterRecovery.tasks.solve?.handoffOutcome, 'valid');
-    assert.equal(afterRecovery.tasks.solve?.handoffRepairAttempted, true);
-    assert.equal(afterRecovery.tasks.solve?.handoffRepairSucceeded, true);
+    assert.equal(afterRecovery.tasks.solve?.handoffRepairAttempts.length > 0, true);
+    assert.equal(afterRecovery.tasks.solve?.handoffRepairAttempts.at(-1)?.succeeded, true);
     assert.ok(afterRecovery.tasks.solve?.commit?.sha, 'a real task commit must have been created');
     // Downstream, dependency-only BLOCKED tasks are unblocked to PENDING —
     // not jumped straight to READY (verify's own dependency check runs it).
@@ -1090,6 +1091,114 @@ test('scenario 16: a persisted FAILED/HANDOFF_INVALID task recovers via recoverH
     assert.deepEqual(recoveryCodex.invocations, [], 'the Solver must never be re-invoked');
     assert.deepEqual(recoveryClaude.invocations, ['verify']);
     assert.equal(completed.tasks.fix?.status, 'SKIPPED');
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+// 16b. A task whose handoff-repair attempt budget is already exhausted (by
+// prior recorded attempts, native or migrated-legacy) must never reach
+// repair dispatch again — recover-handoffs fails fast with a stable
+// reasonCode, and the repair agent is never invoked a second time.
+test('scenario 16b: recover-handoffs refuses a task whose handoff repair attempt budget is already exhausted', async () => {
+  const { fixture, write } = await setUp();
+  try {
+    const phaseFile = await write({ maxCorrectionRounds: 1, escalation: true });
+    const runsRoot = join(fixture.container, 'runs');
+    const started = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: fixture.repository,
+      runsRoot,
+      agents: { codex: new ScenarioAgent('codex', {}), claude: new ScenarioAgent('claude', {}) },
+    });
+    const runId = started.snapshot().runId;
+    const before = started.snapshot();
+
+    const worktrees = await WorktreeManager.create({ repositoryPath: fixture.repository });
+    const worktree = await worktrees.createTaskWorktree({
+      runId,
+      taskId: 'solve',
+      baseBranch: fixture.baseBranch,
+      baseSha: before.baseSha,
+    });
+    await writeFile(join(worktree.path, 'feature.txt'), 'implemented', 'utf8');
+
+    const logsDir = join(started.stateStore.runDirectory, 'logs');
+    await mkdir(logsDir, { recursive: true });
+    await writeFile(
+      join(logsDir, `${runId}.solve.codex.attempt-1.stdout.log`),
+      JSON.stringify({
+        ...(completeHandoff() as Record<string, unknown>),
+        'assumptions (optional; implementation tasks)': ['a real assumption'],
+      }),
+      'utf8',
+    );
+
+    const dependencyFailedError = {
+      code: 'TASK_DEPENDENCY_FAILED' as const,
+      message: 'A task dependency did not succeed',
+      at: before.createdAt,
+    };
+    const failed: RunState = {
+      ...before,
+      status: 'FAILED',
+      tasks: {
+        ...before.tasks,
+        solve: {
+          ...before.tasks.solve!,
+          status: 'FAILED',
+          worktreePath: worktree.path,
+          branch: worktree.branch,
+          preparedHeadSha: before.baseSha,
+          startedAt: before.createdAt,
+          finishedAt: before.createdAt,
+          agentAttempts: [{
+            attempt: 1,
+            agent: 'codex',
+            startedAt: before.createdAt,
+            finishedAt: before.createdAt,
+            outcome: 'succeeded',
+          }],
+          error: {
+            code: 'HANDOFF_INVALID',
+            message: 'handoff.assumptions (optional; implementation tasks): is not a supported field',
+            at: before.createdAt,
+          },
+          // Two prior attempts already recorded — the default
+          // maxHandoffRepairAttempts (2) is exhausted before this
+          // recover-handoffs call is even made.
+          handoffRepairAttempts: [
+            { method: 'agent' as const, succeeded: false, failureReason: 'agent_invocation_failed' as const, timestamp: before.createdAt },
+            { method: 'agent' as const, succeeded: false, failureReason: 'evidence_insufficient' as const, timestamp: before.createdAt },
+          ],
+        },
+        verify: { ...before.tasks.verify!, status: 'BLOCKED', finishedAt: before.createdAt, error: dependencyFailedError },
+        fix: { ...before.tasks.fix!, status: 'BLOCKED', finishedAt: before.createdAt, error: dependencyFailedError },
+        reverify: { ...before.tasks.reverify!, status: 'BLOCKED', finishedAt: before.createdAt, error: dependencyFailedError },
+        judge: { ...before.tasks.judge!, status: 'BLOCKED', finishedAt: before.createdAt, error: dependencyFailedError },
+      },
+    };
+    await started.stateStore.save(failed);
+
+    const recoveryCodex = new ScenarioAgent('codex', {});
+    const recoveryClaude = new ScenarioAgent('claude', {});
+    await assert.rejects(
+      () => AgentOrchestrator.recoverHandoffFailures(runId, {
+        repositoryPath: fixture.repository,
+        runsRoot,
+        agents: { codex: recoveryCodex, claude: recoveryClaude },
+      }),
+      (error: unknown) => {
+        if (!isOrchestratorError(error, 'TASK_STATE_INVALID')) {
+          throw error;
+        }
+        const details = error.details as unknown as { ineligible: Array<{ taskId: string; reasonCode?: string }> };
+        assert.equal(details.ineligible.length, 1);
+        assert.equal(details.ineligible[0]?.taskId, 'solve');
+        assert.equal(details.ineligible[0]?.reasonCode, 'HANDOFF_REPAIR_BUDGET_EXHAUSTED');
+        return true;
+      },
+    );
+    assert.deepEqual(recoveryCodex.invocations, [], 'a repair agent must never be invoked once the budget is exhausted');
   } finally {
     await fixture.dispose();
   }
@@ -1348,8 +1457,8 @@ test('scenario 20: a review response prefaced with prose is recovered via framin
     assert.equal(completed.status, 'COMPLETED');
     assert.equal(completed.tasks.verify?.status, 'SUCCEEDED');
     assert.equal(completed.tasks.verify?.handoffOutcome, 'valid');
-    assert.equal(completed.tasks.verify?.handoffRepairAttempted, true);
-    assert.equal(completed.tasks.verify?.handoffRepairSucceeded, true);
+    assert.equal(completed.tasks.verify?.handoffRepairAttempts.length > 0, true);
+    assert.equal(completed.tasks.verify?.handoffRepairAttempts.at(-1)?.succeeded, true);
     assert.equal(completed.tasks.fix?.status, 'SKIPPED');
   } finally {
     await fixture.dispose();
@@ -1450,8 +1559,8 @@ test('scenario 21: a persisted FAILED/REVIEW_BLOCKED final_review recovers via f
     const afterRecovery = orchestrator.snapshot();
     assert.equal(afterRecovery.tasks.reverify?.status, 'SUCCEEDED');
     assert.equal(afterRecovery.tasks.reverify?.handoffOutcome, 'valid');
-    assert.equal(afterRecovery.tasks.reverify?.handoffRepairAttempted, true);
-    assert.equal(afterRecovery.tasks.reverify?.handoffRepairSucceeded, true);
+    assert.equal(afterRecovery.tasks.reverify?.handoffRepairAttempts.length > 0, true);
+    assert.equal(afterRecovery.tasks.reverify?.handoffRepairAttempts.at(-1)?.succeeded, true);
     // Read-only task: no commit, ever.
     assert.equal(afterRecovery.tasks.reverify?.commit, undefined);
     assert.equal(afterRecovery.tasks.judge?.status, 'PENDING');
@@ -1500,8 +1609,8 @@ test('scenario 22: an implementation handoff prefaced with prose is recovered vi
     assert.equal(completed.status, 'COMPLETED');
     assert.equal(completed.tasks.solve?.status, 'SUCCEEDED');
     assert.equal(completed.tasks.solve?.handoffOutcome, 'valid');
-    assert.equal(completed.tasks.solve?.handoffRepairAttempted, true);
-    assert.equal(completed.tasks.solve?.handoffRepairSucceeded, true);
+    assert.equal(completed.tasks.solve?.handoffRepairAttempts.length > 0, true);
+    assert.equal(completed.tasks.solve?.handoffRepairAttempts.at(-1)?.succeeded, true);
     assert.ok(completed.tasks.solve?.commit?.sha);
   } finally {
     await fixture.dispose();

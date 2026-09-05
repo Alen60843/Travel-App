@@ -5,6 +5,7 @@ import { afterEach, test } from 'node:test';
 
 import {
   changedFiles,
+  computeTrackedDiffFingerprint,
   diffSummary,
   ensureTaskCommit,
   inspectTaskCommits,
@@ -126,4 +127,51 @@ test('rejects multiple agent commits so integration cannot omit earlier work', a
     }),
     /exactly one auditable task commit/,
   );
+});
+
+test('computeTrackedDiffFingerprint is stable for identical tracked content and changes when tracked content changes', async () => {
+  const repository = await createTemporaryRepository();
+  repositories.push(repository);
+  await writeFile(join(repository.repository, 'shared.txt'), 'changed once\n', 'utf8');
+  const first = await computeTrackedDiffFingerprint(repository.git, repository.repository, repository.baseSha);
+  const firstAgain = await computeTrackedDiffFingerprint(repository.git, repository.repository, repository.baseSha);
+  assert.equal(first, firstAgain);
+
+  await writeFile(join(repository.repository, 'shared.txt'), 'changed twice\n', 'utf8');
+  const second = await computeTrackedDiffFingerprint(repository.git, repository.repository, repository.baseSha);
+  assert.notEqual(first, second);
+});
+
+test('computeTrackedDiffFingerprint binds untracked paths and their content', async () => {
+  const repository = await createTemporaryRepository();
+  repositories.push(repository);
+  const before = await computeTrackedDiffFingerprint(repository.git, repository.repository, repository.baseSha);
+
+  const untrackedPath = join(repository.repository, 'untracked.txt');
+  await writeFile(untrackedPath, 'first untracked contents\n', 'utf8');
+  const first = await computeTrackedDiffFingerprint(repository.git, repository.repository, repository.baseSha);
+  assert.notEqual(before, first);
+
+  const firstAgain = await computeTrackedDiffFingerprint(repository.git, repository.repository, repository.baseSha);
+  assert.equal(first, firstAgain);
+
+  await writeFile(untrackedPath, 'second untracked contents\n', 'utf8');
+  const second = await computeTrackedDiffFingerprint(repository.git, repository.repository, repository.baseSha);
+  assert.notEqual(first, second);
+});
+
+test('computeTrackedDiffFingerprint is binary-sensitive for tracked content', async () => {
+  const repository = await createTemporaryRepository();
+  repositories.push(repository);
+  const binaryPath = join(repository.repository, 'binary.bin');
+  await writeFile(binaryPath, Buffer.from([0, 1, 2, 3, 4]));
+  await repository.git.run(repository.repository, ['add', '--', 'binary.bin']);
+  await repository.git.run(repository.repository, ['commit', '-m', 'add binary baseline']);
+  const binaryBase = await repository.git.resolveCommit(repository.repository, 'HEAD');
+
+  await writeFile(binaryPath, Buffer.from([0, 1, 2, 9, 4]));
+  const first = await computeTrackedDiffFingerprint(repository.git, repository.repository, binaryBase);
+  await writeFile(binaryPath, Buffer.from([0, 1, 2, 8, 4]));
+  const second = await computeTrackedDiffFingerprint(repository.git, repository.repository, binaryBase);
+  assert.notEqual(first, second);
 });

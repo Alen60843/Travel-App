@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 
@@ -19,6 +19,7 @@ import {
   GitClient,
   WorktreeManager,
   assertBaseBranchUnmoved,
+  computeTrackedDiffFingerprint,
   ensureTaskCommit,
   inspectTaskCommits,
   integrateTaskCommits,
@@ -30,11 +31,20 @@ import {
 import {
   deterministicallyRepairHandoffKeys,
   parseHandoff,
+  validateCanonicalFindingResponses,
   validateHandoff,
   writeHandoff,
+  type RequiredCanonicalFinding,
   type StructuredHandoff,
 } from './handoff';
-import { IntegrationGate } from './integration/integration-gate';
+import { IntegrationGate, canReuseIntegrationPreparation } from './integration/integration-gate';
+import {
+  applyRecoveryPolicyOverlay,
+  hashRecoveryPolicy,
+  parseRecoveryPolicyOverlay,
+  type RecoveryExecutorConfig,
+  type RecoveryPolicyOverlay,
+} from './recovery/policy';
 import { extractStructuredPayload } from './protocol';
 import { parseReview, validateReview, type StructuredReview } from './review/findings';
 import {
@@ -44,6 +54,9 @@ import {
   reconcileInterruptedTasks,
   withUpdatedTimestamp,
   type AgentAttemptState,
+  type AgentFailureRecoveryState,
+  type HandoffRepairAttemptRecord,
+  type RecoveryPolicySnapshot,
   type RunEventName,
   type RunState,
   type StoredError,
@@ -56,12 +69,29 @@ import {
   assertChangedFileOwnership,
   assertNoParallelOwnershipOverlap,
   assertReviewRoundAllowed,
+  matchesOwnershipPattern,
   severityAtLeast,
+  validateChangedFileOwnership,
+  type AgentName,
   type TaskCondition,
   type TaskSpec,
   type TaskStatus,
 } from './tasks';
 import { loadAnyPhaseConfig } from './workflow/solver-verifier';
+import {
+  AdaptiveCoordinator,
+  capabilityCatalog,
+  isAdaptivePhaseFile,
+  loadAdaptivePhaseConfig,
+  planAdaptivePhase,
+  routeGrantedWork,
+  runtimePhaseConfig,
+  type AdaptivePhaseConfig,
+  type AdaptivePlanResult,
+  type AdaptiveEvent,
+  type CanonicalFindingAuthorization,
+  type WorkRequestDraft,
+} from './adaptive';
 
 export interface PlanResult {
   readonly repositoryRoot: string;
@@ -100,7 +130,7 @@ interface PreparedTask {
   readonly actualDependencyDiff: string;
 }
 
-const REVIEW_MODES = new Set(['review', 'final_review']);
+const REVIEW_MODES = new Set(['review', 'synthesis', 'final_review']);
 const MAX_AGENT_DIFF_BYTES = 2 * 1024 * 1024;
 const INFRASTRUCTURE_FAILURES = new Set(['not_found', 'spawn_error', 'timed_out']);
 /** §6: bounded — a repair reformats existing text, it never does real work. */
@@ -109,14 +139,96 @@ const HANDOFF_REPAIR_TIMEOUT_MS = 5 * 60 * 1000;
 interface HandoffOutcomeRecord {
   readonly outcome: 'valid' | 'invalid';
   readonly repairAttempted: boolean;
-  readonly repairSucceeded?: boolean;
+  readonly repairRecord?: HandoffRepairAttemptRecord;
 }
+
+/**
+ * Stable, machine-readable eligibility-failure classification for
+ * recover-handoffs, distinct from HandoffRepairAttemptRecord.failureReason
+ * (which classifies an execution failure that happened AFTER dispatch).
+ * HANDOFF_REPAIR_ALREADY_RESOLVED is deliberately not included: a
+ * successful repair always transitions the task out of FAILED, so
+ * HANDOFF_TASK_NOT_FAILED already covers that case — there is no reachable
+ * branch where a task is still FAILED and its last repair succeeded.
+ */
+type HandoffRecoveryEligibilityReasonCode =
+  | 'HANDOFF_TASK_CONFIG_MISSING'
+  | 'HANDOFF_TASK_MODE_MISMATCH'
+  | 'HANDOFF_TASK_NOT_FAILED'
+  | 'HANDOFF_LAST_ATTEMPT_NOT_SUCCEEDED'
+  | 'HANDOFF_COMMIT_ALREADY_RECORDED'
+  | 'HANDOFF_WORKTREE_NOT_PRESERVED'
+  | 'HANDOFF_WORKTREE_NOT_REGISTERED'
+  | 'HANDOFF_WORKTREE_INVALID_DESCENDANT'
+  | 'HANDOFF_WORKTREE_HEAD_MOVED'
+  | 'HANDOFF_WORKTREE_HAS_FOREIGN_COMMITS'
+  | 'HANDOFF_ORIGINAL_LOG_MISSING'
+  | 'HANDOFF_REPAIR_BUDGET_EXHAUSTED';
+
+/** Stable, machine-readable eligibility-failure classification for salvage-task — same pattern as HandoffRecoveryEligibilityReasonCode. */
+type SalvageEligibilityReasonCode =
+  | 'SALVAGE_NOT_TIMED_OUT'
+  | 'SALVAGE_COMMIT_ALREADY_RECORDED'
+  | 'SALVAGE_WORKTREE_NOT_REGISTERED'
+  | 'SALVAGE_WORKTREE_HEAD_MOVED'
+  | 'SALVAGE_WORKTREE_HAS_FOREIGN_COMMITS'
+  | 'SALVAGE_WORKTREE_CLEAN'
+  | 'SALVAGE_OWNERSHIP_VIOLATION'
+  | 'SALVAGE_UNEXPECTED_UNTRACKED_FILE'
+  | 'SALVAGE_DIFF_CHECK_FAILED'
+  | 'SALVAGE_ALREADY_INTEGRATED'
+  | 'SALVAGE_DEPENDENCY_UNSATISFIED';
+
+type HandoffRepairMethod = 'framing' | 'deterministic' | 'agent';
+type HandoffRepairFailureReason =
+  | 'agent_invocation_failed'
+  | 'repair_output_invalid'
+  | 'evidence_insufficient'
+  | 'contradiction_detected'
+  | 'no_eligible_recovery_executor';
+type RepairOutcome =
+  | {
+      readonly ok: true;
+      readonly handoff: StructuredHandoff;
+      readonly method: HandoffRepairMethod;
+      /** Present only for method: 'agent' — see resolveHandoffRepairExecutor. */
+      readonly executorId?: string;
+      readonly adapter?: AgentName;
+    }
+  | {
+      readonly ok: false;
+      readonly reason: HandoffRepairFailureReason;
+      /** Present only once routing resolved an executor (i.e. not for no_eligible_recovery_executor) — see resolveHandoffRepairExecutor. */
+      readonly executorId?: string;
+      readonly adapter?: AgentName;
+    };
 
 /** Result of recoverHandoffFailures: which persisted FAILED tasks were actually recovered, and why any others were left untouched. */
 export interface HandoffRecoveryResult {
   readonly orchestrator: AgentOrchestrator;
   readonly recovered: readonly string[];
   readonly skipped: readonly { readonly taskId: string; readonly reason: string }[];
+}
+
+/** Result of an explicit process-layer retry authorization. No agent is run by this operation. */
+export interface AgentFailureRetryResult {
+  readonly orchestrator: AgentOrchestrator;
+  readonly taskId: string;
+  readonly recovery: AgentFailureRecoveryState;
+  readonly reopenedTasks: readonly string[];
+}
+
+/** Result of AgentOrchestrator.salvageTask. */
+export interface SalvageResult {
+  readonly orchestrator: AgentOrchestrator;
+  readonly taskId: string;
+  readonly commitSha: string;
+}
+
+/** Result of AgentOrchestrator.authorizeRecoveryPolicy. */
+export interface RecoveryPolicyAuthorizationResult {
+  readonly orchestrator: AgentOrchestrator;
+  readonly policyHash: string;
 }
 
 export async function planPhase(
@@ -188,8 +300,20 @@ export async function planPhase(
   };
 }
 
+export type AnyPlanResult = PlanResult | AdaptivePlanResult;
+
+/** Strategy dispatcher. Static planning remains the original default and code path. */
+export async function planOrchestrationPhase(
+  phaseFile: string,
+  options: OrchestratorOptions,
+): Promise<AnyPlanResult> {
+  return await isAdaptivePhaseFile(resolve(phaseFile))
+    ? planAdaptivePhase(phaseFile, options)
+    : planPhase(phaseFile, options);
+}
+
 export class AgentOrchestrator {
-  readonly config: PhaseConfig;
+  config: PhaseConfig;
   readonly repositoryRoot: string;
   readonly runsRoot: string;
   readonly stateStore: StateStore;
@@ -200,6 +324,9 @@ export class AgentOrchestrator {
   private readonly agents: Readonly<Record<'codex' | 'claude', Agent>>;
   private readonly clock: () => Date;
   private readonly signal: AbortSignal | undefined;
+  private readonly adaptiveConfig: AdaptivePhaseConfig | undefined;
+  /** Resolved solely from the most recently authorized recovery-policy overlay — see loadRunForContinuation and resolveHandoffRepairExecutor. */
+  private readonly recoveryExecutors: readonly RecoveryExecutorConfig[] | undefined;
   private stateQueue: Promise<void> = Promise.resolve();
 
   private constructor(options: {
@@ -213,6 +340,8 @@ export class AgentOrchestrator {
     readonly agents: Readonly<Record<'codex' | 'claude', Agent>>;
     readonly clock: () => Date;
     readonly signal?: AbortSignal;
+    readonly adaptiveConfig?: AdaptivePhaseConfig;
+    readonly recoveryExecutors?: readonly RecoveryExecutorConfig[];
   }) {
     this.config = options.config;
     this.repositoryRoot = options.repositoryRoot;
@@ -224,9 +353,14 @@ export class AgentOrchestrator {
     this.agents = options.agents;
     this.clock = options.clock;
     this.signal = options.signal;
+    this.adaptiveConfig = options.adaptiveConfig;
+    this.recoveryExecutors = options.recoveryExecutors;
   }
 
   static async start(phaseFile: string, options: OrchestratorOptions): Promise<AgentOrchestrator> {
+    if (await isAdaptivePhaseFile(resolve(phaseFile))) {
+      return AgentOrchestrator.startAdaptive(phaseFile, options);
+    }
     const plan = await planPhase(phaseFile, options);
     const git = options.git ?? new GitClient();
     const runsRoot = resolve(
@@ -277,6 +411,64 @@ export class AgentOrchestrator {
     return orchestrator;
   }
 
+  private static async startAdaptive(
+    phaseFile: string,
+    options: OrchestratorOptions,
+  ): Promise<AgentOrchestrator> {
+    const plan = await planAdaptivePhase(phaseFile, options);
+    const clock = options.clock ?? (() => new Date());
+    const coordinator = new AdaptiveCoordinator(plan.preview, capabilityCatalog(plan.config), { now: clock });
+    routeGrantedWork(coordinator, plan.config);
+    const adaptive = coordinator.snapshot();
+    const config = runtimePhaseConfig(plan.config, adaptive);
+    const resolved = await resolveRequiredAgentExecutables(
+      plan.config.executors.filter((executor) => executor.available).map((executor) => executor.adapter),
+      options.agents,
+    );
+    const git = options.git ?? new GitClient();
+    const runsRoot = resolve(options.runsRoot ?? join(plan.repositoryRoot, 'tools/agent-orchestrator/runs'));
+    const runId = createRunId(options.clock);
+    const stateStore = new StateStore(runsRoot, runId);
+    const state = createRunState({
+      runId,
+      phase: config.phase,
+      repositoryRoot: plan.repositoryRoot,
+      baseBranch: config.baseBranch,
+      baseSha: plan.baseSha,
+      tasks: config.tasks,
+      strategy: 'adaptive',
+      adaptive,
+      ...(options.clock === undefined ? {} : { clock: options.clock }),
+      ...(Object.keys(resolved).length === 0 ? {} : { agentExecutables: resolved }),
+    });
+    // State and complete topology are durable before the first agent can launch.
+    await stateStore.initialize(state);
+    await copyPhaseSnapshot(resolve(phaseFile), join(stateStore.runDirectory, 'phase.yaml'));
+    const orchestrator = new AgentOrchestrator({
+      config,
+      adaptiveConfig: plan.config,
+      repositoryRoot: plan.repositoryRoot,
+      runsRoot,
+      stateStore,
+      state,
+      git,
+      worktrees: await WorktreeManager.create({ repositoryPath: plan.repositoryRoot, git }),
+      agents: createAgents(options.agents, resolved),
+      clock,
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    });
+    await orchestrator.event('RUN_CREATED', undefined, {
+      phase: config.phase, baseBranch: config.baseBranch, baseSha: plan.baseSha, strategy: 'adaptive',
+    });
+    await orchestrator.emitNewAdaptiveEvents(0);
+    for (const task of Object.values(state.tasks).filter(({ status }) => status === 'READY')) {
+      await orchestrator.event('ADAPTIVE_WORK_UNIT_READY', task.id, { adaptive: true });
+      await orchestrator.event('TASK_READY', task.id);
+    }
+    await orchestrator.mutate((current) => ({ ...current, status: 'RUNNING' }));
+    return orchestrator;
+  }
+
   /**
    * Shared load/validate/construct path for anything that continues an
    * existing run (resume() for interrupted RUNNING tasks; recoverHandoffFailures()
@@ -300,21 +492,79 @@ export class AgentOrchestrator {
         details: { expected: state.repositoryRoot, actual: repositoryRoot },
       });
     }
-    const config = await loadAnyPhaseConfig(join(stateStore.runDirectory, 'phase.yaml'));
-    if (config.baseBranch !== state.baseBranch) {
+    const phaseSnapshot = join(stateStore.runDirectory, 'phase.yaml');
+    let adaptiveConfig: AdaptivePhaseConfig | undefined;
+    let config: PhaseConfig;
+    let loadedState = state;
+    if (state.strategy === 'adaptive') {
+      adaptiveConfig = await loadAdaptivePhaseConfig(phaseSnapshot);
+      if (state.adaptive === undefined) {
+        throw new OrchestratorError('STATE_CORRUPT', 'Adaptive run has no persisted topology');
+      }
+      const coordinator = new AdaptiveCoordinator(
+        state.adaptive,
+        capabilityCatalog(adaptiveConfig),
+        { now: options.clock ?? (() => new Date()) },
+      );
+      // Crash-safe completion of a grant that was persisted immediately before routing.
+      routeGrantedWork(coordinator, adaptiveConfig);
+      let adaptive = coordinator.snapshot();
+      config = runtimePhaseConfig(adaptiveConfig, adaptive);
+      const tasks = { ...state.tasks };
+      for (const spec of config.tasks) {
+        if (tasks[spec.id] !== undefined) continue;
+        tasks[spec.id] = {
+          id: spec.id,
+          status: spec.dependsOn.every((id) => tasks[id]?.status === 'SUCCEEDED' || tasks[id]?.status === 'SKIPPED') ? 'READY' : 'PENDING',
+          agentAttempts: [], reviewRounds: 0, reviewPaths: [], handoffRepairAttempts: [],
+        };
+      }
+      // Heal the narrow crash window between the existing task-state commit
+      // and its mirrored adaptive lifecycle update. No task or request is
+      // recreated; only the already-persisted unit receives the same terminal fact.
+      for (const unit of coordinator.snapshot().workUnits) {
+        if (!['GRANTED', 'RUNNING'].includes(unit.status)) continue;
+        const task = tasks[unit.id];
+        if (task?.status === 'SUCCEEDED') coordinator.finish(unit.id, 'SUCCEEDED');
+        else if (task?.status === 'SKIPPED') coordinator.finish(unit.id, 'SKIPPED');
+        else if (task?.status === 'FAILED' || task?.status === 'BLOCKED') {
+          coordinator.finish(unit.id, task.error?.code === 'AGENT_TIMEOUT' ? 'TIMED_OUT' : 'FAILED', {
+            error: task.error?.message ?? `Recovered terminal task state ${task.status}`,
+          });
+        }
+      }
+      adaptive = coordinator.snapshot();
+      config = runtimePhaseConfig(adaptiveConfig, adaptive);
+      loadedState = withUpdatedTimestamp({ ...state, adaptive, tasks }, options.clock);
+      await stateStore.save(loadedState);
+    } else {
+      config = await loadAnyPhaseConfig(phaseSnapshot);
+    }
+    if (config.baseBranch !== loadedState.baseBranch) {
       throw new OrchestratorError('STATE_CORRUPT', 'Stored phase base branch differs from run state');
     }
-    const actualBaseSha = await resolveBaseSha(git, repositoryRoot, state.baseBranch);
+    const actualBaseSha = await resolveBaseSha(git, repositoryRoot, loadedState.baseBranch);
     // §9: this is the same immutable-base check resume() has always made —
     // recovery must refuse just as loudly as a normal resume would if
     // phase5/explorer (or any other run's base branch) moved underneath it.
-    assertResumeBaseUnmoved(state.baseSha, actualBaseSha);
-    return new AgentOrchestrator({
+    assertResumeBaseUnmoved(loadedState.baseSha, actualBaseSha);
+    // The most recently authorized recovery-policy snapshot (if any) is
+    // applied here, at every load — never by editing the immutable
+    // phase.yaml snapshot on disk. `config` here is still the FRESH,
+    // un-overlaid value computed above (runtimePhaseConfig or
+    // loadAnyPhaseConfig), exactly what applyRecoveryPolicyOverlay
+    // requires. Recovery executors are resolved solely from the overlay
+    // (see resolveHandoffRepairExecutor) since no adaptive role is ever
+    // 'handoff_repair'. A run that has never had a policy authorized
+    // behaves exactly as before — recoveryPolicyHistory is simply absent.
+    const latestRecoveryPolicy = loadedState.recoveryPolicyHistory?.at(-1)?.policy;
+    config = applyRecoveryPolicyOverlay(config, latestRecoveryPolicy);
+    const orchestrator = new AgentOrchestrator({
       config,
       repositoryRoot,
       runsRoot,
       stateStore,
-      state,
+      state: loadedState,
       git,
       worktrees: await WorktreeManager.create({ repositoryPath: repositoryRoot, git }),
       // §7/§13: deliberately NOT a fresh planPhase/resolveAgentExecutable
@@ -327,10 +577,24 @@ export class AgentOrchestrator {
       // (agentExecutables undefined) and falls back to createAgents'/each
       // adapter's own bare command-name default, matching this orchestrator's
       // pre-existing behavior for that older state shape.
-      agents: createAgents(options.agents, state.agentExecutables ?? {}),
+      agents: createAgents(options.agents, loadedState.agentExecutables ?? {}),
       clock: options.clock ?? (() => new Date()),
+      ...(adaptiveConfig === undefined ? {} : { adaptiveConfig }),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
+      ...(latestRecoveryPolicy?.executors === undefined ? {} : { recoveryExecutors: latestRecoveryPolicy.executors }),
     });
+    // §15 crash safety: heal any adaptive unit left stale by a recovery
+    // whose TaskRunState write landed but whose adaptive mirror didn't (see
+    // reconcileRecoveredAdaptiveUnits) — evidence-gated, so a genuinely
+    // unrecovered failure is never touched merely because it's loaded here.
+    await orchestrator.reconcileRecoveredAdaptiveUnits();
+    // Crash-safety window: an authorized recovery epoch's re-arbitration
+    // (and the tasks/units it granted) already persisted, but the run's own
+    // BLOCKED -> RUNNING transition never did (e.g. a crash right after
+    // authorizeRecoveryPolicy). Every load re-checks this, so no
+    // re-authorization is ever required to heal it.
+    await orchestrator.reactivateBlockedRunAfterRecoveryEpoch();
+    return orchestrator;
   }
 
   static async resume(runId: string, options: OrchestratorOptions): Promise<AgentOrchestrator> {
@@ -338,6 +602,103 @@ export class AgentOrchestrator {
     await orchestrator.reconcile();
     await orchestrator.event('RUN_RESUMED');
     return orchestrator;
+  }
+
+  /**
+   * Explicitly authorizes one more attempt for a task that failed before any
+   * structured output was accepted. This is deliberately separate from
+   * resume/reconciliation, structured-output recovery, and integration-gate
+   * recovery: the command only changes persisted scheduler state. A later
+   * normal resume performs the actual agent invocation.
+   */
+  static async retryAgentFailure(
+    runId: string,
+    taskId: string,
+    options: OrchestratorOptions,
+  ): Promise<AgentFailureRetryResult> {
+    const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options);
+    const checked = await orchestrator.checkAgentFailureRetryEligibility(taskId);
+    if (!checked.eligible) {
+      throw new OrchestratorError(
+        'TASK_STATE_INVALID',
+        `Refusing agent retry for ${taskId}: ${checked.reason}`,
+        { details: { runId, taskId, reason: checked.reason } },
+      );
+    }
+
+    const previous = orchestrator.state.tasks[taskId]!;
+    const previousRunStatus = orchestrator.state.status as 'FAILED' | 'BLOCKED';
+    const lastAttempt = previous.agentAttempts.at(-1)!;
+    const reopenedTasks = orchestrator.dependencyOnlyDescendantsToReopen(taskId);
+    const recovery: AgentFailureRecoveryState = {
+      recovery: (previous.agentFailureRecoveries?.length ?? 0) + 1,
+      authorizedAt: orchestrator.clock().toISOString(),
+      previousRunStatus,
+      previousTaskStatus: 'FAILED',
+      error: previous.error!,
+      attempt: lastAttempt,
+      reopenedTaskIds: reopenedTasks,
+    };
+
+    const reopenState = (state: RunState): RunState => {
+      const target = state.tasks[taskId]!;
+      const {
+        error: _previousError,
+        finishedAt: _previousFinishedAt,
+        startedAt: _previousStartedAt,
+        skipReason: _previousSkipReason,
+        ...retryableTarget
+      } = target;
+      const tasks: Record<string, TaskRunState> = {
+        ...state.tasks,
+        [taskId]: {
+          ...retryableTarget,
+          status: 'READY',
+          agentFailureRecoveries: [
+            ...(target.agentFailureRecoveries ?? []),
+            recovery,
+          ],
+        },
+      };
+      for (const reopenedTaskId of reopenedTasks) {
+        const blocked = state.tasks[reopenedTaskId]!;
+        const {
+          error: _dependencyError,
+          finishedAt: _dependencyFinishedAt,
+          ...waitingTask
+        } = blocked;
+        tasks[reopenedTaskId] = { ...waitingTask, status: 'PENDING' };
+      }
+      return { ...state, status: 'RUNNING', tasks };
+    };
+    if (orchestrator.state.strategy === 'adaptive') {
+      await orchestrator.authorizeAdaptiveRetry(
+        taskId,
+        recovery.error.code === 'AGENT_TIMEOUT',
+        recovery.error.message,
+        reopenState,
+      );
+    } else {
+      await orchestrator.mutate(reopenState);
+    }
+
+    await orchestrator.event('AGENT_RETRY_AUTHORIZED', taskId, {
+      recovery: recovery.recovery,
+      failedAttempt: lastAttempt.attempt,
+      errorCode: recovery.error.code,
+      agent: lastAttempt.agent,
+    });
+    for (const reopenedTaskId of reopenedTasks) {
+      await orchestrator.event('TASK_DEPENDENCY_REOPENED', reopenedTaskId, {
+        recoveredDependency: taskId,
+      });
+    }
+    await orchestrator.event('RUN_RESUMED', undefined, {
+      recoveryMode: 'agent_failure_retry',
+      taskId,
+      reopenedTasks,
+    });
+    return { orchestrator, taskId, recovery, reopenedTasks };
   }
 
   /**
@@ -355,6 +716,42 @@ export class AgentOrchestrator {
    * human review" means exactly that, not a partial silent recovery that
    * could leave the run in a confusing mixed state.
    */
+  /**
+   * Authorizes a recovery-only policy overlay for a historical run without
+   * ever editing its immutable phase.yaml snapshot. Validates and normalizes
+   * the raw policy, hashes the normalized representation (never raw YAML
+   * bytes — see hashRecoveryPolicy), and appends one immutable snapshot to
+   * recoveryPolicyHistory. Deliberately request -> grant, never request ->
+   * execute: this method invokes no agent, salvages no work, repairs no
+   * handoff, creates no task commit, and does not resume the run — it only
+   * authorizes and persists policy. A later agents:recover-handoffs or
+   * agents:salvage-task call picks up the most recently authorized snapshot
+   * the next time the run is loaded.
+   */
+  static async authorizeRecoveryPolicy(
+    runId: string,
+    rawPolicy: unknown,
+    options: OrchestratorOptions,
+  ): Promise<RecoveryPolicyAuthorizationResult> {
+    const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options);
+    const policy = parseRecoveryPolicyOverlay(rawPolicy);
+    const policyHash = hashRecoveryPolicy(policy);
+    const snapshot: RecoveryPolicySnapshot = {
+      authorizedAt: orchestrator.clock().toISOString(),
+      policyHash,
+      policy,
+    };
+    await orchestrator.mutate((state) => ({
+      ...state,
+      recoveryPolicyHistory: [...(state.recoveryPolicyHistory ?? []), snapshot],
+    }));
+    await orchestrator.event('RECOVERY_POLICY_AUTHORIZED', undefined, { policyHash });
+    if (policy.recoveryBudget !== undefined) {
+      await orchestrator.authorizeRecoveryEpoch(policyHash, policy.recoveryBudget.maxWallClockMs);
+    }
+    return { orchestrator, policyHash };
+  }
+
   static async recoverHandoffFailures(
     runId: string,
     options: OrchestratorOptions,
@@ -384,7 +781,11 @@ export class AgentOrchestrator {
             taskState,
             task: undefined,
             kind,
-            check: { eligible: false, reason: 'task id not found in the loaded phase config' },
+            check: {
+              eligible: false,
+              reason: 'task id not found in the loaded phase config',
+              reasonCode: 'HANDOFF_TASK_CONFIG_MISSING' as const,
+            },
           };
         }
         if (kind === 'review' && !REVIEW_MODES.has(task.mode)) {
@@ -392,7 +793,11 @@ export class AgentOrchestrator {
             taskState,
             task,
             kind,
-            check: { eligible: false, reason: `mode ${task.mode} is not a review/final_review task` },
+            check: {
+              eligible: false,
+              reason: `mode ${task.mode} is not a review/final_review task`,
+              reasonCode: 'HANDOFF_TASK_MODE_MISMATCH' as const,
+            },
           };
         }
         const check = await orchestrator.checkStructuredOutputRecoveryEligibility(
@@ -412,6 +817,7 @@ export class AgentOrchestrator {
             ineligible: ineligible.map((entry) => ({
               taskId: entry.taskState.id,
               reason: entry.check.reason,
+              reasonCode: entry.check.reasonCode,
             })),
           },
         },
@@ -426,6 +832,11 @@ export class AgentOrchestrator {
         await orchestrator.recoverReviewBlockedTask(entry.task!, entry.taskState);
       }
       recovered.push(entry.taskState.id);
+      // §11: mirror this recovery into the adaptive layer immediately —
+      // never rerun the correction agent, never recreate the commit, never
+      // duplicate the handoff; just complete the same semantic lifecycle a
+      // live success would have run.
+      await orchestrator.completeRecoveredAdaptiveTask(entry.taskState.id, 'handoff_repair');
     }
     const unblocked = await orchestrator.unblockDependencyOnlyFailures();
     if (recovered.length > 0) {
@@ -468,10 +879,11 @@ export class AgentOrchestrator {
         `Refusing integration retry: run status is ${state.status}, not BLOCKED`,
       );
     }
-    if (state.integration.error?.code !== 'INTEGRATION_TEST_FAILED') {
+    if (state.integration.error?.code !== 'INTEGRATION_TEST_FAILED'
+      && state.integration.error?.code !== 'INTEGRATION_PREPARATION_FAILED') {
       throw new OrchestratorError(
         'TASK_STATE_INVALID',
-        `Refusing integration retry: integration.error.code is ${state.integration.error?.code ?? 'undefined'}, not INTEGRATION_TEST_FAILED`,
+        `Refusing integration retry: integration.error.code is ${state.integration.error?.code ?? 'undefined'}, not INTEGRATION_TEST_FAILED or INTEGRATION_PREPARATION_FAILED`,
       );
     }
     const nonTerminalTasks = Object.values(state.tasks).filter(
@@ -496,7 +908,10 @@ export class AgentOrchestrator {
     }
 
     await orchestrator.archiveIntegrationAttempt();
-    await orchestrator.mutate((current) => ({ ...current, status: 'RUNNING' }));
+    await orchestrator.mutate((current) => {
+      const { error: _archivedError, ...integration } = current.integration;
+      return { ...current, status: 'RUNNING', integration: { ...integration, status: 'RUNNING' } };
+    });
     await orchestrator.event('RUN_RESUMED', undefined, { recoveryMode: 'integration_retry' });
     return orchestrator;
   }
@@ -618,6 +1033,207 @@ export class AgentOrchestrator {
     return orchestrator;
   }
 
+  /**
+   * Salvages useful work a timed-out writer left behind in its dirty
+   * worktree. A dirty diff is only evidence, never success on its own:
+   * eligibility (ownership/foreign-commit/diff-check-clean) -> deterministic
+   * salvage.verify (never trusting operator prose) -> a diff/config-bound
+   * SALVAGE_VERIFIED checkpoint -> the Orchestrator (never salvage code
+   * itself) creates the commit via the same ensureTaskCommit/
+   * assertChangedFileOwnership path applyIntegrationFix already uses. No
+   * canonical-finding handling yet at this step (see the follow-up task
+   * that adds it) — a task with no required canonical findings goes
+   * straight from a passing verification to a synthesized handoff and
+   * succeedTask, exactly like any other task completion.
+   */
+  static async salvageTask(
+    runId: string,
+    taskId: string,
+    options: OrchestratorOptions,
+  ): Promise<SalvageResult> {
+    const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options);
+    const checked = await orchestrator.checkSalvageEligibility(taskId);
+    if (!checked.eligible) {
+      throw new OrchestratorError(
+        'TASK_STATE_INVALID',
+        `Refusing salvage for ${taskId}: ${checked.reason}`,
+        { details: { runId, taskId, reason: checked.reason, reasonCode: checked.reasonCode } },
+      );
+    }
+    const taskSpec = orchestrator.config.tasks.find((task) => task.id === taskId)!;
+    const preparedHeadSha = orchestrator.state.tasks[taskId]!.preparedHeadSha!;
+
+    if (orchestrator.state.tasks[taskId]?.salvage === undefined) {
+      await orchestrator.mutate((state) => updateTask(state, taskId, (task) => ({
+        ...task,
+        salvage: { authorizedAt: orchestrator.clock().toISOString() },
+      })));
+      await orchestrator.event('SALVAGE_AUTHORIZED', taskId, {});
+    }
+
+    const verifyConfigFingerprint = createHash('sha256')
+      .update(JSON.stringify(orchestrator.config.salvage.verify), 'utf8')
+      .digest('hex');
+    const existingCheckpoint = orchestrator.state.tasks[taskId]?.salvage?.verification;
+    const currentDiffFingerprint = await computeTrackedDiffFingerprint(
+      orchestrator.git, checked.worktree.path, preparedHeadSha,
+    );
+    const checkpointValid = existingCheckpoint !== undefined
+      && existingCheckpoint.worktreeHeadSha === preparedHeadSha
+      && existingCheckpoint.trackedDiffFingerprint === currentDiffFingerprint
+      && existingCheckpoint.verifyConfigFingerprint === verifyConfigFingerprint;
+
+    if (!checkpointValid) {
+      if (orchestrator.config.agentWorktree.prepare.length > 0) {
+        const prepared = await new IntegrationGate().run({
+          cwd: checked.worktree.path,
+          logsDirectory: join(orchestrator.stateStore.runDirectory, 'logs', taskId, 'salvage-prepare'),
+          commands: orchestrator.config.agentWorktree.prepare,
+          ...(orchestrator.signal === undefined ? {} : { signal: orchestrator.signal }),
+        });
+        if (!prepared.passed) {
+          throw new OrchestratorError(
+            'AGENT_WORKTREE_PREPARATION_FAILED',
+            `Refusing salvage for ${taskId}: worktree preparation failed`,
+            { details: { runId, taskId } },
+          );
+        }
+      }
+      if (orchestrator.config.salvage.verify.length === 0) {
+        throw new OrchestratorError(
+          'SALVAGE_VERIFICATION_FAILED',
+          `Refusing salvage for ${taskId}: no salvage.verify commands configured`,
+          { details: { runId, taskId, reason: 'no_verify_configured' } },
+        );
+      }
+      const preFingerprint = await computeTrackedDiffFingerprint(
+        orchestrator.git, checked.worktree.path, preparedHeadSha,
+      );
+      const verified = await new IntegrationGate().run({
+        cwd: checked.worktree.path,
+        logsDirectory: join(orchestrator.stateStore.runDirectory, 'logs', taskId, 'salvage-verify'),
+        commands: orchestrator.config.salvage.verify,
+        ...(orchestrator.signal === undefined ? {} : { signal: orchestrator.signal }),
+      });
+      const postFingerprint = await computeTrackedDiffFingerprint(
+        orchestrator.git, checked.worktree.path, preparedHeadSha,
+      );
+      // Mutation detection takes priority over the commands' own exit
+      // codes: a verify command must never silently become another writer,
+      // even one that happens to also report success.
+      if (postFingerprint !== preFingerprint) {
+        await orchestrator.event('SALVAGE_VERIFICATION_FAILED', taskId, { reason: 'verify_mutated_tracked_source' });
+        throw new OrchestratorError(
+          'SALVAGE_VERIFICATION_FAILED',
+          `Refusing salvage for ${taskId}: verify commands modified tracked source`,
+          { details: { runId, taskId, reason: 'verify_mutated_tracked_source' } },
+        );
+      }
+      if (!verified.passed) {
+        await orchestrator.event('SALVAGE_VERIFICATION_FAILED', taskId, { reason: 'verify_command_failed' });
+        throw new OrchestratorError(
+          'SALVAGE_VERIFICATION_FAILED',
+          `Refusing salvage for ${taskId}: required verify command failed`,
+          { details: { runId, taskId, reason: 'verify_command_failed' } },
+        );
+      }
+      await orchestrator.mutate((state) => updateTask(state, taskId, (task) => ({
+        ...task,
+        salvage: {
+          authorizedAt: task.salvage!.authorizedAt,
+          verification: {
+            worktreeHeadSha: preparedHeadSha,
+            trackedDiffFingerprint: postFingerprint,
+            verifyConfigFingerprint,
+            result: 'passed',
+          },
+        },
+      })));
+      await orchestrator.event('SALVAGE_VERIFIED', taskId, {});
+    }
+
+    // No Git commit exists yet, and none is created until every
+    // semantic/protocol check required for task completion has succeeded —
+    // ownership was already proven at eligibility time (checked.changedFiles
+    // is exactly the dirty diff's changed-file set, computed from `git
+    // status`, not from a commit); reusing it here means the handoff never
+    // needs to wait for ensureTaskCommit to learn what changed, and a
+    // canonical repair that fails leaves the worktree exactly as dirty and
+    // salvageable as it was before this call — never a stranded commit with
+    // nothing left to repair.
+    //
+    // A timed-out writer never produced a handoff at all, so one is
+    // synthesized here from the salvaged diff and verify evidence. If the
+    // task carries required canonical findings, this shell deliberately
+    // omits findingResponses, which routes it through the exact same
+    // parseOrRepairHandoff -> repairHandoff -> repairHandoffViaAgent
+    // cascade Part A hardened — the identical bounded, evidence-only
+    // repair, never a canonical-validation bypass. A task with no required
+    // canonical findings passes straight through with no repair attempt at
+    // all (validateCanonicalFindingResponses is a no-op for an empty
+    // requirement list).
+    const requiredCanonicalFindings = orchestrator.requiredCanonicalFindings(taskId);
+    const finalDiff = (await orchestrator.git.run(
+      checked.worktree.path, ['diff', '--no-ext-diff', '--no-color', preparedHeadSha],
+    )).stdout;
+    const synthesizedHandoff = {
+      status: 'complete',
+      summary: `Salvaged timed-out writer work for ${taskId} after deterministic verification.`,
+      filesChanged: [...checked.changedFiles],
+      decisions: [],
+      tests: orchestrator.config.salvage.verify.map((command) => ({
+        command: command.command,
+        result: 'pass' as const,
+        details: 'salvage.verify required command passed',
+      })),
+      openQuestions: [],
+      reviewRequested: [],
+    };
+    const parsed = await orchestrator.parseOrRepairHandoff(
+      taskSpec, synthesizedHandoff, null, requiredCanonicalFindings, finalDiff,
+    );
+    await orchestrator.recordHandoffOutcome(taskId, parsed.outcome);
+    if (parsed.handoff === null) {
+      // The worktree is untouched (still dirty, HEAD unmoved) — a later
+      // salvage-task call with different/available recovery evidence
+      // remains fully eligible and can retry from scratch.
+      throw parsed.error;
+    }
+
+    // ONLY NOW, with a strictly-validated, accepted canonical handoff in
+    // hand, does the Orchestrator (never salvage code calling git itself)
+    // create the commit — the same ensureTaskCommit/assertChangedFileOwnership
+    // path applyIntegrationFix already uses.
+    const ensured = await ensureTaskCommit(orchestrator.git, {
+      worktreePath: checked.worktree.path,
+      baseSha: preparedHeadSha,
+      agent: taskSpec.owner,
+      taskId,
+      summary: `Salvaged timed-out writer work for ${taskId}`,
+    });
+    assertChangedFileOwnership(taskId, ensured.changedFiles, taskSpec.files);
+    if (JSON.stringify([...ensured.changedFiles].sort()) !== JSON.stringify([...checked.changedFiles].sort())) {
+      throw new OrchestratorError(
+        'STATE_CORRUPT',
+        `Refusing salvage for ${taskId}: the committed changed-file set does not match what was reported pre-commit`,
+        { details: { runId, taskId, preCommit: checked.changedFiles, committed: ensured.changedFiles } },
+      );
+    }
+
+    const handoffPath = await writeHandoff(join(orchestrator.stateStore.runDirectory, 'handoffs'), taskId, parsed.handoff);
+    await orchestrator.succeedTask(taskId, handoffPath, {
+      sha: ensured.commitSha,
+      parentSha: preparedHeadSha,
+      changedFiles: [...ensured.changedFiles],
+    });
+    // §12: same post-recovery adaptive completion lifecycle as handoff
+    // repair — no salvage.verify rerun, no second commit, no repeat repair;
+    // this only mirrors the already-accepted success into the adaptive layer.
+    await orchestrator.completeRecoveredAdaptiveTask(taskId, 'salvage');
+
+    return { orchestrator, taskId, commitSha: ensured.commitSha };
+  }
+
   snapshot(): RunState {
     return this.state;
   }
@@ -634,6 +1250,9 @@ export class AgentOrchestrator {
         this.state.baseBranch,
         this.state.baseSha,
       );
+      await this.advanceAdaptiveScheduling();
+      await this.reconcileAdaptiveCorrectionFlow();
+      await this.advanceAdaptiveScheduling();
       const scheduler = new TaskScheduler(
         this.config.tasks,
         this.config.concurrency,
@@ -691,6 +1310,46 @@ export class AgentOrchestrator {
             (task) => task.status === 'SUCCEEDED' || task.status === 'SKIPPED',
           )
         ) {
+          if (this.state.strategy === 'adaptive') {
+            // `true` asks whether topology is otherwise complete; the actual
+            // deterministic gate still runs below and alone decides completion.
+            const completion = this.adaptiveCoordinator().completionStatus(true);
+            if (completion === 'HUMAN_APPROVAL_REQUIRED' || completion === 'BLOCKED') {
+              const error = new OrchestratorError(
+                'BLOCKED_FOR_HUMAN_REVIEW',
+                completion === 'HUMAN_APPROVAL_REQUIRED'
+                  ? 'Adaptive work is waiting for explicit human approval'
+                  : 'A required adaptive request was denied by policy',
+              );
+              await this.mutate((current) => ({
+                ...current,
+                status: 'BLOCKED',
+                errors: [...current.errors, normalizeError(error, this.clock)],
+              }));
+              await this.event('RUN_BLOCKED', undefined, { adaptiveCompletion: completion });
+              return this.state;
+            }
+            if (completion === 'FAILED') {
+              await this.mutate((current) => ({ ...current, status: 'FAILED' }));
+              return this.state;
+            }
+            if (completion === 'ACTIVE') return this.state;
+            const reviewGate = await this.adaptiveReviewGate();
+            if (reviewGate !== 'APPROVED') {
+              if (reviewGate === 'ACTIVE') return this.state;
+              const error = new OrchestratorError(
+                'BLOCKED_FOR_HUMAN_REVIEW',
+                'Adaptive review has unresolved material findings after the authorized correction rounds',
+              );
+              await this.mutate((current) => ({
+                ...current,
+                status: 'BLOCKED',
+                errors: [...current.errors, normalizeError(error, this.clock)],
+              }));
+              await this.event('RUN_BLOCKED', undefined, { adaptiveReviewGate: reviewGate });
+              return this.state;
+            }
+          }
           await this.integrateAndVerify();
           return this.state;
         }
@@ -714,6 +1373,7 @@ export class AgentOrchestrator {
           ])),
         },
       }));
+      await this.startAdaptiveUnits(claimed.map((task) => task.id));
       await Promise.all(claimed.map(async (task) => {
         await this.event('TASK_STARTED', task.id);
         try {
@@ -735,8 +1395,567 @@ export class AgentOrchestrator {
         'Refusing cleanup while run or tasks are still running',
       );
     }
-    const results = await this.worktrees.cleanupRun(this.state.runId);
+    const entries = (await this.worktrees.listOwned()).filter((entry) => entry.runId === this.state.runId);
+    const results = [];
+    for (const entry of entries) {
+      results.push(await this.worktrees.cleanup(entry.path, {
+        allowUntrackedPreparationArtifacts: entry.kind === 'integration'
+          && this.state.integration.preparation?.status === 'SUCCEEDED',
+      }));
+    }
     return results.map((result) => result.entry.path);
+  }
+
+  private adaptiveCoordinator(state: RunState = this.state): AdaptiveCoordinator {
+    if (this.adaptiveConfig === undefined || state.adaptive === undefined) {
+      throw new OrchestratorError('STATE_CORRUPT', 'Adaptive coordinator requested for a static run');
+    }
+    return new AdaptiveCoordinator(
+      state.adaptive,
+      capabilityCatalog(this.adaptiveConfig),
+      { now: this.clock },
+    );
+  }
+
+  /** Re-arbitrate after every completion/release; persist grants and routes before tasks can launch. */
+  private async advanceAdaptiveScheduling(): Promise<void> {
+    if (this.adaptiveConfig === undefined || this.state.adaptive === undefined) return;
+    let emitted: readonly AdaptiveEvent[] = [];
+    const added: string[] = [];
+    await this.mutate((current) => {
+      const coordinator = this.adaptiveCoordinator(current);
+      const previousEvents = current.adaptive!.events.length;
+      coordinator.arbitrate();
+      routeGrantedWork(coordinator, this.adaptiveConfig!);
+      const adaptive = coordinator.snapshot();
+      emitted = adaptive.events.slice(previousEvents);
+      // Always re-derive from the FRESH, un-overlaid runtimePhaseConfig,
+      // then reapply the currently-authorized recovery policy on top —
+      // never reuse `this.config` here, which may already be overlaid: a
+      // repeated overlay of an already-overlaid config is exactly how
+      // handoffRepair.additionalAttempts (or a re-applied
+      // integrationRecovery.prepare) would silently stack across every
+      // scheduling pass instead of staying pinned to the latest
+      // authorization's own value.
+      const runtimeBase = runtimePhaseConfig(this.adaptiveConfig!, adaptive);
+      const latestRecoveryPolicy = current.recoveryPolicyHistory?.at(-1)?.policy;
+      const effectiveRuntime = applyRecoveryPolicyOverlay(runtimeBase, latestRecoveryPolicy);
+      const tasks = { ...current.tasks };
+      for (const spec of effectiveRuntime.tasks) {
+        if (tasks[spec.id] !== undefined) continue;
+        tasks[spec.id] = {
+          id: spec.id,
+          status: spec.dependsOn.every((id) => tasks[id]?.status === 'SUCCEEDED' || tasks[id]?.status === 'SKIPPED')
+            ? 'READY'
+            : 'PENDING',
+          agentAttempts: [], reviewRounds: 0, reviewPaths: [], handoffRepairAttempts: [],
+        };
+        added.push(spec.id);
+      }
+      this.config = effectiveRuntime;
+      return { ...current, adaptive, tasks };
+    });
+    await this.emitAdaptiveEvents(emitted);
+    for (const id of added.filter((taskId) => this.state.tasks[taskId]?.status === 'READY')) {
+      await this.event('ADAPTIVE_WORK_UNIT_READY', id, { adaptive: true });
+      await this.event('TASK_READY', id, { adaptive: true });
+    }
+  }
+
+  private async emitNewAdaptiveEvents(previousCount: number): Promise<void> {
+    if (this.state.adaptive === undefined) return;
+    await this.emitAdaptiveEvents(this.state.adaptive.events.slice(previousCount));
+  }
+
+  private async emitAdaptiveEvents(entries: readonly AdaptiveEvent[]): Promise<void> {
+    const names: Readonly<Record<string, RunEventName | undefined>> = {
+      REQUEST_CREATED: 'ADAPTIVE_REQUEST_CREATED',
+      GRANT_DECIDED: 'ADAPTIVE_GRANT_DECIDED',
+      WORK_UNIT_CREATED: 'ADAPTIVE_WORK_UNIT_CREATED',
+      WORK_UNIT_STARTED: 'ADAPTIVE_WORK_UNIT_STARTED',
+      WORK_UNIT_FINISHED: 'ADAPTIVE_WORK_UNIT_FINISHED',
+      RESOURCE_RELEASED: 'ADAPTIVE_RESOURCE_RELEASED',
+      SYNTHESIS_TREE_CREATED: 'ADAPTIVE_SYNTHESIS_CREATED',
+      CANONICAL_FINDINGS_IMPORTED: 'ADAPTIVE_CANONICAL_FINDINGS_IMPORTED',
+      CORRECTION_PLAN_CREATED: 'ADAPTIVE_CORRECTION_PLAN_CREATED',
+      CORRECTION_REQUEST_CREATED: 'ADAPTIVE_CORRECTION_REQUEST_CREATED',
+      CORRECTION_GRANTED: 'ADAPTIVE_CORRECTION_GRANTED',
+      REVERIFICATION_CREATED: 'ADAPTIVE_REVERIFICATION_CREATED',
+      WORK_UNIT_RECOVERED: 'ADAPTIVE_WORK_UNIT_RECOVERED',
+      RECOVERY_EPOCH_AUTHORIZED: 'ADAPTIVE_RECOVERY_EPOCH_AUTHORIZED',
+    };
+    for (const entry of entries) {
+      let name = names[entry.type];
+      if (entry.type === 'GRANT_DECIDED') {
+        name = entry.detail.startsWith('GRANTED:')
+          ? 'ADAPTIVE_REQUEST_GRANTED'
+          : entry.detail.startsWith('WAITING:')
+            ? 'ADAPTIVE_REQUEST_WAITING'
+            : 'ADAPTIVE_REQUEST_DENIED';
+      } else if (entry.type === 'WORK_UNIT_FINISHED') {
+        name = entry.detail === 'SUCCEEDED' || entry.detail === 'SKIPPED'
+          ? 'ADAPTIVE_WORK_UNIT_SUCCEEDED'
+          : 'ADAPTIVE_WORK_UNIT_FAILED';
+      }
+      if (name === undefined) continue;
+      await this.event(name, entry.workUnitId, {
+        adaptiveSequence: entry.sequence,
+        requestId: entry.requestId ?? null,
+        decisionId: entry.decisionId ?? null,
+        detail: entry.detail,
+      });
+    }
+  }
+
+  private async startAdaptiveUnits(ids: readonly string[]): Promise<void> {
+    if (this.state.adaptive === undefined) return;
+    let emitted: readonly AdaptiveEvent[] = [];
+    await this.mutate((current) => {
+      const coordinator = this.adaptiveCoordinator(current);
+      const previousEvents = current.adaptive!.events.length;
+      for (const id of ids) coordinator.start(id);
+      const adaptive = coordinator.snapshot();
+      emitted = adaptive.events.slice(previousEvents);
+      return { ...current, adaptive };
+    });
+    await this.emitAdaptiveEvents(emitted);
+  }
+
+  private async finishAdaptiveUnit(
+    taskId: string,
+    status: 'SUCCEEDED' | 'FAILED' | 'TIMED_OUT' | 'SKIPPED',
+    error?: string,
+  ): Promise<void> {
+    if (this.state.adaptive === undefined) return;
+    let emitted: readonly AdaptiveEvent[] = [];
+    await this.mutate((current) => {
+      const coordinator = this.adaptiveCoordinator(current);
+      const unit = coordinator.snapshot().workUnits.find((candidate) => candidate.id === taskId);
+      if (unit === undefined || !['GRANTED', 'RUNNING'].includes(unit.status)) return current;
+      const previousEvents = current.adaptive!.events.length;
+      coordinator.finish(taskId, status, error === undefined ? {} : { error });
+      const adaptive = coordinator.snapshot();
+      emitted = adaptive.events.slice(previousEvents);
+      return { ...current, adaptive };
+    });
+    await this.emitAdaptiveEvents(emitted);
+  }
+
+  /**
+   * The single shared post-recovery adaptive completion lifecycle, used by
+   * both recoverHandoffFailures and salvageTask (never duplicated between
+   * them) and by reconcileRecoveredAdaptiveUnits' crash-safety scan. A
+   * successfully recovered task must pass through the SAME semantic
+   * completion the live path uses — mirror the adaptive unit to SUCCEEDED,
+   * then run the identical reconcileAdaptiveCorrectionFlow/
+   * advanceAdaptiveScheduling pair finishParsedHandoff already runs after
+   * every live success, so a canonical correction's targeted re-verification
+   * is materialized exactly as it would be for a live completion.
+   *
+   * Guarded, in order: adaptive strategy in use; the task is actually
+   * SUCCEEDED; an adaptive unit exists for it; that unit is not already
+   * SUCCEEDED (idempotent no-op — never calls recoverFinishedUnit twice);
+   * the unit is a genuine terminal failure (FAILED/TIMED_OUT — a
+   * GRANTED/RUNNING/WAITING/REQUESTED/DENIED unit is never touched here,
+   * that's finishAdaptiveUnit's job); and finally the caller's claimed
+   * recoveryKind actually matches the strongest persisted evidence
+   * (recoveryEvidenceKind) — never inferred, never trusted from the caller
+   * alone. Any failed guard is a silent no-op, not a throw: this runs from
+   * a crash-safety scan over every adaptive unit on every load, where most
+   * units legitimately don't qualify.
+   */
+  private async completeRecoveredAdaptiveTask(
+    taskId: string,
+    recoveryKind: 'handoff_repair' | 'salvage',
+  ): Promise<void> {
+    if (this.state.adaptive === undefined) return;
+    const task = this.state.tasks[taskId];
+    if (task?.status !== 'SUCCEEDED') return;
+    const unit = this.state.adaptive.workUnits.find((candidate) => candidate.id === taskId);
+    if (unit === undefined || unit.status === 'SUCCEEDED') return;
+    if (!['FAILED', 'TIMED_OUT'].includes(unit.status)) return;
+    if (recoveryEvidenceKind(task) !== recoveryKind) return;
+    let emitted: readonly AdaptiveEvent[] = [];
+    await this.mutate((current) => {
+      const coordinator = this.adaptiveCoordinator(current);
+      const previousEvents = current.adaptive!.events.length;
+      coordinator.recoverFinishedUnit(taskId, recoveryKind);
+      const adaptive = coordinator.snapshot();
+      emitted = adaptive.events.slice(previousEvents);
+      return { ...current, adaptive };
+    });
+    await this.emitAdaptiveEvents(emitted);
+    await this.reconcileAdaptiveCorrectionFlow();
+    await this.advanceAdaptiveScheduling();
+  }
+
+  /**
+   * §15 crash safety: heals a run loaded after a crash that landed between
+   * a recovery flow's TaskRunState-SUCCEEDED write and its adaptive mirror.
+   * Deliberately NOT a broadening of the narrow GRANTED/RUNNING crash-window
+   * loop in loadRunForContinuation (that loop mirrors an ACTIVE unit forward
+   * to whatever terminal fact TaskRunState already recorded, which can only
+   * arise mid-flight); this instead heals a unit that is ALREADY terminal
+   * FAILED/TIMED_OUT into SUCCEEDED, which is only ever safe when
+   * recoveryEvidenceKind proves a real recovery flow produced that success —
+   * never merely because the two disagree. Reuses
+   * completeRecoveredAdaptiveTask, so the gating/idempotency logic exists in
+   * exactly one place.
+   */
+  private async reconcileRecoveredAdaptiveUnits(): Promise<void> {
+    if (this.state.adaptive === undefined) return;
+    for (const unit of this.state.adaptive.workUnits) {
+      if (!['FAILED', 'TIMED_OUT'].includes(unit.status)) continue;
+      const kind = recoveryEvidenceKind(this.state.tasks[unit.id]);
+      if (kind === undefined) continue;
+      await this.completeRecoveredAdaptiveTask(unit.id, kind);
+    }
+  }
+
+  /**
+   * The exact, narrow recovery scope this feature is allowed to touch:
+   * targeted reverification requests (`authorization.purpose ===
+   * 'reverification'`) whose source correction (`authorization.
+   * sourceWorkUnitId`) is a task with real persisted recovery evidence
+   * (recoveryEvidenceKind — the same handoff-repair/salvage proof
+   * completeRecoveredAdaptiveTask requires). Never inferred from request
+   * IDs or finding names — this is the actual causal provenance chain: a
+   * reverification exists ONLY because reconcileAdaptiveCorrectionFlow saw
+   * its correction unit reach SUCCEEDED, and that correction can only have
+   * reached SUCCEEDED while still WALL_CLOCK-denied-adjacent (i.e. after
+   * the original run's own budget was already exhausted) via an explicitly
+   * authorized recovery.
+   */
+  private recoveryScopedReverificationRequestIds(): readonly string[] {
+    if (this.state.adaptive === undefined) return [];
+    return this.state.adaptive.workRequests
+      .filter((request) => request.authorization?.purpose === 'reverification')
+      .filter((request) => recoveryEvidenceKind(this.state.tasks[request.authorization!.sourceWorkUnitId]) !== undefined)
+      .map((request) => request.id);
+  }
+
+  /**
+   * §5/§6/§13/§14: binds (or reuses) the operator-authorized recovery
+   * execution budget epoch and performs the one bounded re-arbitration pass
+   * for whatever recovery-scoped requests are still stuck in
+   * DENIED/WALL_CLOCK_BUDGET_EXCEEDED. The original run's own
+   * startedAt/policy.limits.maxWallClockMs, and every other limit
+   * (maxAgentInvocations, maxTotalWorkUnits, maxConcurrentAgents,
+   * maxDecompositionDepth, maxFanOutPerWorkUnit, maxSynthesisInputs,
+   * maxEstimatedCostUnits), are completely untouched — see
+   * AdaptiveCoordinator.authorizeRecoveryEpoch for the actual state
+   * transition and its idempotency semantics (same policyHash reuses the
+   * same epoch identity/clock; a different one starts the next epoch).
+   */
+  private async authorizeRecoveryEpoch(policyHash: string, maxWallClockMs: number): Promise<void> {
+    if (this.state.adaptive === undefined) return;
+    const requestIds = this.recoveryScopedReverificationRequestIds();
+    let emitted: readonly AdaptiveEvent[] = [];
+    await this.mutate((current) => {
+      const coordinator = this.adaptiveCoordinator(current);
+      const previousEvents = current.adaptive!.events.length;
+      coordinator.authorizeRecoveryEpoch({ policyHash, maxWallClockMs, requestIds });
+      const adaptive = coordinator.snapshot();
+      emitted = adaptive.events.slice(previousEvents);
+      return { ...current, adaptive };
+    });
+    await this.emitAdaptiveEvents(emitted);
+    await this.advanceAdaptiveScheduling();
+    await this.reactivateBlockedRunAfterRecoveryEpoch();
+  }
+
+  /**
+   * A BLOCKED adaptive run whose ONLY blocker was a required adaptive
+   * request denied for the original wall-clock budget can go stale once an
+   * authorized recovery epoch supersedes that denial with a fresh GRANTED/
+   * WAITING decision — execute()'s own while-loop guard
+   * (RUNNING/CREATED only) never gets a chance to notice, since it refuses
+   * to even enter the loop while BLOCKED. This reuses the SAME authoritative
+   * completionStatus()/adaptiveReviewGate() checks execute() itself used to
+   * decide BLOCKED in the first place (no parallel copy of that decision
+   * logic) — it only ever flips BLOCKED -> RUNNING when those checks, run
+   * fresh right now, no longer say BLOCKED/HUMAN_APPROVAL_REQUIRED/FAILED,
+   * AND at least one recovery-scoped request is proven to have been
+   * superseded (a real, persisted WALL_CLOCK_BUDGET_EXCEEDED denial
+   * followed by a later GRANTED/WAITING decision). Every other BLOCKED
+   * cause — integration failure/conflict, a genuinely still-denied request,
+   * an unresolved human-approval WAITING, a task-level BLOCKED_FOR_HUMAN_REVIEW,
+   * or simply no authorized recovery epoch at all — is left completely
+   * untouched. Idempotent: a no-op whenever status is not already BLOCKED.
+   */
+  private async reactivateBlockedRunAfterRecoveryEpoch(): Promise<void> {
+    if (this.state.status !== 'BLOCKED') return;
+    if (this.state.strategy !== 'adaptive' || this.state.adaptive === undefined) return;
+    if (this.state.adaptive.recoveryEpochs === undefined || this.state.adaptive.recoveryEpochs.length === 0) return;
+    // Integration failures/conflicts and task-level human-review blocks are
+    // never this mechanism's concern, whatever the adaptive layer now says.
+    if (this.state.integration.status === 'BLOCKED') return;
+    if (Object.values(this.state.tasks).some((task) => task.status === 'BLOCKED')) return;
+    const completion = this.adaptiveCoordinator().completionStatus(true);
+    if (completion === 'BLOCKED' || completion === 'HUMAN_APPROVAL_REQUIRED' || completion === 'FAILED') return;
+    // 'ACTIVE' (review still genuinely in progress) never caused a BLOCKED
+    // transition in the first place — only 'BLOCKED' did, matching
+    // execute()'s own reviewGate check exactly.
+    const reviewGate = await this.adaptiveReviewGate();
+    if (reviewGate === 'BLOCKED') return;
+    const supersededRequestIds = this.recoveryScopedReverificationRequestIds().filter((id) => {
+      const decisions = this.state.adaptive!.grantDecisions.filter((decision) => decision.requestId === id);
+      const first = decisions[0];
+      const latest = decisions.at(-1);
+      return first?.outcome === 'DENIED' && first.reason === 'WALL_CLOCK_BUDGET_EXCEEDED'
+        && latest !== undefined && (latest.outcome === 'GRANTED' || latest.outcome === 'WAITING');
+    });
+    if (supersededRequestIds.length === 0) return;
+    await this.mutate((current) => ({ ...current, status: 'RUNNING' }));
+    await this.event('RUN_RECOVERY_REACTIVATED', undefined, {
+      recoveryEpochNumber: this.state.adaptive.activeRecoveryEpochNumber,
+      supersededRequestIds,
+    });
+  }
+
+  private async authorizeAdaptiveRetry(
+    taskId: string,
+    timedOut: boolean,
+    message: string,
+    stateUpdate: (state: RunState) => RunState = (state) => state,
+  ): Promise<void> {
+    if (this.state.adaptive === undefined || this.adaptiveConfig === undefined) {
+      await this.mutate(stateUpdate);
+      return;
+    }
+    let emitted: readonly AdaptiveEvent[] = [];
+    await this.mutate((current) => {
+      const coordinator = this.adaptiveCoordinator(current);
+      const previousEvents = current.adaptive!.events.length;
+      const unit = coordinator.snapshot().workUnits.find((candidate) => candidate.id === taskId);
+      if (unit !== undefined && ['GRANTED', 'RUNNING'].includes(unit.status)) {
+        coordinator.finish(taskId, timedOut ? 'TIMED_OUT' : 'FAILED', { error: message });
+      }
+      coordinator.authorizeRetry(taskId);
+      coordinator.arbitrate();
+      routeGrantedWork(coordinator, this.adaptiveConfig!);
+      const adaptive = coordinator.snapshot();
+      if (adaptive.workUnits.find((candidate) => candidate.id === taskId)?.status !== 'GRANTED') {
+        throw new OrchestratorError('TASK_STATE_INVALID', `Adaptive retry for ${taskId} was not re-granted`);
+      }
+      emitted = adaptive.events.slice(previousEvents);
+      return { ...stateUpdate(current), adaptive };
+    });
+    await this.emitAdaptiveEvents(emitted);
+  }
+
+  private async submitAdditionalAdaptiveRequests(
+    parentTaskId: string,
+    drafts: readonly WorkRequestDraft[] | undefined,
+    arbitrate = true,
+  ): Promise<void> {
+    if (drafts === undefined || drafts.length === 0 || this.state.adaptive === undefined) return;
+    let emitted: readonly AdaptiveEvent[] = [];
+    let submitted = false;
+    await this.mutate((current) => {
+      const coordinator = this.adaptiveCoordinator(current);
+      const previousEvents = current.adaptive!.events.length;
+      const existing = coordinator.snapshot().workRequests;
+      const unseen = drafts.filter((draft) => !existing.some((request) =>
+        request.parentWorkUnitId === parentTaskId && workRequestMatchesDraft(request, draft),
+      ));
+      if (unseen.length === 0) return current;
+      const requests = coordinator.submitMany(unseen, { parentWorkUnitId: parentTaskId, source: 'agent' });
+      const reviews = requests.filter((request) => request.role === 'review');
+      if (reviews.length > 1) coordinator.createSynthesisTree(reviews.map((request) => request.id));
+      const adaptive = coordinator.snapshot();
+      emitted = adaptive.events.slice(previousEvents);
+      submitted = true;
+      return { ...current, adaptive };
+    });
+    if (submitted) await this.emitAdaptiveEvents(emitted);
+    if (arbitrate) await this.advanceAdaptiveScheduling();
+  }
+
+  /**
+   * Deterministically materialize privileged correction roots and their
+   * targeted re-review from already-persisted artifacts. Agent proposals
+   * remain ordinary children and can never enter this path.
+   */
+  private async reconcileAdaptiveCorrectionFlow(): Promise<void> {
+    const correctionPolicy = this.adaptiveConfig?.policy.correctionPolicy;
+    if (this.state.adaptive === undefined || correctionPolicy === undefined) return;
+    const snapshot = this.state;
+    const adaptive = snapshot.adaptive!;
+    const actions: Array<{
+      draft: WorkRequestDraft;
+      authorization: CanonicalFindingAuthorization;
+    }> = [];
+    const synthesisRequestIds = new Set(adaptive.workRequests
+      .filter((request) => request.role === 'synthesis')
+      .flatMap((request) => request.dependencies));
+
+    for (const unit of adaptive.workUnits) {
+      if (unit.status !== 'SUCCEEDED') continue;
+      const request = adaptive.workRequests.find((candidate) => candidate.id === unit.requestId);
+      const task = snapshot.tasks[unit.id];
+      if (request === undefined || task === undefined) continue;
+
+      if (request.authorization?.purpose === 'correction') {
+        const auth = request.authorization;
+        const exists = adaptive.workRequests.some((candidate) =>
+          candidate.authorization?.purpose === 'reverification'
+          && candidate.authorization.canonicalFindingKey === auth.canonicalFindingKey
+          && candidate.authorization.round === auth.round,
+        );
+        if (!exists) {
+          const { importedSource: _importedSource, ...localAuthorization } = auth;
+          actions.push({
+            draft: {
+              role: 'review', concern: request.concern,
+              objective: `Re-verify canonical finding ${auth.findingReference} after correction round ${auth.round}`,
+              reason: 'A successful correction requires targeted independent verification before integration',
+              dependencies: [request.id], capabilities: [{ capability: 'review' }],
+              resourceClaims: request.resourceClaims.map((claim) => ({ ...claim, mode: 'read' as const })),
+              evidence: [{ kind: 'finding', reference: auth.findingReference, summary: `Canonical finding ${auth.canonicalFindingKey}` }],
+              risk: request.risk, priority: Math.min(100, request.priority + 1),
+            },
+            authorization: { ...localAuthorization, purpose: 'reverification', sourceWorkUnitId: unit.id, artifactPath: task.handoffPath ?? auth.artifactPath },
+          });
+        }
+        continue;
+      }
+
+      const isReverification = request.authorization?.purpose === 'reverification';
+      const isRootReview = ['review', 'synthesis', 'final_review'].includes(request.role)
+        && !synthesisRequestIds.has(request.id);
+      if (!isReverification && !isRootReview) continue;
+      const reviewPath = task.reviewPaths.at(-1);
+      if (reviewPath === undefined) continue;
+      const review = parseReview(await readFile(reviewPath, 'utf8'));
+      if (review.status !== 'changes_requested') continue;
+      const nextRound = isReverification ? request.authorization!.round + 1 : 1;
+      if (nextRound > correctionPolicy.maxRounds) continue;
+      const sourceFindings = isReverification
+        ? [review.findings.find((finding) => finding.id === request.authorization!.findingReference) ?? review.findings[0]!]
+        : review.findings;
+      for (const finding of sourceFindings) {
+        const key = request.authorization?.canonicalFindingKey ?? `${unit.id}:${finding.id}`;
+        // Only the accepted canonical artifact may refine the deterministic
+        // fallback plan. A shard proposal or arbitrary agent request is never
+        // consulted for privileged scope.
+        const canonicalProposal = review.additionalWorkRequests?.find((proposal) =>
+          (proposal.role === 'correction' || proposal.role === 'testing')
+          && proposal.resourceClaims?.some((claim) => claim.mode === 'write')
+          && proposal.evidence?.some((entry) => entry.kind === 'finding' && entry.reference === finding.id),
+        );
+        const desiredRole = canonicalProposal?.role === 'testing' || (canonicalProposal === undefined && finding.category === 'testing')
+          ? 'testing' as const
+          : 'correction' as const;
+        actions.push({
+          draft: {
+            role: desiredRole,
+            concern: canonicalProposal?.concern ?? request.concern,
+            objective: canonicalProposal?.objective ?? `Correct ${finding.id}: ${finding.problem}`,
+            reason: canonicalProposal?.reason ?? finding.suggestedFix,
+            dependencies: [request.id],
+            capabilities: canonicalProposal?.capabilities ?? [{ capability: desiredRole === 'testing' ? 'testing' : 'typescript_backend_editing' }],
+            resourceClaims: canonicalProposal?.resourceClaims ?? [{ kind: 'repository_path', key: finding.file, mode: 'write' }],
+            evidence: canonicalProposal?.evidence ?? [{ kind: 'finding', reference: finding.id, summary: finding.evidence }],
+            risk: finding.severity,
+            priority: canonicalProposal?.priority ?? (finding.severity === 'critical' ? 100 : finding.severity === 'high' ? 90 : finding.severity === 'medium' ? 75 : 50),
+            ...(canonicalProposal?.estimatedCostUnits === undefined ? {} : { estimatedCostUnits: canonicalProposal.estimatedCostUnits }),
+          },
+          authorization: {
+            kind: 'canonical_finding', purpose: 'correction', canonicalFindingKey: key,
+            findingReference: finding.id, sourceWorkUnitId: unit.id, artifactPath: reviewPath, round: nextRound,
+          },
+        });
+      }
+    }
+    if (actions.length === 0) return;
+    let emitted: readonly AdaptiveEvent[] = [];
+    await this.mutate((current) => {
+      const coordinator = this.adaptiveCoordinator(current);
+      const previous = current.adaptive!.events.length;
+      for (const action of actions) coordinator.submitCanonicalFindingWork(action.draft, action.authorization);
+      const adaptive = coordinator.snapshot();
+      emitted = adaptive.events.slice(previous);
+      return { ...current, adaptive };
+    });
+    await this.emitAdaptiveEvents(emitted);
+  }
+
+  /** Review verdict is an independent prerequisite; task success alone is insufficient. */
+  private async adaptiveReviewGate(): Promise<'APPROVED' | 'ACTIVE' | 'BLOCKED'> {
+    if (this.state.adaptive === undefined) return 'APPROVED';
+    const continuation = this.state.adaptive.continuation;
+    if (continuation !== undefined) {
+      for (const imported of continuation.findings) {
+        const correction = this.state.adaptive.workRequests.find((request) =>
+          request.authorization?.purpose === 'correction'
+          && request.authorization.canonicalFindingKey === imported.canonicalFindingKey
+          && request.authorization.round === 1,
+        );
+        if (correction === undefined) return 'BLOCKED';
+        const correctionDecision = [...this.state.adaptive.grantDecisions].reverse().find(
+          (decision) => decision.requestId === correction.id,
+        );
+        if (correctionDecision?.outcome === 'DENIED') return 'BLOCKED';
+        const reverifications = this.state.adaptive.workRequests
+          .filter((request) => request.authorization?.purpose === 'reverification'
+            && request.authorization.canonicalFindingKey === imported.canonicalFindingKey)
+          .sort((left, right) => left.authorization!.round - right.authorization!.round);
+        const latest = reverifications.at(-1);
+        if (latest === undefined) return 'ACTIVE';
+        const verificationUnit = this.state.adaptive.workUnits.find((unit) => unit.requestId === latest.id);
+        const verificationPath = verificationUnit === undefined
+          ? undefined
+          : this.state.tasks[verificationUnit.id]?.reviewPaths.at(-1);
+        if (verificationUnit?.status !== 'SUCCEEDED' || verificationPath === undefined) return 'ACTIVE';
+        const verdict = parseReview(await readFile(verificationPath, 'utf8'));
+        if (verdict.status === 'approved') continue;
+        if (verdict.status === 'blocked'
+          || latest.authorization!.round >= this.adaptiveConfig!.policy.correctionPolicy!.maxRounds) return 'BLOCKED';
+        return 'ACTIVE';
+      }
+    }
+    const synthesisInputs = new Set(this.state.adaptive.workRequests
+      .filter((request) => request.role === 'synthesis')
+      .flatMap((request) => request.dependencies));
+    const canonical = this.state.adaptive.workUnits.filter((unit) => {
+      const request = this.state.adaptive!.workRequests.find((candidate) => candidate.id === unit.requestId)!;
+      return ['review', 'synthesis', 'final_review'].includes(request.role)
+        && request.authorization === undefined
+        && !synthesisInputs.has(request.id);
+    });
+    for (const unit of canonical) {
+      const task = this.state.tasks[unit.id];
+      if (unit.status !== 'SUCCEEDED' || task?.reviewPaths.at(-1) === undefined) return 'ACTIVE';
+      const review = parseReview(await readFile(task.reviewPaths.at(-1)!, 'utf8'));
+      if (review.status === 'blocked') return 'BLOCKED';
+      if (review.status !== 'changes_requested') continue;
+      if (this.adaptiveConfig?.policy.correctionPolicy === undefined) return 'BLOCKED';
+      for (const finding of review.findings) {
+        const key = `${unit.id}:${finding.id}`;
+        const reverifications = this.state.adaptive.workRequests
+          .filter((request) => request.authorization?.purpose === 'reverification'
+            && request.authorization.canonicalFindingKey === key)
+          .sort((left, right) => left.authorization!.round - right.authorization!.round);
+        const latest = reverifications.at(-1);
+        if (latest === undefined) {
+          const correction = this.state.adaptive.workRequests.find((request) =>
+            request.authorization?.purpose === 'correction'
+            && request.authorization.canonicalFindingKey === key,
+          );
+          if (correction !== undefined && [...this.state.adaptive.grantDecisions].reverse().find((decision) => decision.requestId === correction.id)?.outcome === 'DENIED') return 'BLOCKED';
+          return 'ACTIVE';
+        }
+        const verificationUnit = this.state.adaptive.workUnits.find((candidate) => candidate.requestId === latest.id);
+        const verificationPath = verificationUnit === undefined ? undefined : this.state.tasks[verificationUnit.id]?.reviewPaths.at(-1);
+        if (verificationUnit?.status !== 'SUCCEEDED' || verificationPath === undefined) return 'ACTIVE';
+        const verdict = parseReview(await readFile(verificationPath, 'utf8'));
+        if (verdict.status === 'approved') continue;
+        if (verdict.status === 'blocked' || latest.authorization!.round >= this.adaptiveConfig!.policy.correctionPolicy!.maxRounds) return 'BLOCKED';
+        return 'ACTIVE';
+      }
+    }
+    return 'APPROVED';
   }
 
   private async executeTask(task: TaskSpec): Promise<void> {
@@ -832,6 +2051,7 @@ export class AgentOrchestrator {
       };
     }));
     await this.event('TASK_SKIPPED', taskId, { reason });
+    await this.finishAdaptiveUnit(taskId, 'SKIPPED');
   }
 
   private async prepareTask(task: TaskSpec): Promise<PreparedTask> {
@@ -864,12 +2084,86 @@ export class AgentOrchestrator {
       }));
     }
 
-    const inspection = await inspectTaskCommits(this.git, worktree.path, this.state.baseSha);
+    let inspection = await inspectTaskCommits(this.git, worktree.path, this.state.baseSha);
     if (!inspection.clean) {
       throw new OrchestratorError(
         'AGENT_FAILED',
         `Task ${task.id} worktree is dirty before invocation; preserving it for inspection`,
       );
+    }
+    const preparationReusable = canReuseIntegrationPreparation(
+      this.state.tasks[task.id]?.preparation,
+      worktree.path,
+      inspection.headSha,
+      this.config.agentWorktree.prepare.length,
+    );
+    if (!preparationReusable) {
+      const startedAt = this.clock().toISOString();
+      await this.event('AGENT_WORKTREE_PREPARATION_STARTED', task.id, {
+        worktreePath: worktree.path, headSha: inspection.headSha,
+      });
+      await this.mutate((state) => updateTask(state, task.id, (value) => ({
+        ...value,
+        preparation: {
+          status: 'RUNNING', worktreePath: worktree.path, headSha: inspection.headSha,
+          commands: [], startedAt,
+        },
+      })));
+      const result = await new IntegrationGate().run({
+        cwd: worktree.path,
+        logsDirectory: join(this.stateStore.runDirectory, 'logs', task.id, 'preparation'),
+        commands: this.config.agentWorktree.prepare,
+        ...(this.signal === undefined ? {} : { signal: this.signal }),
+        onCommandFinished: async (command, index) => {
+          await this.mutate((state) => updateTask(state, task.id, (value) => ({
+            ...value,
+            preparation: {
+              ...value.preparation!,
+              commands: [...value.preparation!.commands, command],
+            },
+          })));
+          await this.event('AGENT_WORKTREE_PREPARATION_COMMAND_FINISHED', task.id, {
+            index, command: command.command, required: command.required,
+            exitCode: command.exitCode, timedOut: command.timedOut,
+            termination: command.termination, durationMs: command.durationMs,
+            stdoutPath: command.stdoutPath, stderrPath: command.stderrPath,
+          });
+        },
+      });
+      const finishedAt = this.clock().toISOString();
+      await this.mutate((state) => updateTask(state, task.id, (value) => ({
+        ...value,
+        preparation: {
+          ...value.preparation!, status: result.passed ? 'SUCCEEDED' : 'FAILED',
+          commands: result.commands, finishedAt,
+        },
+      })));
+      if (!result.passed) {
+        const failed = result.commands.at(-1);
+        await this.event('AGENT_WORKTREE_PREPARATION_FAILED', task.id, {
+          command: failed?.command ?? null, exitCode: failed?.exitCode ?? null,
+          timedOut: failed?.timedOut ?? false, durationMs: failed?.durationMs ?? 0,
+        });
+        throw new OrchestratorError(
+          'AGENT_WORKTREE_PREPARATION_FAILED',
+          `Required worktree preparation failed for ${task.id}`,
+          { details: failed === undefined ? {} : { ...failed } },
+        );
+      }
+      const afterHead = await this.git.resolveCommit(worktree.path, 'HEAD');
+      const trackedChanges = (await this.git.run(worktree.path, ['status', '--porcelain', '--untracked-files=no'])).stdout.trim();
+      if (afterHead !== inspection.headSha || trackedChanges !== '') {
+        await this.mutate((state) => updateTask(state, task.id, (value) => ({
+          ...value, preparation: { ...value.preparation!, status: 'FAILED' },
+        })));
+        await this.event('AGENT_WORKTREE_PREPARATION_FAILED', task.id, { afterHead, trackedChanges });
+        throw new OrchestratorError(
+          'AGENT_WORKTREE_PREPARATION_FAILED',
+          `Worktree preparation for ${task.id} modified tracked source or created a commit`,
+          { details: { afterHead, trackedChanges } },
+        );
+      }
+      inspection = await inspectTaskCommits(this.git, worktree.path, this.state.baseSha);
     }
     if (current.preparedHeadSha !== inspection.headSha) {
       await this.mutate((state) => updateTask(state, task.id, (value) => ({
@@ -915,9 +2209,13 @@ export class AgentOrchestrator {
 
   private async runTrackedAgent(prepared: PreparedTask, agent: Agent): Promise<AgentResult> {
     const task = prepared.task;
-    const attemptNumber = await this.allocateAttempt(task.id, agent.name);
-    await this.event('AGENT_STARTED', task.id, { agent: agent.name, attempt: attemptNumber });
+    const configuredTimeoutMs = task.timeoutMs ?? this.config.agentTimeoutMs;
+    const attemptNumber = await this.allocateAttempt(task.id, agent.name, configuredTimeoutMs);
+    await this.event('AGENT_STARTED', task.id, {
+      agent: agent.name, attempt: attemptNumber, timeoutMs: configuredTimeoutMs,
+    });
 
+    const canonicalFindings = this.requiredCanonicalFindings(task.id, prepared.previousReviewFindings);
     const request: AgentRequest = {
       runId: this.state.runId,
       taskId: task.id,
@@ -928,13 +2226,28 @@ export class AgentOrchestrator {
         task,
         ancestorTasks: ancestorTasks(task, new TaskGraph(this.config.tasks)),
         actualDependencyDiff: prepared.actualDependencyDiff,
+        ...(this.state.adaptive === undefined ? {} : {
+          allowedNonFileResources: this.state.adaptive.policy.allowedResources,
+          resourceRequestContract: 'Additional work must request an exact listed kind/key and a contained mode; this list conveys no grant authority.',
+        }),
+        ...(canonicalFindings.length === 0 ? {} : {
+          requiredCanonicalFindings: canonicalFindings,
+          canonicalFindingResponseContract: [
+            'Return exactly one findingResponses entry for every assigned finding ID.',
+            'A generic summary is not a canonical response.',
+            'Use decision confirmed/rejected and resolution resolved/unresolved/not_applicable.',
+            'Confirmed/resolved requires evidence, fix, and verification; rejected requires evidence and reason.',
+            'Do not introduce unassigned finding IDs.',
+          ],
+        }),
         responseSchema: REVIEW_MODES.has(task.mode)
-          ? reviewResponseSchema()
-          : handoffResponseSchema(),
+          ? reviewResponseSchema(this.state.strategy === 'adaptive')
+          : handoffResponseSchema(this.state.strategy === 'adaptive'),
         responseSchemaNotes: REVIEW_MODES.has(task.mode)
-          ? reviewResponseSchemaNotes()
-          : handoffResponseSchemaNotes(),
+          ? reviewResponseSchemaNotes(this.state.strategy === 'adaptive')
+          : handoffResponseSchemaNotes(this.state.strategy === 'adaptive'),
       },
+      ...(this.state.strategy === 'adaptive' ? { adaptive: true } : {}),
       canonicalDesignDocumentPath: join(
         this.repositoryRoot,
         this.config.canonicalDesignDocument,
@@ -944,7 +2257,7 @@ export class AgentOrchestrator {
       previousReviewFindings: prepared.previousReviewFindings,
       requestedEffort: task.effort,
       ...(task.model === undefined ? {} : { requestedModel: task.model }),
-      timeoutMs: task.timeoutMs ?? this.config.agentTimeoutMs,
+      timeoutMs: configuredTimeoutMs,
       artifactsDirectory: join(this.stateStore.runDirectory, 'logs'),
       access: task.writer ? 'writer' : 'read_only',
       attempt: attemptNumber,
@@ -983,7 +2296,7 @@ export class AgentOrchestrator {
       prepared.preparedHeadSha,
     );
     if (retryAvailable && inspection.clean && inspection.commits.length === 0) {
-      await this.mutate((state) => updateTask(state, prepared.task.id, (task) => ({
+      const retryState = (state: RunState): RunState => updateTask(state, prepared.task.id, (task) => ({
         ...task,
         status: 'READY',
         error: storedError(
@@ -991,7 +2304,17 @@ export class AgentOrchestrator {
           result.errorMessage ?? `Agent process ended as ${result.status}`,
           this.clock,
         ),
-      })));
+      }));
+      if (this.state.strategy === 'adaptive') {
+        await this.authorizeAdaptiveRetry(
+          prepared.task.id,
+          result.failureCode === 'AGENT_TIMEOUT',
+          result.errorMessage ?? `Agent process ended as ${result.status}`,
+          retryState,
+        );
+      } else {
+        await this.mutate(retryState);
+      }
       await this.event('TASK_READY', prepared.task.id, { retry: true });
       return;
     }
@@ -1006,16 +2329,53 @@ export class AgentOrchestrator {
   }
 
   private async finishHandoff(prepared: PreparedTask, result: AgentResult): Promise<void> {
+    const taskDiff = (await this.git.run(prepared.worktree.path, [
+      'diff', '--no-ext-diff', '--no-color', prepared.preparedHeadSha,
+    ])).stdout;
+    const requiredCanonicalFindings = this.requiredCanonicalFindings(
+      prepared.task.id,
+      prepared.previousReviewFindings,
+    );
     const parsed = await this.parseOrRepairHandoff(
       prepared.task,
       result.structuredHandoff,
       result.rawStdout ?? null,
+      requiredCanonicalFindings,
+      taskDiff,
     );
     await this.recordHandoffOutcome(prepared.task.id, parsed.outcome);
     if (parsed.handoff === null) {
       throw parsed.error;
     }
     await this.finishParsedHandoff(prepared, parsed.handoff);
+  }
+
+  /** Trusted assignment context comes from persisted orchestrator state, never agent output. */
+  private requiredCanonicalFindings(
+    taskId: string,
+    immediatelyRelevantFindings: readonly unknown[] = [],
+  ): readonly RequiredCanonicalFinding[] {
+    const adaptive = this.state.adaptive;
+    if (adaptive === undefined) return [];
+    const unit = adaptive.workUnits.find((candidate) => candidate.id === taskId);
+    const request = adaptive.workRequests.find((candidate) => candidate.id === unit?.requestId);
+    const authorization = request?.authorization;
+    if (authorization?.purpose !== 'correction') return [];
+    const imported = adaptive.continuation?.findings.find(
+      (candidate) => candidate.canonicalFindingKey === authorization.canonicalFindingKey,
+    );
+    const directlyRelevant = immediatelyRelevantFindings.find((candidate) =>
+      isRecord(candidate) && candidate.id === authorization.findingReference,
+    );
+    return [{
+      findingId: authorization.findingReference,
+      canonicalFindingKey: authorization.canonicalFindingKey,
+      sourceWorkUnitId: authorization.sourceWorkUnitId,
+      artifactPath: authorization.artifactPath,
+      ...(imported?.finding === undefined && directlyRelevant === undefined
+        ? {}
+        : { finding: imported?.finding ?? directlyRelevant }),
+    }];
   }
 
   /**
@@ -1078,7 +2438,10 @@ export class AgentOrchestrator {
       await this.assertReadOnlyTaskClean(prepared);
     }
 
+    await this.submitAdditionalAdaptiveRequests(prepared.task.id, handoff.additionalWorkRequests, false);
     await this.succeedTask(prepared.task.id, handoffPath, commit);
+    await this.reconcileAdaptiveCorrectionFlow();
+    await this.advanceAdaptiveScheduling();
   }
 
   /**
@@ -1093,33 +2456,58 @@ export class AgentOrchestrator {
     task: TaskSpec,
     rawStructuredHandoff: unknown,
     rawStdout: string | null,
+    requiredCanonicalFindings: readonly RequiredCanonicalFinding[] = [],
+    taskDiff = '',
   ): Promise<
     | { readonly handoff: StructuredHandoff; readonly error: null; readonly outcome: HandoffOutcomeRecord }
     | { readonly handoff: null; readonly error: unknown; readonly outcome: HandoffOutcomeRecord }
   > {
     try {
       const handoff = parseHandoff(rawStructuredHandoff);
+      validateCanonicalFindingResponses(handoff, requiredCanonicalFindings);
       return { handoff, error: null, outcome: { outcome: 'valid', repairAttempted: false } };
     } catch (error) {
       if (!isOrchestratorError(error, 'HANDOFF_INVALID')) {
         throw error;
       }
-      const repaired = await this.repairHandoff(task, rawStructuredHandoff, rawStdout);
+      const repaired = await this.repairHandoff(
+        task, rawStructuredHandoff, rawStdout, requiredCanonicalFindings, taskDiff,
+      );
+      const record: HandoffRepairAttemptRecord = repaired.ok
+        ? {
+            method: repaired.method,
+            succeeded: true,
+            timestamp: this.clock().toISOString(),
+            ...(repaired.executorId === undefined ? {} : { repairExecutorId: repaired.executorId }),
+            ...(repaired.adapter === undefined ? {} : { repairAdapter: repaired.adapter }),
+          }
+        : {
+            method: 'none',
+            succeeded: false,
+            failureReason: repaired.reason,
+            timestamp: this.clock().toISOString(),
+            // Recorded even on failure whenever routing genuinely resolved
+            // an executor before the output turned out unusable — distinct
+            // from no_eligible_recovery_executor, where none ever was.
+            ...(repaired.executorId === undefined ? {} : { repairExecutorId: repaired.executorId }),
+            ...(repaired.adapter === undefined ? {} : { repairAdapter: repaired.adapter }),
+          };
       await this.event('HANDOFF_REPAIR_ATTEMPTED', task.id, {
-        method: repaired?.method ?? 'none',
-        succeeded: repaired !== null,
+        method: record.method,
+        succeeded: record.succeeded,
+        ...(record.failureReason === undefined ? {} : { failureReason: record.failureReason }),
       });
-      if (repaired === null) {
+      if (!repaired.ok) {
         return {
           handoff: null,
           error,
-          outcome: { outcome: 'invalid', repairAttempted: true, repairSucceeded: false },
+          outcome: { outcome: 'invalid', repairAttempted: true, repairRecord: record },
         };
       }
       return {
         handoff: repaired.handoff,
         error: null,
-        outcome: { outcome: 'valid', repairAttempted: true, repairSucceeded: true },
+        outcome: { outcome: 'valid', repairAttempted: true, repairRecord: record },
       };
     }
   }
@@ -1128,8 +2516,9 @@ export class AgentOrchestrator {
     await this.mutate((state) => updateTask(state, taskId, (task) => ({
       ...task,
       handoffOutcome: outcome.outcome,
-      handoffRepairAttempted: outcome.repairAttempted,
-      ...(outcome.repairSucceeded === undefined ? {} : { handoffRepairSucceeded: outcome.repairSucceeded }),
+      ...(outcome.repairRecord === undefined
+        ? {}
+        : { handoffRepairAttempts: [...task.handoffRepairAttempts, outcome.repairRecord] }),
     })));
   }
 
@@ -1153,28 +2542,81 @@ export class AgentOrchestrator {
     task: TaskSpec,
     rawStructuredHandoff: unknown,
     rawStdout: string | null,
-  ): Promise<
-    { readonly handoff: StructuredHandoff; readonly method: 'framing' | 'deterministic' | 'agent' } | null
-  > {
-    const framed = extractStructuredPayload(rawStdout, validateHandoff);
+    requiredCanonicalFindings: readonly RequiredCanonicalFinding[],
+    taskDiff: string,
+  ): Promise<RepairOutcome> {
+    const validate = (value: unknown): StructuredHandoff => {
+      const handoff = validateHandoff(value);
+      validateCanonicalFindingResponses(handoff, requiredCanonicalFindings);
+      return handoff;
+    };
+    const framed = extractStructuredPayload(rawStdout, validate);
     if (framed.ok) {
-      return { handoff: framed.value, method: 'framing' };
+      return { ok: true, handoff: framed.value, method: 'framing' };
     }
     if (framed.reason === 'ambiguous') {
-      return null;
+      return { ok: false, reason: 'evidence_insufficient' };
     }
 
     const deterministic = deterministicallyRepairHandoffKeys(rawStructuredHandoff);
     if (deterministic.changed) {
       try {
-        return { handoff: parseHandoff(deterministic.value), method: 'deterministic' };
+        const handoff = parseHandoff(deterministic.value);
+        validateCanonicalFindingResponses(handoff, requiredCanonicalFindings);
+        return { ok: true, handoff, method: 'deterministic' };
       } catch {
         // The rename didn't fully resolve it (e.g. a second, genuinely
         // unrecognized field) — fall through rather than guessing further.
       }
     }
-    const repaired = await this.repairHandoffViaAgent(task, rawStructuredHandoff);
-    return repaired === null ? null : { handoff: repaired, method: 'agent' };
+    const original = (() => {
+      try { return parseHandoff(rawStructuredHandoff); } catch { return undefined; }
+    })();
+    const repaired = await this.repairHandoffViaAgent(
+      task, rawStructuredHandoff, requiredCanonicalFindings, taskDiff, original,
+    );
+    return repaired.ok
+      ? { ok: true, handoff: repaired.handoff, method: 'agent', executorId: repaired.executorId, adapter: repaired.adapter }
+      : repaired;
+  }
+
+  /**
+   * Selects who actually runs a bounded handoff_repair call — deliberately
+   * NEVER the same thing as task.owner (which continues to truthfully
+   * record who produced the original code; see the docs/superpowers spec
+   * for this hardening). Recovery routing is resolved solely from the most
+   * recently authorized recovery-policy overlay's executors
+   * (this.recoveryExecutors, set once at load time in
+   * loadRunForContinuation) — adaptive executors are never consulted here,
+   * since 'handoff_repair' is deliberately excluded from AdaptiveRole.
+   *
+   * Backward compatible by design: no policy ever authorized ->
+   * this.recoveryExecutors is undefined -> falls back to task.owner, the
+   * historical behavior every existing run/test already depends on.
+   *
+   * FAILS CLOSED once executors are explicitly configured: if
+   * recoveryExecutors is a non-undefined (even empty) array and no entry is
+   * available, declares the 'handoff_repair' role, AND declares the
+   * 'handoff_repair' capability, this returns { ok: false } — it never
+   * silently falls back to task.owner in that case. An operator who
+   * explicitly configured a specific recovery executor and had it turn out
+   * unavailable must see that failure, not have Codex quietly consume an
+   * attempt instead.
+   */
+  private resolveHandoffRepairExecutor(
+    task: TaskSpec,
+  ): { readonly ok: true; readonly agent: Agent; readonly executorId: string; readonly adapter: AgentName } | { readonly ok: false } {
+    if (this.recoveryExecutors === undefined) {
+      return { ok: true, agent: this.agents[task.owner], executorId: task.owner, adapter: task.owner };
+    }
+    const eligible = this.recoveryExecutors.find((executor) =>
+      executor.available
+      && executor.roles.includes('handoff_repair')
+      && executor.capabilities.some((capability) => capability.capability === 'handoff_repair'));
+    if (eligible === undefined) {
+      return { ok: false };
+    }
+    return { ok: true, agent: this.agents[eligible.adapter], executorId: eligible.id, adapter: eligible.adapter };
   }
 
   /**
@@ -1187,7 +2629,20 @@ export class AgentOrchestrator {
   private async repairHandoffViaAgent(
     task: TaskSpec,
     malformedOutput: unknown,
-  ): Promise<StructuredHandoff | null> {
+    requiredCanonicalFindings: readonly RequiredCanonicalFinding[],
+    taskDiff: string,
+    originalHandoff?: StructuredHandoff,
+  ): Promise<
+    { readonly ok: true; readonly handoff: StructuredHandoff; readonly executorId: string; readonly adapter: AgentName }
+    | { readonly ok: false; readonly reason: HandoffRepairFailureReason; readonly executorId?: string; readonly adapter?: AgentName }
+  > {
+    const routing = this.resolveHandoffRepairExecutor(task);
+    if (!routing.ok) {
+      // Fails closed BEFORE constructing or sending any AgentRequest — an
+      // explicitly-configured-but-ineligible recovery policy must never
+      // consume an agent call, on any adapter, silently or otherwise.
+      return { ok: false, reason: 'no_eligible_recovery_executor' };
+    }
     const repairDirectory = join(this.stateStore.runDirectory, 'repairs', task.id);
     await mkdir(repairDirectory, { recursive: true, mode: 0o700 });
     const request: AgentRequest = {
@@ -1198,9 +2653,20 @@ export class AgentOrchestrator {
       baseSha: this.state.baseSha,
       taskSpecification: {
         malformedOutput,
-        responseSchema: handoffResponseSchema(),
-        responseSchemaNotes: handoffResponseSchemaNotes(),
+        ...(requiredCanonicalFindings.length === 0 ? {} : {
+          repairKind: 'canonical_finding_metadata',
+          requiredCanonicalFindings,
+          deterministicTaskEvidence: {
+            taskDiff,
+            tests: originalHandoff?.tests ?? [],
+            filesChanged: originalHandoff?.filesChanged ?? [],
+          },
+          safety: 'Add metadata only. Do not claim resolved unless the supplied diff/tests support it; otherwise use unresolved or fail.',
+        }),
+        responseSchema: handoffResponseSchema(this.state.strategy === 'adaptive'),
+        responseSchemaNotes: handoffResponseSchemaNotes(this.state.strategy === 'adaptive'),
       },
+      ...(this.state.strategy === 'adaptive' ? { adaptive: true } : {}),
       canonicalDesignDocumentPath: join(this.repositoryRoot, this.config.canonicalDesignDocument),
       allowedFileOwnership: [],
       dependencyHandoffs: [],
@@ -1218,18 +2684,63 @@ export class AgentOrchestrator {
     // HANDOFF_INVALID with a generic uncaught-error code.
     let result: AgentResult;
     try {
-      result = await this.agents[task.owner].run(request);
+      result = await routing.agent.run(request);
     } catch {
-      return null;
+      return { ok: false, reason: 'agent_invocation_failed' };
     }
     if (result.status !== 'succeeded') {
-      return null;
+      return { ok: false, reason: 'agent_invocation_failed' };
     }
+
+    const validate = (value: unknown): StructuredHandoff => {
+      const handoff = parseHandoff(value);
+      validateCanonicalFindingResponses(handoff, requiredCanonicalFindings);
+      return handoff;
+    };
+    // The repair agent's OWN output goes through the exact same
+    // deterministic framing/structured-output extraction every ordinary
+    // agent's output already gets (extractStructuredPayload,
+    // src/protocol/structured-output.ts) — a repair response can suffer the
+    // identical transport-shape problem (a prose preface, a markdown fence
+    // around the JSON) the original agent's response can, and is not
+    // exempt from the same fix. Direct validation of the already-parsed
+    // value is tried first (the common case, and what every existing
+    // fake/real adapter that already returns a clean object continues to
+    // hit); only on failure does this fall back to re-extracting from the
+    // raw text. Framing here can only do the SAME deterministic structural
+    // cleanup it always does — remove prose, find the one unambiguous JSON
+    // object — it never invents or reinterprets findingResponses, and the
+    // exact same strict validate() runs either way, so nothing here loosens
+    // what a valid canonical response means.
+    let repaired: StructuredHandoff;
     try {
-      return parseHandoff(result.structuredHandoff);
+      repaired = validate(result.structuredHandoff);
     } catch {
-      return null;
+      if (result.rawStdout === undefined || result.rawStdout === null) {
+        return { ok: false, reason: 'repair_output_invalid', executorId: routing.executorId, adapter: routing.adapter };
+      }
+      const framed = extractStructuredPayload(result.rawStdout, validate);
+      if (!framed.ok) {
+        return { ok: false, reason: 'repair_output_invalid', executorId: routing.executorId, adapter: routing.adapter };
+      }
+      repaired = framed.value;
     }
+
+    if (originalHandoff !== undefined) {
+      const withoutResponses = (handoff: StructuredHandoff): unknown => {
+        const { findingResponses: _responses, ...rest } = handoff;
+        return rest;
+      };
+      if (JSON.stringify(withoutResponses(repaired)) !== JSON.stringify(withoutResponses(originalHandoff))) {
+        return { ok: false, reason: 'contradiction_detected', executorId: routing.executorId, adapter: routing.adapter };
+      }
+      const claimsResolved = repaired.findingResponses?.some((response) =>
+        response.decision === 'confirmed' && response.resolution === 'resolved');
+      if (claimsResolved && (taskDiff.trim() === '' || !originalHandoff.tests.some((test) => test.result === 'pass'))) {
+        return { ok: false, reason: 'evidence_insufficient', executorId: routing.executorId, adapter: routing.adapter };
+      }
+    }
+    return { ok: true, handoff: repaired, executorId: routing.executorId, adapter: routing.adapter };
   }
 
   private async finishReview(prepared: PreparedTask, result: AgentResult): Promise<void> {
@@ -1271,21 +2782,25 @@ export class AgentOrchestrator {
         throw error;
       }
       const framed = extractStructuredPayload(rawStdout, validateReview);
+      const record: HandoffRepairAttemptRecord = framed.ok
+        ? { method: 'framing', succeeded: true, timestamp: this.clock().toISOString() }
+        : { method: 'none', succeeded: false, failureReason: 'evidence_insufficient', timestamp: this.clock().toISOString() };
       await this.event('HANDOFF_REPAIR_ATTEMPTED', task.id, {
-        method: 'framing',
-        succeeded: framed.ok,
+        method: record.method,
+        succeeded: record.succeeded,
+        ...(record.failureReason === undefined ? {} : { failureReason: record.failureReason }),
       });
       if (!framed.ok) {
         return {
           review: null,
           error,
-          outcome: { outcome: 'invalid', repairAttempted: true, repairSucceeded: false },
+          outcome: { outcome: 'invalid', repairAttempted: true, repairRecord: record },
         };
       }
       return {
         review: framed.value,
         error: null,
-        outcome: { outcome: 'valid', repairAttempted: true, repairSucceeded: true },
+        outcome: { outcome: 'valid', repairAttempted: true, repairRecord: record },
       };
     }
   }
@@ -1328,15 +2843,28 @@ export class AgentOrchestrator {
       && review.status !== 'approved'
       && escalationDependent !== undefined
       && review.findings.some((finding) => severityAtLeast(finding.severity, escalationMinimumSeverity));
+    const adaptiveRequestId = this.state.adaptive?.workUnits.find(
+      (unit) => unit.id === prepared.task.id,
+    )?.requestId;
+    const feedsAdaptiveSynthesis = adaptiveRequestId !== undefined && (this.state.adaptive?.workRequests.some(
+      (request) => request.role === 'synthesis' && request.dependencies.includes(adaptiveRequestId),
+    ) ?? false);
+    const adaptiveUnresolvedWithoutCorrection =
+      this.state.strategy === 'adaptive'
+      && review.status === 'changes_requested'
+      && !feedsAdaptiveSynthesis
+      && this.adaptiveConfig?.policy.correctionPolicy === undefined;
     if (
       !routeToEscalation
       && (review.status === 'blocked'
-        || (prepared.task.mode === 'final_review' && review.status !== 'approved'))
+        || adaptiveUnresolvedWithoutCorrection
+        || (prepared.task.mode === 'final_review' && review.status !== 'approved'
+          && this.adaptiveConfig?.policy.correctionPolicy === undefined))
     ) {
       await this.failTask(
         prepared.task.id,
         new OrchestratorError(
-          prepared.task.mode === 'final_review'
+          prepared.task.mode === 'final_review' || adaptiveUnresolvedWithoutCorrection
             ? 'BLOCKED_FOR_HUMAN_REVIEW'
             : 'REVIEW_BLOCKED',
           `Review ${prepared.task.id} ended as ${review.status}`,
@@ -1347,6 +2875,7 @@ export class AgentOrchestrator {
       );
       return;
     }
+    await this.submitAdditionalAdaptiveRequests(prepared.task.id, review.additionalWorkRequests, false);
     await this.mutate((state) => updateTask(state, prepared.task.id, (task) => {
       const { error: _previousError, ...withoutError } = task;
       return {
@@ -1358,6 +2887,9 @@ export class AgentOrchestrator {
       };
     }));
     await this.event('TASK_SUCCEEDED', prepared.task.id, { reviewStatus: review.status });
+    await this.finishAdaptiveUnit(prepared.task.id, 'SUCCEEDED');
+    await this.reconcileAdaptiveCorrectionFlow();
+    await this.advanceAdaptiveScheduling();
   }
 
   private async executeDebate(prepared: PreparedTask): Promise<void> {
@@ -1520,8 +3052,11 @@ export class AgentOrchestrator {
     } else {
       const inspection = await inspectTaskCommits(this.git, worktree.path, this.state.baseSha);
       const expectedCommits = commits.map(({ commitSha }) => commitSha);
+      const trackedCheckpointClean = this.state.integration.preparation === undefined
+        ? inspection.clean
+        : (await this.git.run(worktree.path, ['status', '--porcelain', '--untracked-files=no'])).stdout.trim() === '';
       if (
-        !inspection.clean
+        !trackedCheckpointClean
         || inspection.headSha !== this.state.integration.headSha
         || !sameStrings(this.state.integration.integratedTaskCommits, expectedCommits)
       ) {
@@ -1534,14 +3069,117 @@ export class AgentOrchestrator {
       }
     }
 
-    const gate = await new IntegrationGate().run({
+    // Included in the checkpoint so a later attempt whose EFFECTIVE
+    // integration.prepare differs (e.g. an authorized
+    // integrationRecovery.prepare overlay) can never wrongly reuse a
+    // checkpoint that ran a different — and here, incomplete — command
+    // list. A legacy checkpoint persisted before this field existed has no
+    // fingerprint at all, which also fails the comparison (undefined !==
+    // a real hash) and correctly forces one safe re-run.
+    const prepareConfigFingerprint = createHash('sha256')
+      .update(JSON.stringify(this.config.integration.prepare), 'utf8')
+      .digest('hex');
+    const preparationReusable = canReuseIntegrationPreparation(
+      this.state.integration.preparation,
+      worktree.path,
+      this.state.integration.headSha,
+      this.config.integration.prepare.length,
+      prepareConfigFingerprint,
+    );
+    if (!preparationReusable) {
+      const startedAt = this.clock().toISOString();
+      await this.event('INTEGRATION_PREPARATION_STARTED', undefined, {
+        worktreePath: worktree.path,
+        headSha: this.state.integration.headSha,
+      });
+      await this.mutate((state) => ({
+        ...state,
+        integration: {
+          ...state.integration,
+          preparation: {
+            status: 'RUNNING', worktreePath: worktree.path, headSha: state.integration.headSha!,
+            commands: [], startedAt, prepareConfigFingerprint,
+          },
+        },
+      }));
+      const preparation = await new IntegrationGate().run({
+        cwd: worktree.path,
+        logsDirectory: join(this.stateStore.runDirectory, 'logs', 'integration', 'preparation'),
+        commands: this.config.integration.prepare,
+        ...(this.signal === undefined ? {} : { signal: this.signal }),
+        onCommandFinished: async (command, index) => {
+          await this.mutate((state) => ({
+            ...state,
+            integration: {
+              ...state.integration,
+              preparation: {
+                ...state.integration.preparation!,
+                commands: [...state.integration.preparation!.commands, command],
+              },
+            },
+          }));
+          await this.event('INTEGRATION_PREPARATION_COMMAND_FINISHED', undefined, {
+            index, command: command.command, required: command.required, exitCode: command.exitCode,
+            timedOut: command.timedOut, termination: command.termination, durationMs: command.durationMs,
+            stdoutPath: command.stdoutPath, stderrPath: command.stderrPath,
+          });
+        },
+      });
+      const finishedAt = this.clock().toISOString();
+      await this.mutate((state) => ({
+        ...state,
+        integration: {
+          ...state.integration,
+          preparation: {
+            ...state.integration.preparation!,
+            status: preparation.passed ? 'SUCCEEDED' : 'FAILED',
+            commands: preparation.commands,
+            finishedAt,
+          },
+        },
+      }));
+      if (this.signal?.aborted === true) {
+        await this.cancelRun('Integration preparation was aborted');
+        return;
+      }
+      if (!preparation.passed) {
+        await this.event('INTEGRATION_PREPARATION_FAILED', undefined, { worktreePath: worktree.path });
+        await this.blockIntegration(new OrchestratorError(
+          'INTEGRATION_PREPARATION_FAILED',
+          'A required integration preparation command failed',
+        ));
+        return;
+      }
+      const afterPrepareHead = await this.git.resolveCommit(worktree.path, 'HEAD');
+      const trackedChanges = (await this.git.run(worktree.path, ['status', '--porcelain', '--untracked-files=no'])).stdout.trim();
+      if (afterPrepareHead !== this.state.integration.headSha || trackedChanges !== '') {
+        await this.mutate((state) => ({
+          ...state,
+          integration: {
+            ...state.integration,
+            preparation: { ...state.integration.preparation!, status: 'FAILED' },
+          },
+        }));
+        await this.event('INTEGRATION_PREPARATION_FAILED', undefined, {
+          worktreePath: worktree.path, afterPrepareHead, trackedChanges,
+        });
+        await this.blockIntegration(new OrchestratorError(
+          'INTEGRATION_PREPARATION_FAILED',
+          'Integration preparation modified tracked source or created a commit',
+          { details: { afterPrepareHead, trackedChanges } },
+        ));
+        return;
+      }
+    }
+
+    const verificationGate = await new IntegrationGate().run({
       cwd: worktree.path,
       logsDirectory: join(this.stateStore.runDirectory, 'logs', 'integration'),
       commands: this.config.integration.commands,
       diagnostics: this.config.integration.diagnostics,
       ...(this.signal === undefined ? {} : { signal: this.signal }),
     });
-    for (const [index, command] of gate.commands.entries()) {
+    for (const [index, command] of verificationGate.commands.entries()) {
       await this.event('INTEGRATION_COMMAND_FINISHED', undefined, {
         index,
         command: command.command,
@@ -1558,7 +3196,7 @@ export class AgentOrchestrator {
       await this.cancelRun('Integration verification was aborted');
       return;
     }
-    if (!gate.passed) {
+    if (!verificationGate.passed) {
       await this.blockIntegration(new OrchestratorError(
         'INTEGRATION_TEST_FAILED',
         'A required integration command failed',
@@ -1628,6 +3266,7 @@ export class AgentOrchestrator {
       };
     }));
     await this.event('TASK_SUCCEEDED', taskId);
+    await this.finishAdaptiveUnit(taskId, 'SUCCEEDED');
   }
 
   private async failTask(
@@ -1656,6 +3295,11 @@ export class AgentOrchestrator {
       status,
       message: normalized.message,
     });
+    await this.finishAdaptiveUnit(
+      taskId,
+      normalized.code === 'AGENT_TIMEOUT' ? 'TIMED_OUT' : 'FAILED',
+      normalized.message,
+    );
   }
 
   private taskAttemptStdoutLogPath(taskId: string, attempt: AgentAttemptState): string {
@@ -1664,6 +3308,343 @@ export class AgentOrchestrator {
       'logs',
       `${this.state.runId}.${taskId}.${attempt.agent}.attempt-${attempt.attempt}.stdout.log`,
     );
+  }
+
+  /**
+   * Provider-neutral eligibility for an explicitly requested retry. The
+   * decision is made from persisted execution structure, never provider text:
+   * a terminal process outcome, no accepted protocol artifact, and an
+   * unchanged registered worktree at its prepared checkpoint.
+   */
+  private async checkAgentFailureRetryEligibility(
+    taskId: string,
+  ): Promise<{ readonly eligible: boolean; readonly reason: string }> {
+    if (this.state.status !== 'FAILED' && this.state.status !== 'BLOCKED') {
+      return {
+        eligible: false,
+        reason: `run status is ${this.state.status}, not FAILED or BLOCKED`,
+      };
+    }
+    if (Object.values(this.state.tasks).some((task) =>
+      task.status === 'PENDING' || task.status === 'READY' || task.status === 'RUNNING')) {
+      return { eligible: false, reason: 'run still contains non-terminal tasks' };
+    }
+    if (
+      this.state.integration.status !== 'PENDING'
+      || this.state.integration.integratedTaskCommits.length > 0
+      || (this.state.integration.integrationFixCommits?.length ?? 0) > 0
+      || this.state.integration.worktreePath !== undefined
+      || this.state.integration.branch !== undefined
+      || this.state.integration.headSha !== undefined
+      || this.state.integration.currentCommand !== undefined
+      || this.state.integration.error !== undefined
+      || (this.state.integrationAttempts?.length ?? 0) > 0
+    ) {
+      return { eligible: false, reason: 'integration has started or has its own recovery state' };
+    }
+
+    const taskSpec = this.config.tasks.find((task) => task.id === taskId);
+    const taskState = this.state.tasks[taskId];
+    if (taskSpec === undefined || taskState === undefined) {
+      return { eligible: false, reason: 'task id does not exist in this run' };
+    }
+    if (taskState.status !== 'FAILED') {
+      return { eligible: false, reason: `task status is ${taskState.status}, not FAILED` };
+    }
+    const lastAttempt = taskState.agentAttempts.at(-1);
+    const processFailure =
+      (taskState.error?.code === 'AGENT_FAILED' && lastAttempt?.outcome === 'failed')
+      || (taskState.error?.code === 'AGENT_TIMEOUT' && lastAttempt?.outcome === 'timed_out');
+    if (!processFailure || lastAttempt?.finishedAt === undefined) {
+      return {
+        eligible: false,
+        reason: 'failure is not a completed agent/process-layer AGENT_FAILED or AGENT_TIMEOUT attempt',
+      };
+    }
+    if (lastAttempt.agent !== taskSpec.owner) {
+      return { eligible: false, reason: 'last attempt agent does not match the task owner' };
+    }
+    if (taskState.commit !== undefined) {
+      return { eligible: false, reason: 'a successful task commit is already recorded' };
+    }
+    if (
+      taskState.handoffPath !== undefined
+      || taskState.reviewPaths.length > 0
+      || taskState.handoffOutcome !== undefined
+      || taskState.handoffRepairAttempts.length > 0
+    ) {
+      return { eligible: false, reason: 'a structured handoff/review outcome has already been accepted or evaluated' };
+    }
+    const unsatisfiedDependencies = taskSpec.dependsOn.filter((dependencyId) => {
+      const status = this.state.tasks[dependencyId]?.status;
+      return status !== 'SUCCEEDED' && status !== 'SKIPPED';
+    });
+    if (unsatisfiedDependencies.length > 0) {
+      return {
+        eligible: false,
+        reason: `dependencies are no longer satisfied: ${unsatisfiedDependencies.join(', ')}`,
+      };
+    }
+    if (
+      taskState.worktreePath === undefined
+      || taskState.branch === undefined
+      || taskState.preparedHeadSha === undefined
+    ) {
+      return { eligible: false, reason: 'preserved task worktree/checkpoint is incomplete' };
+    }
+
+    let owned: OwnedWorktree;
+    try {
+      owned = await this.worktrees.assertRegistered(taskState.worktreePath);
+    } catch (error) {
+      return { eligible: false, reason: `preserved worktree is not registered: ${errorText(error)}` };
+    }
+    if (
+      owned.kind !== 'task'
+      || owned.runId !== this.state.runId
+      || owned.taskId !== taskId
+      || owned.branch !== taskState.branch
+      || owned.baseSha !== this.state.baseSha
+    ) {
+      return { eligible: false, reason: 'preserved worktree registration does not match the task checkpoint' };
+    }
+    try {
+      const listed = (await this.worktrees.listGitWorktrees()).find(
+        (worktree) => worktree.path === owned.path,
+      );
+      if (listed?.branch !== `refs/heads/${owned.branch}`) {
+        return { eligible: false, reason: 'preserved worktree is missing or checked out on another branch' };
+      }
+      const inspection = await inspectTaskCommits(
+        this.git,
+        owned.path,
+        taskState.preparedHeadSha,
+      );
+      if (!inspection.clean) {
+        return { eligible: false, reason: 'preserved worktree contains uncommitted or untracked changes' };
+      }
+      if (inspection.headSha !== taskState.preparedHeadSha || inspection.commits.length > 0) {
+        return { eligible: false, reason: 'preserved worktree HEAD moved past the prepared checkpoint' };
+      }
+    } catch (error) {
+      return { eligible: false, reason: `preserved worktree checkpoint is invalid: ${errorText(error)}` };
+    }
+    return { eligible: true, reason: '' };
+  }
+
+  /**
+   * Salvage eligibility for a timed-out writer's dirty worktree — the
+   * structural mirror of checkAgentFailureRetryEligibility, inverted on
+   * dirtiness: retry-agent requires a CLEAN preserved worktree (no partial
+   * work); salvage requires a DIRTY one whose every changed tracked file is
+   * inside the task's own ownership globs, with no foreign commits and no
+   * unexpected untracked files. AGENT_FAILED (a process crash) is
+   * deliberately out of scope here — only a completed AGENT_TIMEOUT attempt
+   * qualifies; a crashed process is a different failure shape and folding it
+   * in without a real example to validate against would be scope creep.
+   */
+  private async checkSalvageEligibility(taskId: string): Promise<
+    | {
+        readonly eligible: true;
+        readonly worktree: OwnedWorktree;
+        readonly trackedChanged: readonly string[];
+        /** trackedChanged + untrackedNew, sorted — the exact pre-commit changed-file set ensureTaskCommit will later commit. */
+        readonly changedFiles: readonly string[];
+      }
+    | { readonly eligible: false; readonly reason: string; readonly reasonCode: SalvageEligibilityReasonCode }
+  > {
+    const taskSpec = this.config.tasks.find((task) => task.id === taskId);
+    const taskState = this.state.tasks[taskId];
+    if (taskSpec === undefined || taskState === undefined) {
+      return { eligible: false, reason: 'task id does not exist in this run', reasonCode: 'SALVAGE_NOT_TIMED_OUT' };
+    }
+    const lastAttempt = taskState.agentAttempts.at(-1);
+    const timedOut = taskState.error?.code === 'AGENT_TIMEOUT' && lastAttempt?.outcome === 'timed_out';
+    if ((taskState.status !== 'FAILED' && taskState.status !== 'BLOCKED') || !timedOut) {
+      return {
+        eligible: false,
+        reason: 'task did not end in a completed AGENT_TIMEOUT agent attempt',
+        reasonCode: 'SALVAGE_NOT_TIMED_OUT',
+      };
+    }
+    if (taskState.commit !== undefined) {
+      return {
+        eligible: false,
+        reason: 'a task commit is already recorded for this task',
+        reasonCode: 'SALVAGE_COMMIT_ALREADY_RECORDED',
+      };
+    }
+    if (
+      this.state.integration.integratedTaskCommits.length > 0
+      || (this.state.integration.integrationFixCommits?.length ?? 0) > 0
+    ) {
+      return {
+        eligible: false,
+        reason: 'integration has already consumed committed work for this run',
+        reasonCode: 'SALVAGE_ALREADY_INTEGRATED',
+      };
+    }
+    const unsatisfiedDependencies = taskSpec.dependsOn.filter((dependencyId) => {
+      const status = this.state.tasks[dependencyId]?.status;
+      return status !== 'SUCCEEDED' && status !== 'SKIPPED';
+    });
+    if (unsatisfiedDependencies.length > 0) {
+      return {
+        eligible: false,
+        reason: `dependencies are not satisfied: ${unsatisfiedDependencies.join(', ')}`,
+        reasonCode: 'SALVAGE_DEPENDENCY_UNSATISFIED',
+      };
+    }
+    if (
+      taskState.worktreePath === undefined
+      || taskState.branch === undefined
+      || taskState.preparedHeadSha === undefined
+    ) {
+      return {
+        eligible: false,
+        reason: 'no preserved worktree path / prepared SHA recorded for this task',
+        reasonCode: 'SALVAGE_WORKTREE_NOT_REGISTERED',
+      };
+    }
+    let worktree: OwnedWorktree;
+    try {
+      worktree = await this.worktrees.assertRegistered(taskState.worktreePath);
+    } catch (error) {
+      return {
+        eligible: false,
+        reason: `preserved worktree is not registered/present: ${errorText(error)}`,
+        reasonCode: 'SALVAGE_WORKTREE_NOT_REGISTERED',
+      };
+    }
+    let headSha: string;
+    try {
+      headSha = await this.git.resolveCommit(worktree.path, 'HEAD');
+    } catch (error) {
+      return {
+        eligible: false,
+        reason: `preserved worktree HEAD could not be resolved: ${errorText(error)}`,
+        reasonCode: 'SALVAGE_WORKTREE_NOT_REGISTERED',
+      };
+    }
+    if (headSha !== taskState.preparedHeadSha) {
+      return {
+        eligible: false,
+        reason: 'worktree HEAD has moved past the SHA prepared for this task',
+        reasonCode: 'SALVAGE_WORKTREE_HEAD_MOVED',
+      };
+    }
+    const ancestorLog = await this.git.run(
+      worktree.path, ['log', '--format=%H', `${taskState.preparedHeadSha}..HEAD`],
+    );
+    if (ancestorLog.stdout.trim().length > 0) {
+      return {
+        eligible: false,
+        reason: 'worktree already has commits beyond the prepared SHA',
+        reasonCode: 'SALVAGE_WORKTREE_HAS_FOREIGN_COMMITS',
+      };
+    }
+    const status = await this.git.run(
+      worktree.path, ['status', '--porcelain=v1', '-z', '--untracked-files=all'],
+    );
+    const entries = status.stdout.split('\0').filter((entry) => entry.length > 0);
+    if (entries.length === 0) {
+      return {
+        eligible: false,
+        reason: 'worktree has no dirty changes to salvage',
+        reasonCode: 'SALVAGE_WORKTREE_CLEAN',
+      };
+    }
+    const trackedChanged: string[] = [];
+    const untrackedNew: string[] = [];
+    for (const entry of entries) {
+      const marker = entry.slice(0, 2);
+      const path = entry.slice(3);
+      if (marker === '??') {
+        untrackedNew.push(path);
+      } else {
+        trackedChanged.push(path);
+      }
+    }
+    const ownershipCheck = validateChangedFileOwnership(trackedChanged, taskSpec.files);
+    if (ownershipCheck.violations.length > 0) {
+      return {
+        eligible: false,
+        reason: `tracked changes outside ownership: ${ownershipCheck.violations.join(', ')}`,
+        reasonCode: 'SALVAGE_OWNERSHIP_VIOLATION',
+      };
+    }
+    const untrackedViolations = untrackedNew.filter(
+      (path) => !taskSpec.files.some((pattern) => matchesOwnershipPattern(path, pattern)),
+    );
+    if (untrackedViolations.length > 0) {
+      return {
+        eligible: false,
+        reason: `unexpected untracked files: ${untrackedViolations.join(', ')}`,
+        reasonCode: 'SALVAGE_UNEXPECTED_UNTRACKED_FILE',
+      };
+    }
+    const diffCheck = await this.git.run(
+      worktree.path, ['diff', '--check', taskState.preparedHeadSha], { allowFailure: true },
+    );
+    if (diffCheck.exitCode !== 0) {
+      return {
+        eligible: false,
+        reason: 'git diff --check reported whitespace/conflict-marker errors',
+        reasonCode: 'SALVAGE_DIFF_CHECK_FAILED',
+      };
+    }
+    return {
+      eligible: true,
+      worktree,
+      trackedChanged,
+      changedFiles: [...trackedChanged, ...untrackedNew].sort(),
+    };
+  }
+
+  /**
+   * Reopens only the pristine dependency-failure cascade attributable solely
+   * to the retried task. A task with another failed/cancelled dependency is
+   * intentionally left BLOCKED.
+   */
+  private dependencyOnlyDescendantsToReopen(taskId: string): readonly string[] {
+    const graph = new TaskGraph(this.config.tasks);
+    const recoveredChain = new Set([taskId]);
+    const reopened: string[] = [];
+    for (const candidate of graph.topologicalOrder()) {
+      if (candidate.id === taskId || !graph.hasDependencyPath(candidate.id, taskId)) continue;
+      const dependsOnRecoveredChain = candidate.dependsOn.some((id) => recoveredChain.has(id));
+      const allOtherDependenciesSatisfied = candidate.dependsOn.every((id) => {
+        if (recoveredChain.has(id)) return true;
+        const status = this.state.tasks[id]?.status;
+        return status === 'SUCCEEDED' || status === 'SKIPPED';
+      });
+      if (!dependsOnRecoveredChain || !allOtherDependenciesSatisfied) continue;
+
+      const state = this.state.tasks[candidate.id]!;
+      if (state.status !== 'BLOCKED' || state.error?.code !== 'TASK_DEPENDENCY_FAILED') continue;
+      if (
+        state.commit !== undefined
+        || state.agentAttempts.length > 0
+        || state.worktreePath !== undefined
+        || state.branch !== undefined
+        || state.preparedHeadSha !== undefined
+        || state.handoffPath !== undefined
+        || state.reviewPaths.length > 0
+        || state.startedAt !== undefined
+        || state.skipReason !== undefined
+        || state.handoffOutcome !== undefined
+        || state.handoffRepairAttempts.length > 0
+      ) {
+        throw new OrchestratorError(
+          'TASK_STATE_INVALID',
+          `Refusing agent retry: dependency-blocked task ${candidate.id} contains execution artifacts`,
+          { details: { taskId: candidate.id } },
+        );
+      }
+      recoveredChain.add(candidate.id);
+      reopened.push(candidate.id);
+    }
+    return reopened;
   }
 
   /**
@@ -1683,25 +3664,55 @@ export class AgentOrchestrator {
   private async checkStructuredOutputRecoveryEligibility(
     taskState: TaskRunState,
     expectedErrorCode: 'HANDOFF_INVALID' | 'REVIEW_BLOCKED',
-  ): Promise<{ readonly eligible: boolean; readonly reason: string }> {
+  ): Promise<{ readonly eligible: boolean; readonly reason: string; readonly reasonCode?: HandoffRecoveryEligibilityReasonCode }> {
     if (taskState.status !== 'FAILED' || taskState.error?.code !== expectedErrorCode) {
-      return { eligible: false, reason: `task is not currently FAILED with error code ${expectedErrorCode}` };
+      return {
+        eligible: false,
+        reason: `task is not currently FAILED with error code ${expectedErrorCode}`,
+        reasonCode: 'HANDOFF_TASK_NOT_FAILED',
+      };
+    }
+    if (
+      expectedErrorCode === 'HANDOFF_INVALID'
+      && taskState.handoffRepairAttempts.length >= this.config.maxHandoffRepairAttempts
+    ) {
+      return {
+        eligible: false,
+        reason: `handoff repair attempt budget (${this.config.maxHandoffRepairAttempts}) exhausted`,
+        reasonCode: 'HANDOFF_REPAIR_BUDGET_EXHAUSTED',
+      };
     }
     const lastAttempt = taskState.agentAttempts.at(-1);
     if (lastAttempt?.outcome !== 'succeeded') {
-      return { eligible: false, reason: 'the most recent recorded agent attempt did not succeed' };
+      return {
+        eligible: false,
+        reason: 'the most recent recorded agent attempt did not succeed',
+        reasonCode: 'HANDOFF_LAST_ATTEMPT_NOT_SUCCEEDED',
+      };
     }
     if (taskState.commit !== undefined) {
-      return { eligible: false, reason: 'a task commit is already recorded for this task' };
+      return {
+        eligible: false,
+        reason: 'a task commit is already recorded for this task',
+        reasonCode: 'HANDOFF_COMMIT_ALREADY_RECORDED',
+      };
     }
     if (taskState.worktreePath === undefined || taskState.preparedHeadSha === undefined) {
-      return { eligible: false, reason: 'no preserved worktree path / prepared SHA recorded for this task' };
+      return {
+        eligible: false,
+        reason: 'no preserved worktree path / prepared SHA recorded for this task',
+        reasonCode: 'HANDOFF_WORKTREE_NOT_PRESERVED',
+      };
     }
     let worktree: OwnedWorktree;
     try {
       worktree = await this.worktrees.assertRegistered(taskState.worktreePath);
     } catch (error) {
-      return { eligible: false, reason: `preserved worktree is not registered/present: ${errorText(error)}` };
+      return {
+        eligible: false,
+        reason: `preserved worktree is not registered/present: ${errorText(error)}`,
+        reasonCode: 'HANDOFF_WORKTREE_NOT_REGISTERED',
+      };
     }
     let inspection: Awaited<ReturnType<typeof inspectTaskCommits>>;
     try {
@@ -1710,18 +3721,31 @@ export class AgentOrchestrator {
       return {
         eligible: false,
         reason: `worktree is not a valid descendant of its own prepared SHA: ${errorText(error)}`,
+        reasonCode: 'HANDOFF_WORKTREE_INVALID_DESCENDANT',
       };
     }
     if (inspection.headSha !== taskState.preparedHeadSha) {
-      return { eligible: false, reason: 'worktree HEAD has moved past the SHA prepared for this task' };
+      return {
+        eligible: false,
+        reason: 'worktree HEAD has moved past the SHA prepared for this task',
+        reasonCode: 'HANDOFF_WORKTREE_HEAD_MOVED',
+      };
     }
     if (inspection.commits.length > 0) {
-      return { eligible: false, reason: 'worktree already has commits beyond the prepared SHA' };
+      return {
+        eligible: false,
+        reason: 'worktree already has commits beyond the prepared SHA',
+        reasonCode: 'HANDOFF_WORKTREE_HAS_FOREIGN_COMMITS',
+      };
     }
     try {
       await stat(this.taskAttemptStdoutLogPath(taskState.id, lastAttempt));
     } catch {
-      return { eligible: false, reason: 'original agent stdout log is missing' };
+      return {
+        eligible: false,
+        reason: 'original agent stdout log is missing',
+        reasonCode: 'HANDOFF_ORIGINAL_LOG_MISSING',
+      };
     }
     return { eligible: true, reason: '' };
   }
@@ -1738,7 +3762,13 @@ export class AgentOrchestrator {
     const lastAttempt = taskState.agentAttempts.at(-1)!;
     const rawStdout = await readBoundedStdoutText(this.taskAttemptStdoutLogPath(task.id, lastAttempt));
     const rawStructuredHandoff = parseJsonOrNull(rawStdout);
-    const parsed = await this.parseOrRepairHandoff(task, rawStructuredHandoff, rawStdout);
+    const taskDiff = (await this.git.run(worktree.path, [
+      'diff', '--no-ext-diff', '--no-color', taskState.preparedHeadSha!,
+    ])).stdout;
+    const requiredCanonicalFindings = this.requiredCanonicalFindings(task.id);
+    const parsed = await this.parseOrRepairHandoff(
+      task, rawStructuredHandoff, rawStdout, requiredCanonicalFindings, taskDiff,
+    );
     await this.recordHandoffOutcome(task.id, parsed.outcome);
     if (parsed.handoff === null) {
       throw parsed.error;
@@ -1918,11 +3948,39 @@ export class AgentOrchestrator {
       agentRetries: this.config.agentRetries,
       clock: this.clock,
     });
-    this.state = reconciled.state;
+    const previousAdaptiveEvents = this.state.adaptive?.events.length ?? 0;
+    let reconciledState = reconciled.state;
+    if (this.state.adaptive !== undefined && this.adaptiveConfig !== undefined) {
+      const coordinator = this.adaptiveCoordinator();
+      for (const [taskId, action] of Object.entries(reconciled.actions)) {
+        if (action === 'RETRY_PROCESS_LOSS') {
+          const unit = coordinator.snapshot().workUnits.find((candidate) => candidate.id === taskId);
+          if (unit !== undefined && ['GRANTED', 'RUNNING'].includes(unit.status)) {
+            coordinator.finish(taskId, 'FAILED', { error: 'Agent process disappeared during interruption' });
+          }
+          coordinator.authorizeRetry(taskId);
+          coordinator.arbitrate();
+          routeGrantedWork(coordinator, this.adaptiveConfig);
+        } else if (action === 'RECOVERED_COMMIT' || action === 'RECOVERED_READ_ONLY' || action === 'RECOVERED_REVIEW') {
+          const unit = coordinator.snapshot().workUnits.find((candidate) => candidate.id === taskId);
+          if (unit !== undefined && ['GRANTED', 'RUNNING'].includes(unit.status)) coordinator.finish(taskId, 'SUCCEEDED');
+        } else if (['BLOCKED_MISSING_HANDOFF', 'BLOCKED_INVALID_HANDOFF', 'BLOCKED_OWNERSHIP', 'BLOCKED_BY_HANDOFF', 'FAILED_BY_HANDOFF', 'FAILED_RETRIES_EXHAUSTED'].includes(action)) {
+          const unit = coordinator.snapshot().workUnits.find((candidate) => candidate.id === taskId);
+          if (unit !== undefined && ['GRANTED', 'RUNNING'].includes(unit.status)) coordinator.finish(taskId, 'FAILED', { error: action });
+        }
+      }
+      reconciledState = { ...reconciledState, adaptive: coordinator.snapshot() };
+    }
+    this.state = reconciledState;
     await this.stateStore.save(this.state);
+    await this.emitNewAdaptiveEvents(previousAdaptiveEvents);
     for (const [taskId, action] of Object.entries(reconciled.actions)) {
       if (action === 'RETRY_PROCESS_LOSS') {
         await this.event('TASK_READY', taskId, { recovered: true });
+      } else if (action === 'RECOVERED_COMMIT' || action === 'RECOVERED_READ_ONLY') {
+        await this.submitAdditionalAdaptiveRequests(taskId, observations[taskId]?.handoff?.additionalWorkRequests);
+      } else if (action === 'RECOVERED_REVIEW') {
+        await this.submitAdditionalAdaptiveRequests(taskId, observations[taskId]?.review?.additionalWorkRequests);
       }
     }
   }
@@ -1938,7 +3996,11 @@ export class AgentOrchestrator {
   }
 
   /** Allocate attempt numbers under the same persistence queue used for state writes. */
-  private async allocateAttempt(taskId: string, agent: 'codex' | 'claude'): Promise<number> {
+  private async allocateAttempt(
+    taskId: string,
+    agent: 'codex' | 'claude',
+    timeoutMs: number,
+  ): Promise<number> {
     let allocatedAttempt = 0;
     const operation = this.stateQueue.then(async () => {
       const task = this.state.tasks[taskId];
@@ -1950,6 +4012,7 @@ export class AgentOrchestrator {
         attempt: allocatedAttempt,
         agent,
         startedAt: this.clock().toISOString(),
+        timeoutMs,
       };
       const next = withUpdatedTimestamp(
         updateTask(this.state, taskId, (value) => ({
@@ -2006,6 +4069,25 @@ function createAgents(
   };
 }
 
+async function resolveRequiredAgentExecutables(
+  agents: readonly ('codex' | 'claude')[],
+  overrides: OrchestratorOptions['agents'],
+): Promise<Partial<Record<'codex' | 'claude', string>>> {
+  const result: Partial<Record<'codex' | 'claude', string>> = {};
+  const required = new Set(agents);
+  for (const agent of required) {
+    if (overrides?.[agent] !== undefined) continue;
+    const resolution = await resolveAgentExecutable(agent);
+    if (resolution === null) {
+      throw new OrchestratorError('AGENT_NOT_FOUND', `Required agent executable not found: ${agent}`, {
+        details: { agent },
+      });
+    }
+    result[agent] = resolution.path;
+  }
+  return result;
+}
+
 function createRunId(clock?: () => Date): string {
   const timestamp = (clock ?? (() => new Date()))().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
   return `run-${timestamp}-${randomBytes(4).toString('hex')}`;
@@ -2013,6 +4095,22 @@ function createRunId(clock?: () => Date): string {
 
 function taskStatusRecord(state: RunState): Record<string, TaskStatus> {
   return Object.fromEntries(Object.entries(state.tasks).map(([id, task]) => [id, task.status]));
+}
+
+/**
+ * The strongest persisted proof that a SUCCEEDED task's success came from an
+ * explicit, authorized recovery flow rather than a normal live completion —
+ * used to gate recoverFinishedUnit so a stale adaptive/task mismatch is
+ * never "healed" merely because the two disagree (see
+ * completeRecoveredAdaptiveTask). A live completion never reaches this
+ * check at all, since its adaptive unit is GRANTED/RUNNING (mirrored
+ * normally by finishAdaptiveUnit), not FAILED/TIMED_OUT.
+ */
+function recoveryEvidenceKind(task: TaskRunState | undefined): 'handoff_repair' | 'salvage' | undefined {
+  if (task === undefined || task.status !== 'SUCCEEDED') return undefined;
+  if (task.handoffRepairAttempts.at(-1)?.succeeded === true) return 'handoff_repair';
+  if (task.salvage?.verification?.result === 'passed' && task.commit !== undefined) return 'salvage';
+  return undefined;
 }
 
 function ancestorTasks(task: TaskSpec, graph: TaskGraph): TaskSpec[] {
@@ -2068,7 +4166,7 @@ function updateAttemptFinished(
   return updateTask(state, taskId, (task) => ({
     ...task,
     agentAttempts: task.agentAttempts.map((attempt) => attempt.attempt === attemptNumber
-      ? { ...attempt, finishedAt: result.endedAt, outcome }
+      ? { ...attempt, finishedAt: result.endedAt, outcome, durationMs: result.durationMs }
       : attempt),
   }));
 }
@@ -2192,6 +4290,25 @@ function sameStrings(left: readonly string[], right: readonly string[]): boolean
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
+function workRequestMatchesDraft(
+  request: NonNullable<RunState['adaptive']>['workRequests'][number],
+  draft: WorkRequestDraft,
+): boolean {
+  return JSON.stringify({
+    role: request.role,
+    concern: request.concern,
+    objective: request.objective,
+    reason: request.reason,
+    dependencies: request.dependencies,
+    capabilities: request.capabilities,
+    resourceClaims: request.resourceClaims,
+    evidence: request.evidence,
+    risk: request.risk,
+    priority: request.priority,
+    ...(request.estimatedCostUnits === undefined ? {} : { estimatedCostUnits: request.estimatedCostUnits }),
+  }) === JSON.stringify(draft);
+}
+
 // Recovery note (real Phase 5 dogfood run run-20260822094645-5b090308): these
 // two functions previously baked each optional field's description directly
 // into its own JSON key, e.g. 'assumptions (optional; implementation tasks)'
@@ -2205,7 +4322,7 @@ function sameStrings(left: readonly string[], right: readonly string[]): boolean
 // — never back into a key name. See buildAgentPrompt()'s explicit instruction
 // not to copy a note into a property name, and
 // test/agents/response-schema-prompt.test.ts for the regression coverage.
-function handoffResponseSchema(): unknown {
+function handoffResponseSchema(adaptive = false): unknown {
   return {
     status: 'complete | blocked | failed',
     summary: 'string',
@@ -2219,24 +4336,28 @@ function handoffResponseSchema(): unknown {
     attackSurface: ['where an adversarial reviewer is most likely to find a real defect'],
     findingResponses: [{
       findingId: 'F001',
+      canonicalFindingKey: 'trusted provenance key supplied in requiredCanonicalFindings',
       decision: 'confirmed | rejected',
+      resolution: 'resolved | unresolved | not_applicable',
       evidence: 'string',
       fix: 'string',
       verification: 'string',
       reason: 'string',
     }],
+    additionalWorkRequests: [additionalWorkRequestResponseSchema()],
   };
 }
 
-function handoffResponseSchemaNotes(): readonly string[] {
+function handoffResponseSchemaNotes(adaptive = false): readonly string[] {
   return [
     'assumptions, knownRisks, and attackSurface are optional and apply only to implementation tasks. Omit a field entirely if you have nothing real to report for it — do not include it empty.',
-    'findingResponses is optional and applies only to correction tasks: include exactly one entry per finding you are responding to.',
-    'Within each findingResponses entry: fix and verification apply only when decision is "confirmed"; reason applies only when decision is "rejected". Omit whichever field does not apply — do not include it empty.',
+    'findingResponses is optional for generic tasks, but mandatory for a canonical correction/testing task: include exactly one entry for every assigned canonical finding, copy its canonicalFindingKey exactly, and include no unassigned ID.',
+    'Canonical responses require resolution. confirmed uses resolved or unresolved; confirmed/resolved requires evidence, fix, and verification. rejected uses not_applicable and requires evidence plus reason.',
+    'additionalWorkRequests is optional. It proposes bounded evidence-backed work to the orchestrator; it does not grant or launch work.',
   ];
 }
 
-function reviewResponseSchema(): unknown {
+function reviewResponseSchema(adaptive = false): unknown {
   return {
     status: 'approved | changes_requested | blocked',
     findings: [{
@@ -2255,11 +4376,29 @@ function reviewResponseSchema(): unknown {
       expectedBehavior: 'string',
       violatingBehavior: 'string',
     }],
+    additionalWorkRequests: [additionalWorkRequestResponseSchema()],
   };
 }
 
-function reviewResponseSchemaNotes(): readonly string[] {
+function reviewResponseSchemaNotes(adaptive = false): readonly string[] {
   return [
     'On each finding, counterexample, reproduction, expectedBehavior, and violatingBehavior are optional. Prefer supplying them over a bare claim, but omit any you cannot fill in — do not include it empty.',
+    'additionalWorkRequests is optional. It proposes bounded evidence-backed work to the orchestrator; it does not grant or launch work.',
   ];
+}
+
+function additionalWorkRequestResponseSchema(): unknown {
+  return {
+    role: 'implementation | review | correction | testing | synthesis | final_review | escalation | integration_assistance',
+    concern: 'allowed concern string',
+    objective: 'bounded objective',
+    reason: 'evidence-backed reason',
+    dependencies: ['request-000001'],
+    capabilities: [{ capability: 'string', minimumLevel: 0 }],
+    resourceClaims: [{ kind: 'repository_path | database | service | logical', key: 'string', mode: 'read | write' }],
+    evidence: [{ kind: 'diff | file | test | schema | runtime | finding', reference: 'string', summary: 'string' }],
+    risk: 'low | medium | high | critical',
+    priority: 50,
+    estimatedCostUnits: 0,
+  };
 }

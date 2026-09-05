@@ -39,7 +39,7 @@
       "items": { "type": "string" }
     },
     "findingResponses": {
-      "description": "Optional, correction/Fixer tasks: a CONFIRMED or REJECTED verdict, with evidence, for every finding this task acted on.",
+      "description": "Optional for generic tasks; contextually required for canonical correction/testing tasks: one strict response for every assigned finding.",
       "type": "array",
       "items": {
         "type": "object",
@@ -47,7 +47,9 @@
         "required": ["findingId", "decision", "evidence"],
         "properties": {
           "findingId": { "type": "string", "pattern": "^F[0-9]{3,}$" },
+          "canonicalFindingKey": { "type": "string", "description": "Contextually required and exact for canonical-finding tasks." },
           "decision": { "enum": ["confirmed", "rejected"] },
+          "resolution": { "enum": ["resolved", "unresolved", "not_applicable"], "description": "Required by the canonical-finding task contract." },
           "evidence": { "type": "string" },
           "fix": { "type": "string", "description": "Populated when decision is confirmed." },
           "verification": { "type": "string", "description": "Populated when decision is confirmed." },
