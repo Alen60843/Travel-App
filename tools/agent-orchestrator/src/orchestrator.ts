@@ -600,6 +600,12 @@ export class AgentOrchestrator {
     // reconcileRecoveredAdaptiveUnits) — evidence-gated, so a genuinely
     // unrecovered failure is never touched merely because it's loaded here.
     await orchestrator.reconcileRecoveredAdaptiveUnits();
+    // Crash-safety window: an authorized recovery epoch's re-arbitration
+    // (and the tasks/units it granted) already persisted, but the run's own
+    // BLOCKED -> RUNNING transition never did (e.g. a crash right after
+    // authorizeRecoveryPolicy). Every load re-checks this, so no
+    // re-authorization is ever required to heal it.
+    await orchestrator.reactivateBlockedRunAfterRecoveryEpoch();
     return orchestrator;
   }
 
@@ -1657,6 +1663,56 @@ export class AgentOrchestrator {
     });
     await this.emitAdaptiveEvents(emitted);
     await this.advanceAdaptiveScheduling();
+    await this.reactivateBlockedRunAfterRecoveryEpoch();
+  }
+
+  /**
+   * A BLOCKED adaptive run whose ONLY blocker was a required adaptive
+   * request denied for the original wall-clock budget can go stale once an
+   * authorized recovery epoch supersedes that denial with a fresh GRANTED/
+   * WAITING decision — execute()'s own while-loop guard
+   * (RUNNING/CREATED only) never gets a chance to notice, since it refuses
+   * to even enter the loop while BLOCKED. This reuses the SAME authoritative
+   * completionStatus()/adaptiveReviewGate() checks execute() itself used to
+   * decide BLOCKED in the first place (no parallel copy of that decision
+   * logic) — it only ever flips BLOCKED -> RUNNING when those checks, run
+   * fresh right now, no longer say BLOCKED/HUMAN_APPROVAL_REQUIRED/FAILED,
+   * AND at least one recovery-scoped request is proven to have been
+   * superseded (a real, persisted WALL_CLOCK_BUDGET_EXCEEDED denial
+   * followed by a later GRANTED/WAITING decision). Every other BLOCKED
+   * cause — integration failure/conflict, a genuinely still-denied request,
+   * an unresolved human-approval WAITING, a task-level BLOCKED_FOR_HUMAN_REVIEW,
+   * or simply no authorized recovery epoch at all — is left completely
+   * untouched. Idempotent: a no-op whenever status is not already BLOCKED.
+   */
+  private async reactivateBlockedRunAfterRecoveryEpoch(): Promise<void> {
+    if (this.state.status !== 'BLOCKED') return;
+    if (this.state.strategy !== 'adaptive' || this.state.adaptive === undefined) return;
+    if (this.state.adaptive.recoveryEpoch === undefined) return;
+    // Integration failures/conflicts and task-level human-review blocks are
+    // never this mechanism's concern, whatever the adaptive layer now says.
+    if (this.state.integration.status === 'BLOCKED') return;
+    if (Object.values(this.state.tasks).some((task) => task.status === 'BLOCKED')) return;
+    const completion = this.adaptiveCoordinator().completionStatus(true);
+    if (completion === 'BLOCKED' || completion === 'HUMAN_APPROVAL_REQUIRED' || completion === 'FAILED') return;
+    // 'ACTIVE' (review still genuinely in progress) never caused a BLOCKED
+    // transition in the first place — only 'BLOCKED' did, matching
+    // execute()'s own reviewGate check exactly.
+    const reviewGate = await this.adaptiveReviewGate();
+    if (reviewGate === 'BLOCKED') return;
+    const supersededRequestIds = this.recoveryScopedReverificationRequestIds().filter((id) => {
+      const decisions = this.state.adaptive!.grantDecisions.filter((decision) => decision.requestId === id);
+      const first = decisions[0];
+      const latest = decisions.at(-1);
+      return first?.outcome === 'DENIED' && first.reason === 'WALL_CLOCK_BUDGET_EXCEEDED'
+        && latest !== undefined && (latest.outcome === 'GRANTED' || latest.outcome === 'WAITING');
+    });
+    if (supersededRequestIds.length === 0) return;
+    await this.mutate((current) => ({ ...current, status: 'RUNNING' }));
+    await this.event('RUN_RECOVERY_REACTIVATED', undefined, {
+      recoveryEpochNumber: this.state.adaptive.recoveryEpoch.number,
+      supersededRequestIds,
+    });
   }
 
   private async authorizeAdaptiveRetry(
