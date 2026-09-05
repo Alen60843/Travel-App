@@ -19,6 +19,7 @@ import { EventsService } from './events.service';
 
 const RUN_ID = randomUUID().replaceAll('-', '');
 const UID_PREFIX = `events-int-${RUN_ID}`;
+const INACTIVE_CATEGORY_CODE = `inactive_${RUN_ID.slice(0, 20)}`;
 const NOW = new Date('2089-12-20T00:00:00Z');
 
 interface TestUser {
@@ -99,15 +100,50 @@ describe('EventsService (real PostgreSQL/PostGIS)', () => {
       `INSERT INTO event_categories (code, label, is_active, sort_order)
        VALUES ($1, $2, FALSE, 32767)
        RETURNING id`,
-      [`inactive_${RUN_ID.slice(0, 20)}`, `Inactive ${RUN_ID.slice(0, 8)}`],
+      [INACTIVE_CATEGORY_CODE, `Inactive ${RUN_ID.slice(0, 8)}`],
     )) as Array<{ id: number }>;
     if (!inactiveCategory) throw new Error('Failed to create inactive category fixture.');
     inactiveCategoryId = inactiveCategory.id;
   });
 
-    afterAll(async () => {
-    if (AppDataSource.isInitialized) {
-      await AppDataSource.destroy();
+  afterAll(async () => {
+    try {
+      if (AppDataSource.isInitialized) {
+        await AppDataSource.transaction(async (manager) => {
+          // event_status_history is append-only in production. Test fixture
+          // cleanup temporarily disables only its mutation guard inside this
+          // transaction; a cleanup failure rolls the trigger state back too.
+          await manager.query(
+            `ALTER TABLE event_status_history DISABLE TRIGGER event_status_history_append_only`,
+          );
+          await manager.query(
+            `DELETE FROM event_status_history
+              WHERE event_id IN (
+                SELECT event.id
+                  FROM events event
+                  JOIN users owner ON owner.id = event.host_user_id
+                 WHERE owner.firebase_uid LIKE $1
+              )`,
+            [`${UID_PREFIX}%`],
+          );
+          await manager.query(
+            `DELETE FROM events
+              WHERE host_user_id IN (SELECT id FROM users WHERE firebase_uid LIKE $1)`,
+            [`${UID_PREFIX}%`],
+          );
+          await manager.query(`DELETE FROM event_categories WHERE code = $1`, [
+            INACTIVE_CATEGORY_CODE,
+          ]);
+          await manager.query(`DELETE FROM users WHERE firebase_uid LIKE $1`, [
+            `${UID_PREFIX}%`,
+          ]);
+          await manager.query(
+            `ALTER TABLE event_status_history ENABLE TRIGGER event_status_history_append_only`,
+          );
+        });
+      }
+    } finally {
+      if (AppDataSource.isInitialized) await AppDataSource.destroy();
     }
   });
 
