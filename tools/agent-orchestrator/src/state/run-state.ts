@@ -58,10 +58,25 @@ export interface AgentAttemptState {
  */
 export interface HandoffRepairAttemptRecord {
   readonly method: 'framing' | 'deterministic' | 'agent' | 'none' | 'legacy_unknown';
-  readonly failureReason?: 'agent_invocation_failed' | 'evidence_insufficient' | 'contradiction_detected' | 'legacy_unknown';
+  readonly failureReason?:
+    | 'agent_invocation_failed'
+    | 'evidence_insufficient'
+    | 'contradiction_detected'
+    | 'no_eligible_recovery_executor'
+    | 'legacy_unknown';
   readonly succeeded: boolean;
   /** Absent only for a migrated legacy attempt that predates this field — its real time was never persisted. */
   readonly timestamp?: string;
+  /**
+   * The identity of the executor that actually ran a method:'agent' repair
+   * attempt — separate from, and never a substitute for, the task's own
+   * `owner` (which continues to truthfully record who produced the
+   * original code). Present only for method:'agent' attempts that reached
+   * dispatch (i.e. not 'no_eligible_recovery_executor', which fails closed
+   * before any executor is chosen).
+   */
+  readonly repairExecutorId?: string;
+  readonly repairAdapter?: AgentName;
 }
 
 export interface TaskCommitState {
@@ -640,7 +655,8 @@ function parseIntegrationState(value: unknown, path: string): IntegrationRunStat
 
 const HANDOFF_REPAIR_METHODS = new Set(['framing', 'deterministic', 'agent', 'none', 'legacy_unknown']);
 const HANDOFF_REPAIR_FAILURE_REASONS = new Set([
-  'agent_invocation_failed', 'evidence_insufficient', 'contradiction_detected', 'legacy_unknown',
+  'agent_invocation_failed', 'evidence_insufficient', 'contradiction_detected',
+  'no_eligible_recovery_executor', 'legacy_unknown',
 ]);
 
 function parseHandoffRepairAttemptRecord(value: unknown, path: string): HandoffRepairAttemptRecord {
@@ -663,11 +679,24 @@ function parseHandoffRepairAttemptRecord(value: unknown, path: string): HandoffR
     }
     failureReason = reason as HandoffRepairAttemptRecord['failureReason'];
   }
+  const repairExecutorId = value.repairExecutorId === undefined
+    ? undefined
+    : string(value.repairExecutorId, `${path}.repairExecutorId`);
+  let repairAdapter: AgentName | undefined;
+  if (value.repairAdapter !== undefined) {
+    const adapter = string(value.repairAdapter, `${path}.repairAdapter`);
+    if (adapter !== 'codex' && adapter !== 'claude') {
+      throw new OrchestratorError('STATE_CORRUPT', `${path}.repairAdapter is invalid`);
+    }
+    repairAdapter = adapter;
+  }
   return {
     method: method as HandoffRepairAttemptRecord['method'],
     succeeded,
     ...(failureReason === undefined ? {} : { failureReason }),
     ...(value.timestamp === undefined ? {} : { timestamp: timestamp(value.timestamp, `${path}.timestamp`) }),
+    ...(repairExecutorId === undefined ? {} : { repairExecutorId }),
+    ...(repairAdapter === undefined ? {} : { repairAdapter }),
   };
 }
 

@@ -678,3 +678,128 @@ test('a repair agent that silently rewrites original handoff content classifies 
     assert.equal(record[0]?.failureReason, 'contradiction_detected');
   } finally { await context.fixture.dispose(); }
 });
+
+
+// --- Provider-neutral handoff repair routing (recovery policy executors) ---
+
+test('handoff repair routes to a configured recovery executor instead of the original task owner, which stays unchanged', async () => {
+  const context = await setup(['feature.txt']);
+  try {
+    const phaseFile = join(context.fixture.container, 'continuation.yaml');
+    await writeFile(phaseFile, continuationPhase(context.fixture.baseBranch, context.baseSha), 'utf8');
+    const codex = new SemanticRepairAgent('codex');
+    const claude = new SemanticRepairAgent('claude');
+    const started = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: context.fixture.repository, runsRoot: context.runsRoot, agents: { codex, claude },
+    });
+    const runId = started.snapshot().runId;
+
+    await AgentOrchestrator.authorizeRecoveryPolicy(runId, {
+      executors: [{
+        id: 'metadata-repairer', adapter: 'claude', roles: ['handoff_repair'],
+        capabilities: [{ capability: 'handoff_repair' }], available: true,
+      }],
+    }, { repositoryPath: context.fixture.repository, runsRoot: context.runsRoot, agents: { codex, claude } });
+
+    const resumed = await AgentOrchestrator.resume(runId, {
+      repositoryPath: context.fixture.repository, runsRoot: context.runsRoot, agents: { codex, claude },
+    });
+    const completed = await resumed.execute();
+    assert.equal(completed.status, 'COMPLETED', JSON.stringify(completed.errors));
+
+    // Codex is still the task's writer (correction), but handoff_repair must
+    // have gone to claude, the configured recovery executor — never codex.
+    assert.deepEqual(codex.invocations.map((request) => request.role), ['correction']);
+    assert.equal(claude.invocations.filter((request) => request.role === 'handoff_repair').length, 1);
+
+    const correction = Object.values(completed.tasks).find((task) => task.commit !== undefined)!;
+    assert.equal(correction.agentAttempts[0]?.agent, 'codex', 'the original task owner fact is unchanged');
+    const record = correction.handoffRepairAttempts.at(-1);
+    assert.equal(record?.succeeded, true);
+    assert.equal(record?.repairExecutorId, 'metadata-repairer');
+    assert.equal(record?.repairAdapter, 'claude');
+  } finally { await context.fixture.dispose(); }
+});
+
+test('with no recovery policy authorized, handoff repair falls back to task.owner and still records repair executor identity', async () => {
+  const context = await setup(['feature.txt']);
+  try {
+    const phaseFile = join(context.fixture.container, 'continuation.yaml');
+    await writeFile(phaseFile, continuationPhase(context.fixture.baseBranch, context.baseSha), 'utf8');
+    const codex = new SemanticRepairAgent('codex');
+    const claude = new SemanticRepairAgent('claude');
+    const orchestrator = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: context.fixture.repository, runsRoot: context.runsRoot, agents: { codex, claude },
+    });
+    const completed = await orchestrator.execute();
+    assert.equal(completed.status, 'COMPLETED', JSON.stringify(completed.errors));
+    assert.equal(codex.invocations.filter((request) => request.role === 'handoff_repair').length, 1);
+    const correction = Object.values(completed.tasks).find((task) => task.commit !== undefined)!;
+    const record = correction.handoffRepairAttempts.at(-1);
+    assert.equal(record?.repairExecutorId, 'codex');
+    assert.equal(record?.repairAdapter, 'codex');
+  } finally { await context.fixture.dispose(); }
+});
+
+test('explicitly configured recovery executors with none eligible fail closed WITHOUT consuming an agent call', async () => {
+  const context = await setup(['feature.txt']);
+  try {
+    const phaseFile = join(context.fixture.container, 'continuation.yaml');
+    await writeFile(phaseFile, continuationPhase(context.fixture.baseBranch, context.baseSha), 'utf8');
+    const codex = new SemanticRepairAgent('codex');
+    const claude = new SemanticRepairAgent('claude');
+    const started = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: context.fixture.repository, runsRoot: context.runsRoot, agents: { codex, claude },
+    });
+    const runId = started.snapshot().runId;
+
+    await AgentOrchestrator.authorizeRecoveryPolicy(runId, {
+      executors: [{
+        id: 'unavailable-repairer', adapter: 'claude', roles: ['handoff_repair'],
+        capabilities: [{ capability: 'handoff_repair' }], available: false,
+      }],
+    }, { repositoryPath: context.fixture.repository, runsRoot: context.runsRoot, agents: { codex, claude } });
+
+    const resumed = await AgentOrchestrator.resume(runId, {
+      repositoryPath: context.fixture.repository, runsRoot: context.runsRoot, agents: { codex, claude },
+    });
+    const failed = await resumed.execute();
+    assert.equal(failed.status, 'FAILED');
+    assert.equal(codex.invocations.filter((request) => request.role === 'handoff_repair').length, 0, 'the original owner must never be silently used once executors are explicitly configured');
+    assert.equal(claude.invocations.filter((request) => request.role === 'handoff_repair').length, 0, 'no configured executor was eligible, so no agent call is consumed at all');
+    const correction = Object.values(failed.tasks).find((task) => task.error?.code === 'HANDOFF_INVALID')!;
+    assert.equal(correction.handoffRepairAttempts.at(-1)?.failureReason, 'no_eligible_recovery_executor');
+    assert.equal(correction.handoffRepairAttempts.at(-1)?.repairExecutorId, undefined);
+  } finally { await context.fixture.dispose(); }
+});
+
+test('a configured executor whose declared capabilities omit handoff_repair is a capability mismatch and fails closed', async () => {
+  const context = await setup(['feature.txt']);
+  try {
+    const phaseFile = join(context.fixture.container, 'continuation.yaml');
+    await writeFile(phaseFile, continuationPhase(context.fixture.baseBranch, context.baseSha), 'utf8');
+    const codex = new SemanticRepairAgent('codex');
+    const claude = new SemanticRepairAgent('claude');
+    const started = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: context.fixture.repository, runsRoot: context.runsRoot, agents: { codex, claude },
+    });
+    const runId = started.snapshot().runId;
+
+    await AgentOrchestrator.authorizeRecoveryPolicy(runId, {
+      executors: [{
+        id: 'wrong-capability-repairer', adapter: 'claude', roles: ['handoff_repair'],
+        capabilities: [{ capability: 'some_other_capability' }], available: true,
+      }],
+    }, { repositoryPath: context.fixture.repository, runsRoot: context.runsRoot, agents: { codex, claude } });
+
+    const resumed = await AgentOrchestrator.resume(runId, {
+      repositoryPath: context.fixture.repository, runsRoot: context.runsRoot, agents: { codex, claude },
+    });
+    const failed = await resumed.execute();
+    assert.equal(failed.status, 'FAILED');
+    assert.equal(claude.invocations.filter((request) => request.role === 'handoff_repair').length, 0);
+    assert.equal(codex.invocations.filter((request) => request.role === 'handoff_repair').length, 0);
+    const correction = Object.values(failed.tasks).find((task) => task.error?.code === 'HANDOFF_INVALID')!;
+    assert.equal(correction.handoffRepairAttempts.at(-1)?.failureReason, 'no_eligible_recovery_executor');
+  } finally { await context.fixture.dispose(); }
+});

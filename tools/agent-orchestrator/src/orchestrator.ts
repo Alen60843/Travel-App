@@ -71,6 +71,7 @@ import {
   matchesOwnershipPattern,
   severityAtLeast,
   validateChangedFileOwnership,
+  type AgentName,
   type TaskCondition,
   type TaskSpec,
   type TaskStatus,
@@ -178,9 +179,20 @@ type SalvageEligibilityReasonCode =
   | 'SALVAGE_DEPENDENCY_UNSATISFIED';
 
 type HandoffRepairMethod = 'framing' | 'deterministic' | 'agent';
-type HandoffRepairFailureReason = 'agent_invocation_failed' | 'evidence_insufficient' | 'contradiction_detected';
+type HandoffRepairFailureReason =
+  | 'agent_invocation_failed'
+  | 'evidence_insufficient'
+  | 'contradiction_detected'
+  | 'no_eligible_recovery_executor';
 type RepairOutcome =
-  | { readonly ok: true; readonly handoff: StructuredHandoff; readonly method: HandoffRepairMethod }
+  | {
+      readonly ok: true;
+      readonly handoff: StructuredHandoff;
+      readonly method: HandoffRepairMethod;
+      /** Present only for method: 'agent' — see resolveHandoffRepairExecutor. */
+      readonly executorId?: string;
+      readonly adapter?: AgentName;
+    }
   | { readonly ok: false; readonly reason: HandoffRepairFailureReason };
 
 /** Result of recoverHandoffFailures: which persisted FAILED tasks were actually recovered, and why any others were left untouched. */
@@ -2225,7 +2237,13 @@ export class AgentOrchestrator {
         task, rawStructuredHandoff, rawStdout, requiredCanonicalFindings, taskDiff,
       );
       const record: HandoffRepairAttemptRecord = repaired.ok
-        ? { method: repaired.method, succeeded: true, timestamp: this.clock().toISOString() }
+        ? {
+            method: repaired.method,
+            succeeded: true,
+            timestamp: this.clock().toISOString(),
+            ...(repaired.executorId === undefined ? {} : { repairExecutorId: repaired.executorId }),
+            ...(repaired.adapter === undefined ? {} : { repairAdapter: repaired.adapter }),
+          }
         : { method: 'none', succeeded: false, failureReason: repaired.reason, timestamp: this.clock().toISOString() };
       await this.event('HANDOFF_REPAIR_ATTEMPTED', task.id, {
         method: record.method,
@@ -2310,7 +2328,48 @@ export class AgentOrchestrator {
     const repaired = await this.repairHandoffViaAgent(
       task, rawStructuredHandoff, requiredCanonicalFindings, taskDiff, original,
     );
-    return repaired.ok ? { ok: true, handoff: repaired.handoff, method: 'agent' } : repaired;
+    return repaired.ok
+      ? { ok: true, handoff: repaired.handoff, method: 'agent', executorId: repaired.executorId, adapter: repaired.adapter }
+      : repaired;
+  }
+
+  /**
+   * Selects who actually runs a bounded handoff_repair call — deliberately
+   * NEVER the same thing as task.owner (which continues to truthfully
+   * record who produced the original code; see the docs/superpowers spec
+   * for this hardening). Recovery routing is resolved solely from the most
+   * recently authorized recovery-policy overlay's executors
+   * (this.recoveryExecutors, set once at load time in
+   * loadRunForContinuation) — adaptive executors are never consulted here,
+   * since 'handoff_repair' is deliberately excluded from AdaptiveRole.
+   *
+   * Backward compatible by design: no policy ever authorized ->
+   * this.recoveryExecutors is undefined -> falls back to task.owner, the
+   * historical behavior every existing run/test already depends on.
+   *
+   * FAILS CLOSED once executors are explicitly configured: if
+   * recoveryExecutors is a non-undefined (even empty) array and no entry is
+   * available, declares the 'handoff_repair' role, AND declares the
+   * 'handoff_repair' capability, this returns { ok: false } — it never
+   * silently falls back to task.owner in that case. An operator who
+   * explicitly configured a specific recovery executor and had it turn out
+   * unavailable must see that failure, not have Codex quietly consume an
+   * attempt instead.
+   */
+  private resolveHandoffRepairExecutor(
+    task: TaskSpec,
+  ): { readonly ok: true; readonly agent: Agent; readonly executorId: string; readonly adapter: AgentName } | { readonly ok: false } {
+    if (this.recoveryExecutors === undefined) {
+      return { ok: true, agent: this.agents[task.owner], executorId: task.owner, adapter: task.owner };
+    }
+    const eligible = this.recoveryExecutors.find((executor) =>
+      executor.available
+      && executor.roles.includes('handoff_repair')
+      && executor.capabilities.some((capability) => capability.capability === 'handoff_repair'));
+    if (eligible === undefined) {
+      return { ok: false };
+    }
+    return { ok: true, agent: this.agents[eligible.adapter], executorId: eligible.id, adapter: eligible.adapter };
   }
 
   /**
@@ -2327,9 +2386,16 @@ export class AgentOrchestrator {
     taskDiff: string,
     originalHandoff?: StructuredHandoff,
   ): Promise<
-    { readonly ok: true; readonly handoff: StructuredHandoff }
+    { readonly ok: true; readonly handoff: StructuredHandoff; readonly executorId: string; readonly adapter: AgentName }
     | { readonly ok: false; readonly reason: HandoffRepairFailureReason }
   > {
+    const routing = this.resolveHandoffRepairExecutor(task);
+    if (!routing.ok) {
+      // Fails closed BEFORE constructing or sending any AgentRequest — an
+      // explicitly-configured-but-ineligible recovery policy must never
+      // consume an agent call, on any adapter, silently or otherwise.
+      return { ok: false, reason: 'no_eligible_recovery_executor' };
+    }
     const repairDirectory = join(this.stateStore.runDirectory, 'repairs', task.id);
     await mkdir(repairDirectory, { recursive: true, mode: 0o700 });
     const request: AgentRequest = {
@@ -2371,7 +2437,7 @@ export class AgentOrchestrator {
     // HANDOFF_INVALID with a generic uncaught-error code.
     let result: AgentResult;
     try {
-      result = await this.agents[task.owner].run(request);
+      result = await routing.agent.run(request);
     } catch {
       return { ok: false, reason: 'agent_invocation_failed' };
     }
@@ -2395,7 +2461,7 @@ export class AgentOrchestrator {
           return { ok: false, reason: 'evidence_insufficient' };
         }
       }
-      return { ok: true, handoff: repaired };
+      return { ok: true, handoff: repaired, executorId: routing.executorId, adapter: routing.adapter };
     } catch {
       return { ok: false, reason: 'evidence_insufficient' };
     }
