@@ -6,10 +6,10 @@ import test from 'node:test';
 
 import type { Agent, AgentName, AgentRequest, AgentResult } from '../../src/agents';
 import { isOrchestratorError } from '../../src/errors';
-import { WorktreeManager } from '../../src/git';
+import { GitClient, WorktreeManager } from '../../src/git';
 import { computeTrackedDiffFingerprint } from '../../src/git/diff';
 import { AgentOrchestrator } from '../../src/orchestrator';
-import type { RunState } from '../../src/state';
+import { StateStore, type RunState } from '../../src/state';
 import { createTemporaryRepository, type TemporaryRepository } from '../git/helpers';
 
 /** Never actually invoked in these tests — salvage never calls an agent for the base flow (no canonical findings). */
@@ -607,7 +607,7 @@ test('salvage of a task with a required canonical finding synthesizes a handoff 
   }
 });
 
-test('salvage fails closed if the repair cascade cannot produce a valid findingResponses entry for a required canonical finding', async () => {
+test('salvage fails closed if the repair cascade cannot produce a valid findingResponses entry for a required canonical finding, and NO commit is created', async () => {
   const scenario = await createAdaptiveTimeoutScenario('omit');
   try {
     await assert.rejects(
@@ -618,6 +618,64 @@ test('salvage fails closed if the repair cascade cannot produce a valid findingR
       }),
       (error: unknown) => isOrchestratorError(error, 'HANDOFF_INVALID'),
     );
+  } finally {
+    await scenario.fixture.dispose();
+  }
+});
+
+test('commit-order safety: a failed canonical repair after a passing verification leaves the worktree dirty and salvageable again — no commit, no SUCCEEDED, retryable', async () => {
+  const scenario = await createAdaptiveTimeoutScenario('omit');
+  try {
+    const stateStore = new StateStore(scenario.runsRoot, scenario.runId);
+    const before = await stateStore.load();
+    const worktreePathBefore = before.tasks[scenario.correctionTaskId]!.worktreePath!;
+    const headBefore = (await new GitClient().run(worktreePathBefore, ['rev-parse', 'HEAD'])).stdout.trim();
+
+    await assert.rejects(
+      () => AgentOrchestrator.salvageTask(scenario.runId, scenario.correctionTaskId, {
+        repositoryPath: scenario.fixture.repository,
+        runsRoot: scenario.runsRoot,
+        agents: { codex: new CorrectionTimeoutAgent('codex', 'omit'), claude: new CorrectionTimeoutAgent('claude', 'omit') },
+      }),
+      (error: unknown) => isOrchestratorError(error, 'HANDOFF_INVALID'),
+    );
+
+    // No commit anywhere — neither in persisted task state nor as a real
+    // git commit in the worktree — and the worktree HEAD has not moved.
+    const afterFailedAttempt = await stateStore.load();
+    assert.equal(afterFailedAttempt.tasks[scenario.correctionTaskId]?.commit, undefined);
+    assert.notEqual(afterFailedAttempt.tasks[scenario.correctionTaskId]?.status, 'SUCCEEDED');
+    const headAfterFailedAttempt = (await new GitClient().run(worktreePathBefore, ['rev-parse', 'HEAD'])).stdout.trim();
+    assert.equal(headAfterFailedAttempt, headBefore, 'a failed canonical repair must never leave a real git commit behind');
+    const statusAfterFailedAttempt = (await new GitClient().run(worktreePathBefore, ['status', '--porcelain'])).stdout;
+    assert.notEqual(statusAfterFailedAttempt.trim().length, 0, 'the salvageable dirty diff must still be present, uncommitted');
+
+    // Retry with a working recovery executor — must succeed, because
+    // eligibility (HEAD unmoved, still dirty) is completely unaffected by
+    // the earlier failed attempt.
+    const retried = await AgentOrchestrator.salvageTask(scenario.runId, scenario.correctionTaskId, {
+      repositoryPath: scenario.fixture.repository,
+      runsRoot: scenario.runsRoot,
+      agents: { codex: new CorrectionTimeoutAgent('codex', 'succeed'), claude: new CorrectionTimeoutAgent('claude', 'succeed') },
+    });
+    assert.ok(retried.commitSha);
+    assert.equal(retried.orchestrator.snapshot().tasks[scenario.correctionTaskId]?.status, 'SUCCEEDED');
+  } finally {
+    await scenario.fixture.dispose();
+  }
+});
+
+test('the handoff synthesized before commit reports exactly the same changed-file set that ensureTaskCommit later commits', async () => {
+  const scenario = await createTimeoutScenario({ verifyCommand: 'true' });
+  try {
+    const result = await AgentOrchestrator.salvageTask(scenario.runId, 'timed-out-task', {
+      repositoryPath: scenario.fixture.repository,
+      runsRoot: scenario.runsRoot,
+      agents: { codex: new UnusedAgent('codex'), claude: new UnusedAgent('claude') },
+    });
+    const after = result.orchestrator.snapshot();
+    const handoff = JSON.parse(await readFile(after.tasks['timed-out-task']!.handoffPath!, 'utf8')) as { filesChanged: string[] };
+    assert.deepEqual([...handoff.filesChanged].sort(), [...after.tasks['timed-out-task']!.commit!.changedFiles].sort());
   } finally {
     await scenario.fixture.dispose();
   }

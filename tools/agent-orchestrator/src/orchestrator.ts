@@ -1125,18 +1125,16 @@ export class AgentOrchestrator {
       await orchestrator.event('SALVAGE_VERIFIED', taskId, {});
     }
 
-    const ensured = await ensureTaskCommit(orchestrator.git, {
-      worktreePath: checked.worktree.path,
-      baseSha: preparedHeadSha,
-      agent: taskSpec.owner,
-      taskId,
-      summary: `Salvaged timed-out writer work for ${taskId}`,
-    });
-    // Same ownership enforcement every task commit already goes through —
-    // salvage is not exempt merely because the original agent never
-    // produced a handoff.
-    assertChangedFileOwnership(taskId, ensured.changedFiles, taskSpec.files);
-
+    // No Git commit exists yet, and none is created until every
+    // semantic/protocol check required for task completion has succeeded —
+    // ownership was already proven at eligibility time (checked.changedFiles
+    // is exactly the dirty diff's changed-file set, computed from `git
+    // status`, not from a commit); reusing it here means the handoff never
+    // needs to wait for ensureTaskCommit to learn what changed, and a
+    // canonical repair that fails leaves the worktree exactly as dirty and
+    // salvageable as it was before this call — never a stranded commit with
+    // nothing left to repair.
+    //
     // A timed-out writer never produced a handoff at all, so one is
     // synthesized here from the salvaged diff and verify evidence. If the
     // task carries required canonical findings, this shell deliberately
@@ -1154,7 +1152,7 @@ export class AgentOrchestrator {
     const synthesizedHandoff = {
       status: 'complete',
       summary: `Salvaged timed-out writer work for ${taskId} after deterministic verification.`,
-      filesChanged: [...ensured.changedFiles],
+      filesChanged: [...checked.changedFiles],
       decisions: [],
       tests: orchestrator.config.salvage.verify.map((command) => ({
         command: command.command,
@@ -1169,8 +1167,32 @@ export class AgentOrchestrator {
     );
     await orchestrator.recordHandoffOutcome(taskId, parsed.outcome);
     if (parsed.handoff === null) {
+      // The worktree is untouched (still dirty, HEAD unmoved) — a later
+      // salvage-task call with different/available recovery evidence
+      // remains fully eligible and can retry from scratch.
       throw parsed.error;
     }
+
+    // ONLY NOW, with a strictly-validated, accepted canonical handoff in
+    // hand, does the Orchestrator (never salvage code calling git itself)
+    // create the commit — the same ensureTaskCommit/assertChangedFileOwnership
+    // path applyIntegrationFix already uses.
+    const ensured = await ensureTaskCommit(orchestrator.git, {
+      worktreePath: checked.worktree.path,
+      baseSha: preparedHeadSha,
+      agent: taskSpec.owner,
+      taskId,
+      summary: `Salvaged timed-out writer work for ${taskId}`,
+    });
+    assertChangedFileOwnership(taskId, ensured.changedFiles, taskSpec.files);
+    if (JSON.stringify([...ensured.changedFiles].sort()) !== JSON.stringify([...checked.changedFiles].sort())) {
+      throw new OrchestratorError(
+        'STATE_CORRUPT',
+        `Refusing salvage for ${taskId}: the committed changed-file set does not match what was reported pre-commit`,
+        { details: { runId, taskId, preCommit: checked.changedFiles, committed: ensured.changedFiles } },
+      );
+    }
+
     const handoffPath = await writeHandoff(join(orchestrator.stateStore.runDirectory, 'handoffs'), taskId, parsed.handoff);
     await orchestrator.succeedTask(taskId, handoffPath, {
       sha: ensured.commitSha,
@@ -3157,7 +3179,13 @@ export class AgentOrchestrator {
    * in without a real example to validate against would be scope creep.
    */
   private async checkSalvageEligibility(taskId: string): Promise<
-    | { readonly eligible: true; readonly worktree: OwnedWorktree; readonly trackedChanged: readonly string[] }
+    | {
+        readonly eligible: true;
+        readonly worktree: OwnedWorktree;
+        readonly trackedChanged: readonly string[];
+        /** trackedChanged + untrackedNew, sorted — the exact pre-commit changed-file set ensureTaskCommit will later commit. */
+        readonly changedFiles: readonly string[];
+      }
     | { readonly eligible: false; readonly reason: string; readonly reasonCode: SalvageEligibilityReasonCode }
   > {
     const taskSpec = this.config.tasks.find((task) => task.id === taskId);
@@ -3300,7 +3328,12 @@ export class AgentOrchestrator {
         reasonCode: 'SALVAGE_DIFF_CHECK_FAILED',
       };
     }
-    return { eligible: true, worktree, trackedChanged };
+    return {
+      eligible: true,
+      worktree,
+      trackedChanged,
+      changedFiles: [...trackedChanged, ...untrackedNew].sort(),
+    };
   }
 
   /**
