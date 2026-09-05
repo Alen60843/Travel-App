@@ -4,7 +4,6 @@ import {
   IsEnum,
   IsInt,
   IsNumber,
-  IsOptional,
   IsString,
   Matches,
   Max,
@@ -19,89 +18,86 @@ const EVENT_TIMESTAMP =
 
 /** Mutable draft fields only. Global whitelist validation rejects lifecycle/host projections. */
 export class UpdateEventDto {
-  @IsOptional()
+  @ValidateIf((_object, value: unknown) => value !== undefined)
   @IsInt()
   @Min(1)
   @Max(2_147_483_647)
   categoryId?: number;
 
-  @IsOptional()
+  @ValidateIf((_object, value: unknown) => value !== undefined)
   @IsString()
   @MinLength(3)
   @MaxLength(140)
   title?: string;
 
-  @IsOptional()
-  @ValidateIf((_object, value: unknown) => value !== null)
+  @ValidateIf((_object, value: unknown) => value !== undefined && value !== null)
   @IsString()
   description?: string | null;
 
-  @IsOptional()
+  @ValidateIf((_object, value: unknown) => value !== undefined)
   @IsEnum(EventVisibility)
   visibility?: EventVisibility;
 
-  @IsOptional()
+  @ValidateIf((_object, value: unknown) => value !== undefined)
   @IsInt()
   @Min(1)
   @Max(10_000)
   capacityMax?: number;
 
-  @IsOptional()
+  @ValidateIf((_object, value: unknown) => value !== undefined)
   @IsInt()
   @Min(0)
   @Max(2_147_483_647)
   priceMinor?: number;
 
-  @IsOptional()
+  @ValidateIf((_object, value: unknown) => value !== undefined)
   @IsInt()
   @Min(0)
   @Max(2_147_483_647)
   depositMinor?: number;
 
-  @IsOptional()
+  @ValidateIf((_object, value: unknown) => value !== undefined)
   @IsString()
   @Matches(/^[A-Z]{3}$/)
   currency?: string;
 
-  @IsOptional()
+  @ValidateIf((_object, value: unknown) => value !== undefined)
   @IsString()
   @Matches(EVENT_TIMESTAMP)
   startsAt?: string;
 
-  @IsOptional()
+  @ValidateIf((_object, value: unknown) => value !== undefined)
   @IsString()
   @Matches(EVENT_TIMESTAMP)
   endsAt?: string;
 
-  @IsOptional()
+  @ValidateIf((_object, value: unknown) => value !== undefined)
   @IsNumber({ allowInfinity: false, allowNaN: false })
   @Min(-90)
   @Max(90)
   latitude?: number;
 
-  @IsOptional()
+  @ValidateIf((_object, value: unknown) => value !== undefined)
   @IsNumber({ allowInfinity: false, allowNaN: false })
   @Min(-180)
   @Max(180)
   longitude?: number;
 
-  @IsOptional()
-  @ValidateIf((_object, value: unknown) => value !== null)
+  @ValidateIf((_object, value: unknown) => value !== undefined && value !== null)
   @IsString()
   meetingPointLabel?: string | null;
 
-  @IsOptional()
+  @ValidateIf((_object, value: unknown) => value !== undefined)
   @IsNumber({ allowInfinity: false, allowNaN: false, maxDecimalPlaces: 2 })
   @Min(0)
   @Max(10)
   minTrustScore?: number;
 
-  @IsOptional()
+  @ValidateIf((_object, value: unknown) => value !== undefined)
   @IsBoolean()
   joinApprovalRequired?: boolean;
 
-  @IsOptional()
-  @ValidateIf((_object, value: unknown) => value !== null)
+  @ValidateIf((_object, value: unknown) => value !== undefined && value !== null)
   @IsString()
   cancellationPolicy?: string | null;
 }
