@@ -119,10 +119,10 @@ describe('EventsService (real PostgreSQL/PostGIS)', () => {
           await manager.query(
             `DELETE FROM event_status_history
               WHERE event_id IN (
-                SELECT event.id
-                  FROM events event
-                  JOIN users owner ON owner.id = event.host_user_id
-                 WHERE owner.firebase_uid LIKE $1
+                SELECT e.id
+                  FROM events e
+                  JOIN users u ON u.id = e.host_user_id
+                 WHERE u.firebase_uid LIKE $1
               )`,
             [`${UID_PREFIX}%`],
           );
