@@ -85,4 +85,46 @@ describe('EventsController', () => {
     expect(createTypes[1]).toBe(CreateEventDto);
     expect(updateTypes[2]).toBe(UpdateEventDto);
   });
+
+  it.each([
+    'categoryId',
+    'title',
+    'visibility',
+    'capacityMax',
+    'priceMinor',
+    'depositMinor',
+    'currency',
+    'startsAt',
+    'endsAt',
+    'latitude',
+    'longitude',
+    'minTrustScore',
+    'joinApprovalRequired',
+  ])('rejects null for non-nullable patch field %s', async (field) => {
+    const pipe = createValidationPipe();
+    await expect(
+      pipe.transform(
+        { [field]: null },
+        { type: 'body', metatype: UpdateEventDto },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_FAILED', status: 422 });
+  });
+
+  it('allows null only for explicitly nullable patch text fields', async () => {
+    const pipe = createValidationPipe();
+    await expect(
+      pipe.transform(
+        {
+          description: null,
+          meetingPointLabel: null,
+          cancellationPolicy: null,
+        },
+        { type: 'body', metatype: UpdateEventDto },
+      ),
+    ).resolves.toMatchObject({
+      description: null,
+      meetingPointLabel: null,
+      cancellationPolicy: null,
+    });
+  });
 });
