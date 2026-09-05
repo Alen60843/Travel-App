@@ -167,7 +167,16 @@ export interface GrantDecision {
   readonly effectivePriority: number;
   readonly decidedAt: string;
   readonly sequence: number;
-  /** Present only when `requestId` is bound to an active RecoveryEpochState at decision time — see AdaptiveRunState.recoveryEpoch. */
+  /**
+   * The epoch this decision was made under, if any — the specific
+   * RecoveryEpochState (by number) in AdaptiveRunState.recoveryEpochs whose
+   * requestIds included `requestId` at decision time. Permanent, historical
+   * provenance: a decision stamped with epoch N remains valid forever as
+   * long as epoch N's own persisted record still exists, regardless of
+   * whether a LATER epoch N+1 is now active — see
+   * AdaptiveCoordinator.authorizeRecoveryEpoch and the historical-decision
+   * validation in state-validation.ts.
+   */
   readonly recoveryEpochNumber?: number;
 }
 
@@ -181,7 +190,10 @@ export interface GrantDecision {
  * requests may use. Epoch identity is bound to policyHash: re-authorizing
  * the same normalized recovery policy reuses this exact epoch (no clock
  * reset, no extra budget); a genuinely different policy hash creates the
- * next epoch (number + 1) with a fresh startedAt.
+ * next epoch (number + 1) with a fresh startedAt. A request already claimed
+ * by an earlier epoch's requestIds is never migrated to a later one, even
+ * if it would otherwise be recomputed as in-scope — see
+ * AdaptiveCoordinator.authorizeRecoveryEpoch.
  */
 export interface RecoveryEpochState {
   readonly number: number;
@@ -293,8 +305,17 @@ export interface AdaptiveRunState {
   readonly grantedEstimatedCostUnits: number;
   /** Immutable evidence copied into this run before any continuation agent launches. */
   readonly continuation?: AdaptiveContinuationState;
-  /** See RecoveryEpochState. Absent until an operator explicitly authorizes a recovery-budget overlay. */
-  readonly recoveryEpoch?: RecoveryEpochState;
+  /**
+   * Append-only, oldest-first history of every recovery epoch ever
+   * authorized for this run — see RecoveryEpochState. Absent until an
+   * operator explicitly authorizes a recovery-budget overlay. An epoch's
+   * record here is permanent: authorizing epoch N+1 never removes or
+   * rewrites epoch N, and any GrantDecision.recoveryEpochNumber stamped
+   * with N remains valid against it forever.
+   */
+  readonly recoveryEpochs?: readonly RecoveryEpochState[];
+  /** The currently active epoch's number — must reference an entry in `recoveryEpochs`. */
+  readonly activeRecoveryEpochNumber?: number;
 }
 
 export interface CapabilityAvailability {

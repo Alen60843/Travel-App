@@ -4,10 +4,12 @@ import test from 'node:test';
 import {
   AdaptiveCoordinator,
   StaticCapabilityCatalog,
+  parseAdaptiveRunState,
   type AdaptivePolicy,
   type Clock,
   type WorkRequestDraft,
 } from '../../src/adaptive';
+import { isOrchestratorError } from '../../src/errors';
 
 /**
  * The Recovery Execution Budget Epoch: an operator-authorized, explicitly
@@ -73,6 +75,12 @@ function coordinator(limits: Partial<AdaptivePolicy['limits']> = {}, clock: Cloc
 /** grantDecisions is append-only and ordered oldest-first — a plain .find() would return the FIRST (possibly stale) decision for a re-arbitrated request. */
 function latestDecisionFor(subject: AdaptiveCoordinator, requestId: string) {
   return [...subject.snapshot().grantDecisions].reverse().find((d) => d.requestId === requestId);
+}
+
+/** The currently active recovery epoch's own record. */
+function activeEpoch(subject: AdaptiveCoordinator) {
+  const state = subject.snapshot();
+  return state.recoveryEpochs?.find((epoch) => epoch.number === state.activeRecoveryEpochNumber);
 }
 
 const EPOCH_POLICY_HASH_A = 'a'.repeat(64);
@@ -251,7 +259,7 @@ test('idempotency: reauthorizing the same semantic policy does not reset the clo
   subject.arbitrate();
 
   subject.authorizeRecoveryEpoch({ policyHash: EPOCH_POLICY_HASH_A, maxWallClockMs: 3_600_000, requestIds: [request.id] });
-  const epoch1 = subject.snapshot().recoveryEpoch!;
+  const epoch1 = activeEpoch(subject)!;
   assert.equal(epoch1.number, 1);
   const decisionsAfterFirst = subject.snapshot().grantDecisions.filter((d) => d.requestId === request.id);
   assert.equal(decisionsAfterFirst.length, 2);
@@ -260,7 +268,7 @@ test('idempotency: reauthorizing the same semantic policy does not reset the clo
   // Advance time and reauthorize the exact same semantic policy.
   clock.advance(10 * 60 * 1000);
   const secondDecisions = subject.authorizeRecoveryEpoch({ policyHash: EPOCH_POLICY_HASH_A, maxWallClockMs: 3_600_000, requestIds: [request.id] });
-  const epoch2 = subject.snapshot().recoveryEpoch!;
+  const epoch2 = activeEpoch(subject)!;
   assert.equal(epoch2.number, epoch1.number, 'no new epoch number');
   assert.equal(epoch2.startedAt, epoch1.startedAt, 'no fresh clock reset');
   assert.equal(epoch2.maxWallClockMs, epoch1.maxWallClockMs, 'no extra budget');
@@ -276,15 +284,155 @@ test('idempotency: a genuinely different policy hash creates the next epoch with
   clock.advance(2_000);
   subject.arbitrate();
   subject.authorizeRecoveryEpoch({ policyHash: EPOCH_POLICY_HASH_A, maxWallClockMs: 3_600_000, requestIds: [request.id] });
-  const epoch1 = subject.snapshot().recoveryEpoch!;
+  const epoch1 = activeEpoch(subject)!;
 
   clock.advance(10 * 60 * 1000);
   const second = subject.submit(draft({ objective: 'A second, later recovery-scoped request' }));
   clock.advance(2_000);
   subject.arbitrate();
   subject.authorizeRecoveryEpoch({ policyHash: EPOCH_POLICY_HASH_B, maxWallClockMs: 7_200_000, requestIds: [second.id] });
-  const epoch2 = subject.snapshot().recoveryEpoch!;
+  const epoch2 = activeEpoch(subject)!;
   assert.equal(epoch2.number, epoch1.number + 1, 'a distinct semantic policy authorizes the next epoch');
   assert.notEqual(epoch2.startedAt, epoch1.startedAt, 'the new epoch gets its own fresh start');
   assert.equal(epoch2.maxWallClockMs, 7_200_000);
+});
+
+// --- Multi-epoch history: two epochs, historical GrantDecision validation ---
+
+function twoRequestCoordinator(): { subject: AdaptiveCoordinator; clock: MutableClock; first: string; second: string } {
+  const clock = new MutableClock();
+  const subject = coordinator({ maxWallClockMs: 1_000 }, clock);
+  const first = subject.submit(draft({ objective: 'First recovery-scoped request' }));
+  const second = subject.submit(draft({ objective: 'Second recovery-scoped request', resourceClaims: [{ kind: 'repository_path', key: 'src/other.ts', mode: 'read' }] }));
+  clock.advance(2_000);
+  subject.arbitrate();
+  return { subject, clock, first: first.id, second: second.id };
+}
+
+test('multi-epoch: Epoch 1 remains valid and untouched after Epoch 2 is authorized for a different request', () => {
+  const { subject, clock, first, second } = twoRequestCoordinator();
+  subject.authorizeRecoveryEpoch({ policyHash: EPOCH_POLICY_HASH_A, maxWallClockMs: 3_600_000, requestIds: [first] });
+  const epoch1Before = activeEpoch(subject)!;
+  const decisionsBefore = subject.snapshot().grantDecisions.filter((d) => d.requestId === first);
+
+  clock.advance(60_000);
+  subject.authorizeRecoveryEpoch({ policyHash: EPOCH_POLICY_HASH_B, maxWallClockMs: 7_200_000, requestIds: [second] });
+
+  const after = subject.snapshot();
+  const epoch1After = after.recoveryEpochs!.find((e) => e.number === 1)!;
+  assert.deepEqual(epoch1After, epoch1Before, 'Epoch 1 is byte-for-byte unchanged');
+  assert.deepEqual(after.grantDecisions.filter((d) => d.requestId === first), decisionsBefore, 'Epoch 1 decisions are unchanged, no duplicates');
+  assert.equal(after.recoveryEpochs!.length, 2);
+  assert.equal(after.activeRecoveryEpochNumber, 2);
+  // A request already claimed by Epoch 1 is never migrated into Epoch 2's
+  // scope, even though it would still be recomputed as eligible.
+  assert.ok(!after.recoveryEpochs!.find((e) => e.number === 2)!.requestIds.includes(first));
+
+  // Round-tripping through parseAdaptiveRunState (exactly what a real
+  // resume() does) must never raise STATE_CORRUPT.
+  assert.doesNotThrow(() => parseAdaptiveRunState(JSON.parse(JSON.stringify(after))));
+});
+
+// --- §11: validation failures ---
+
+test('validation A: a GrantDecision referencing a nonexistent epoch fails closed', () => {
+  const { subject, first } = twoRequestCoordinator();
+  subject.authorizeRecoveryEpoch({ policyHash: EPOCH_POLICY_HASH_A, maxWallClockMs: 3_600_000, requestIds: [first] });
+  const corrupted = JSON.parse(JSON.stringify(subject.snapshot()));
+  const decision = corrupted.grantDecisions.find((d: { requestId: string }) => d.requestId === first);
+  decision.recoveryEpochNumber = 99;
+  assert.throws(
+    () => parseAdaptiveRunState(corrupted),
+    (error: unknown) => isOrchestratorError(error, 'STATE_CORRUPT'),
+  );
+});
+
+test('validation B: a GrantDecision referencing an epoch where the requestId was never in scope fails closed', () => {
+  const { subject, clock, first, second } = twoRequestCoordinator();
+  subject.authorizeRecoveryEpoch({ policyHash: EPOCH_POLICY_HASH_A, maxWallClockMs: 3_600_000, requestIds: [first] });
+  clock.advance(60_000);
+  subject.authorizeRecoveryEpoch({ policyHash: EPOCH_POLICY_HASH_B, maxWallClockMs: 7_200_000, requestIds: [second] });
+  const corrupted = JSON.parse(JSON.stringify(subject.snapshot()));
+  // Forge a decision claiming `second` belongs to Epoch 1 — it never did.
+  const secondDecision = [...corrupted.grantDecisions].reverse().find((d: { requestId: string }) => d.requestId === second);
+  secondDecision.recoveryEpochNumber = 1;
+  assert.throws(
+    () => parseAdaptiveRunState(corrupted),
+    (error: unknown) => isOrchestratorError(error, 'STATE_CORRUPT'),
+  );
+});
+
+test('validation C: duplicate epoch numbers fail closed', () => {
+  const { subject, first } = twoRequestCoordinator();
+  subject.authorizeRecoveryEpoch({ policyHash: EPOCH_POLICY_HASH_A, maxWallClockMs: 3_600_000, requestIds: [first] });
+  const corrupted = JSON.parse(JSON.stringify(subject.snapshot()));
+  corrupted.recoveryEpochs.push({ ...corrupted.recoveryEpochs[0], requestIds: [] });
+  assert.throws(
+    () => parseAdaptiveRunState(corrupted),
+    (error: unknown) => isOrchestratorError(error, 'STATE_CORRUPT'),
+  );
+});
+
+test('validation D: activeRecoveryEpochNumber referencing a nonexistent epoch fails closed', () => {
+  const { subject, first } = twoRequestCoordinator();
+  subject.authorizeRecoveryEpoch({ policyHash: EPOCH_POLICY_HASH_A, maxWallClockMs: 3_600_000, requestIds: [first] });
+  const corrupted = JSON.parse(JSON.stringify(subject.snapshot()));
+  corrupted.activeRecoveryEpochNumber = 7;
+  assert.throws(
+    () => parseAdaptiveRunState(corrupted),
+    (error: unknown) => isOrchestratorError(error, 'STATE_CORRUPT'),
+  );
+});
+
+test('validation E: a malformed legacy single-epoch state still fails closed on other invariants (e.g. missing policyHash)', () => {
+  const { subject, first } = twoRequestCoordinator();
+  subject.authorizeRecoveryEpoch({ policyHash: EPOCH_POLICY_HASH_A, maxWallClockMs: 3_600_000, requestIds: [first] });
+  const corrupted = JSON.parse(JSON.stringify(subject.snapshot()));
+  const legacyEpoch = corrupted.recoveryEpochs[0];
+  delete corrupted.recoveryEpochs;
+  delete corrupted.activeRecoveryEpochNumber;
+  delete legacyEpoch.policyHash;
+  corrupted.recoveryEpoch = legacyEpoch;
+  assert.throws(
+    () => parseAdaptiveRunState(corrupted),
+    (error: unknown) => isOrchestratorError(error, 'STATE_CORRUPT'),
+  );
+});
+
+test('validation E: a well-formed legacy single-epoch state parses successfully (backward compatibility)', () => {
+  const { subject, first } = twoRequestCoordinator();
+  subject.authorizeRecoveryEpoch({ policyHash: EPOCH_POLICY_HASH_A, maxWallClockMs: 3_600_000, requestIds: [first] });
+  const snapshot = JSON.parse(JSON.stringify(subject.snapshot()));
+  const legacyEpoch = snapshot.recoveryEpochs[0];
+  delete snapshot.recoveryEpochs;
+  delete snapshot.activeRecoveryEpochNumber;
+  snapshot.recoveryEpoch = legacyEpoch;
+  const parsed = parseAdaptiveRunState(snapshot);
+  assert.deepEqual(parsed.recoveryEpochs, [legacyEpoch]);
+  assert.equal(parsed.activeRecoveryEpochNumber, legacyEpoch.number);
+});
+
+test('legacy and current recoveryEpoch shapes must never coexist', () => {
+  const { subject, first } = twoRequestCoordinator();
+  subject.authorizeRecoveryEpoch({ policyHash: EPOCH_POLICY_HASH_A, maxWallClockMs: 3_600_000, requestIds: [first] });
+  const corrupted = JSON.parse(JSON.stringify(subject.snapshot()));
+  corrupted.recoveryEpoch = corrupted.recoveryEpochs[0];
+  assert.throws(
+    () => parseAdaptiveRunState(corrupted),
+    (error: unknown) => isOrchestratorError(error, 'STATE_CORRUPT'),
+  );
+});
+
+test('validation F: non-monotonic/non-contiguous epoch numbering fails closed', () => {
+  const { subject, clock, first, second } = twoRequestCoordinator();
+  subject.authorizeRecoveryEpoch({ policyHash: EPOCH_POLICY_HASH_A, maxWallClockMs: 3_600_000, requestIds: [first] });
+  clock.advance(60_000);
+  subject.authorizeRecoveryEpoch({ policyHash: EPOCH_POLICY_HASH_B, maxWallClockMs: 7_200_000, requestIds: [second] });
+  const corrupted = JSON.parse(JSON.stringify(subject.snapshot()));
+  // Swap the numbers so the array is [2, 1] instead of [1, 2].
+  corrupted.recoveryEpochs = [corrupted.recoveryEpochs[1], corrupted.recoveryEpochs[0]];
+  assert.throws(
+    () => parseAdaptiveRunState(corrupted),
+    (error: unknown) => isOrchestratorError(error, 'STATE_CORRUPT'),
+  );
 });

@@ -243,12 +243,21 @@ export class AdaptiveCoordinator {
     return [...this.state.grantDecisions].reverse().find((decision) => decision.requestId === requestId);
   }
 
+  /**
+   * The one recovery epoch (if any) that permanently claims this request —
+   * whichever epoch's requestIds first included it, regardless of whether
+   * that epoch is still the active one. authorizeRecoveryEpoch guarantees
+   * a request is never claimed by more than one epoch, so this is always
+   * unambiguous.
+   */
+  private recoveryEpochFor(requestId: string): RecoveryEpochState | undefined {
+    return this.state.recoveryEpochs?.find((epoch) => epoch.requestIds.includes(requestId));
+  }
+
   private decide(request: WorkRequest, outcome: GrantDecision['outcome'], reason: GrantReason, detail: string): GrantDecision {
     const previous = this.latestDecision(request.id);
     if (previous?.outcome === outcome && previous.reason === reason && outcome === 'WAITING') return previous;
-    const recoveryEpochNumber = this.state.recoveryEpoch?.requestIds.includes(request.id) === true
-      ? this.state.recoveryEpoch.number
-      : undefined;
+    const recoveryEpochNumber = this.recoveryEpochFor(request.id)?.number;
     const decision: GrantDecision = {
       id: nextId('decision', this.state.grantDecisions.length),
       requestId: request.id,
@@ -350,14 +359,13 @@ export class AdaptiveCoordinator {
     if (this.state.workUnits.length >= policy.limits.maxTotalWorkUnits && this.existingUnit(request.id) === undefined) return { outcome: 'DENIED', reason: 'MAX_TOTAL_WORK_UNITS', detail: 'work-unit budget exhausted' };
     if (this.state.totalAgentInvocations >= policy.limits.maxAgentInvocations) return { outcome: 'DENIED', reason: 'MAX_AGENT_INVOCATIONS', detail: 'agent-invocation budget exhausted' };
     // A request bound to an authorized recovery epoch (see
-    // authorizeRecoveryEpoch) is measured against that epoch's own
+    // authorizeRecoveryEpoch) is measured against THAT epoch's own
     // independently-tracked start/budget instead of the original run's —
-    // the original wall-clock rule/history is never touched for any other
-    // request, and this request itself keeps using the epoch clock on
-    // every future arbitration pass, not just the one that admitted it.
-    const recoveryEpoch = this.state.recoveryEpoch?.requestIds.includes(request.id) === true
-      ? this.state.recoveryEpoch
-      : undefined;
+    // permanently, even after a later epoch becomes active — the original
+    // wall-clock rule/history is never touched for any other request, and
+    // this request itself keeps using its own epoch's clock on every
+    // future arbitration pass, not just the one that admitted it.
+    const recoveryEpoch = this.recoveryEpochFor(request.id);
     const wallClockStartedAt = recoveryEpoch?.startedAt ?? this.state.startedAt;
     const wallClockBudgetMs = recoveryEpoch?.maxWallClockMs ?? policy.limits.maxWallClockMs;
     if (this.clock.now().getTime() - Date.parse(wallClockStartedAt) > wallClockBudgetMs) {
@@ -427,28 +435,55 @@ export class AdaptiveCoordinator {
    * the SAME epoch (no clock reset, no extra budget) and re-arbitrates only
    * whatever, if anything, is still stuck in DENIED/WALL_CLOCK_BUDGET_EXCEEDED.
    */
+  /**
+   * Binds (or reuses) the active recovery epoch and performs the one
+   * bounded re-arbitration pass for whatever its scope still needs.
+   * Recovery epochs are append-only historical authorization records: an
+   * existing epoch's own persisted requestIds are never rewritten or
+   * removed when a later epoch is created, and a request already claimed
+   * by ANY epoch (active or not) is permanently excluded from ever being
+   * claimed by a different one — recomputed provenance (the caller's
+   * options.requestIds is recomputed fresh on every authorization) must
+   * never accidentally re-scope already-settled work into a new epoch
+   * merely because that epoch now exists.
+   */
   authorizeRecoveryEpoch(options: {
     readonly policyHash: string;
     readonly maxWallClockMs: number;
     readonly requestIds: readonly string[];
   }): GrantDecision[] {
-    const existing = this.state.recoveryEpoch;
+    const epochs = this.state.recoveryEpochs ?? [];
+    const active = epochs.find((epoch) => epoch.number === this.state.activeRecoveryEpochNumber);
     const now = iso(this.clock);
-    const freshRequestIds = [...new Set(options.requestIds)];
-    const epoch: RecoveryEpochState = existing === undefined
-      ? { number: 1, policyHash: options.policyHash, startedAt: now, maxWallClockMs: options.maxWallClockMs, requestIds: freshRequestIds }
-      : existing.policyHash === options.policyHash
-        // Same semantic policy still active: reuse this exact epoch identity
-        // (no clock reset, no extra budget) — only ever widen its tracked
-        // scope with newly-discovered recovery-scoped requests.
-        ? { ...existing, requestIds: [...new Set([...existing.requestIds, ...options.requestIds])] }
-        // A genuinely different policy authorizes the NEXT epoch, scoped to
-        // exactly what this authorization covers — a prior epoch's scope
-        // belongs to that prior epoch's identity, not this one.
-        : { number: existing.number + 1, policyHash: options.policyHash, startedAt: now, maxWallClockMs: options.maxWallClockMs, requestIds: freshRequestIds };
-    this.state = { ...this.state, recoveryEpoch: epoch, updatedAt: now };
-    this.event('RECOVERY_EPOCH_AUTHORIZED', `epoch ${epoch.number}`, {});
-    const reconsider = epoch.requestIds
+    const alreadyClaimed = new Set(epochs.flatMap((epoch) => epoch.requestIds));
+    const newlyScoped = [...new Set(options.requestIds)].filter((id) => !alreadyClaimed.has(id));
+
+    let updatedEpochs: readonly RecoveryEpochState[];
+    let activeNumber: number;
+    if (active !== undefined && active.policyHash === options.policyHash) {
+      // Same semantic policy still active: reuse this exact epoch identity
+      // (no clock reset, no extra budget) — only ever widen its tracked
+      // scope with newly-discovered, not-yet-claimed recovery-scoped requests.
+      const widened: RecoveryEpochState = { ...active, requestIds: [...active.requestIds, ...newlyScoped] };
+      updatedEpochs = epochs.map((epoch) => epoch.number === active.number ? widened : epoch);
+      activeNumber = active.number;
+    } else {
+      // A genuinely different policy authorizes the NEXT epoch — appended,
+      // never replacing or rewriting any prior epoch's own record — scoped
+      // to exactly the not-already-claimed work this authorization covers.
+      const nextNumber = epochs.length === 0 ? 1 : Math.max(...epochs.map((epoch) => epoch.number)) + 1;
+      const created: RecoveryEpochState = {
+        number: nextNumber, policyHash: options.policyHash, startedAt: now,
+        maxWallClockMs: options.maxWallClockMs, requestIds: newlyScoped,
+      };
+      updatedEpochs = [...epochs, created];
+      activeNumber = nextNumber;
+    }
+    this.state = { ...this.state, recoveryEpochs: updatedEpochs, activeRecoveryEpochNumber: activeNumber, updatedAt: now };
+    this.event('RECOVERY_EPOCH_AUTHORIZED', `epoch ${activeNumber}`, {});
+
+    const activeEpoch = updatedEpochs.find((epoch) => epoch.number === activeNumber)!;
+    const reconsider = activeEpoch.requestIds
       .map((id) => this.state.workRequests.find((request) => request.id === id))
       .filter((request): request is WorkRequest => request !== undefined)
       .filter((request) => this.terminalDecision(request.id) && this.latestDecision(request.id)?.reason === 'WALL_CLOCK_BUDGET_EXCEEDED');

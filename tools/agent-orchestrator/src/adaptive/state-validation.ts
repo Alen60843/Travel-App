@@ -244,25 +244,59 @@ function parseUnit(value: unknown, index: number): DynamicWorkUnit {
   };
 }
 
-function parseRecoveryEpoch(value: unknown, knownRequestIds: ReadonlySet<string>): RecoveryEpochState {
-  const input = object(value, 'recoveryEpoch');
-  strict(input, ['number', 'policyHash', 'startedAt', 'maxWallClockMs', 'requestIds'], 'recoveryEpoch');
-  const number = integer(input.number, 'recoveryEpoch.number');
-  if (number < 1) corrupt('recoveryEpoch.number must be at least 1');
-  const policyHash = hash(input.policyHash, 'recoveryEpoch.policyHash');
-  const startedAt = iso(input.startedAt, 'recoveryEpoch.startedAt');
-  const maxWallClockMs = integer(input.maxWallClockMs, 'recoveryEpoch.maxWallClockMs');
-  if (maxWallClockMs < 1) corrupt('recoveryEpoch.maxWallClockMs must be positive');
-  const requestIds = array(input.requestIds, 'recoveryEpoch.requestIds')
-    .map((id, index) => string(id, `recoveryEpoch.requestIds[${index}]`));
-  if (new Set(requestIds).size !== requestIds.length) corrupt('recoveryEpoch.requestIds must be unique');
-  if (requestIds.some((id) => !knownRequestIds.has(id))) corrupt('recoveryEpoch.requestIds references an unknown request');
+function parseRecoveryEpoch(value: unknown, knownRequestIds: ReadonlySet<string>, path: string): RecoveryEpochState {
+  const input = object(value, path);
+  strict(input, ['number', 'policyHash', 'startedAt', 'maxWallClockMs', 'requestIds'], path);
+  const number = integer(input.number, `${path}.number`);
+  if (number < 1) corrupt(`${path}.number must be at least 1`);
+  const policyHash = hash(input.policyHash, `${path}.policyHash`);
+  const startedAt = iso(input.startedAt, `${path}.startedAt`);
+  const maxWallClockMs = integer(input.maxWallClockMs, `${path}.maxWallClockMs`);
+  if (maxWallClockMs < 1) corrupt(`${path}.maxWallClockMs must be positive`);
+  const requestIds = array(input.requestIds, `${path}.requestIds`)
+    .map((id, index) => string(id, `${path}.requestIds[${index}]`));
+  if (new Set(requestIds).size !== requestIds.length) corrupt(`${path}.requestIds must be unique`);
+  if (requestIds.some((id) => !knownRequestIds.has(id))) corrupt(`${path}.requestIds references an unknown request`);
   return { number, policyHash, startedAt, maxWallClockMs, requestIds };
+}
+
+/**
+ * Accepts either the current append-only `recoveryEpochs` array (plus
+ * `activeRecoveryEpochNumber`) or the legacy single-`recoveryEpoch` shape a
+ * run persisted before multi-epoch history existed — normalizing the
+ * legacy shape into a one-entry array/active-number pair. Never both at
+ * once: that combination is never legitimately produced and is rejected as
+ * corrupt rather than guessed at.
+ */
+function parseRecoveryEpochHistory(
+  input: Record<string, unknown>,
+  knownRequestIds: ReadonlySet<string>,
+): { readonly recoveryEpochs?: readonly RecoveryEpochState[]; readonly activeRecoveryEpochNumber?: number } {
+  const hasLegacy = input.recoveryEpoch !== undefined;
+  const hasCurrent = input.recoveryEpochs !== undefined || input.activeRecoveryEpochNumber !== undefined;
+  if (hasLegacy && hasCurrent) {
+    corrupt('recoveryEpoch (legacy) must not coexist with recoveryEpochs/activeRecoveryEpochNumber');
+  }
+  if (hasLegacy) {
+    const legacyEpoch = parseRecoveryEpoch(input.recoveryEpoch, knownRequestIds, 'recoveryEpoch');
+    return { recoveryEpochs: [legacyEpoch], activeRecoveryEpochNumber: legacyEpoch.number };
+  }
+  if (!hasCurrent) return {};
+  const recoveryEpochs = array(input.recoveryEpochs, 'recoveryEpochs')
+    .map((entry, index) => parseRecoveryEpoch(entry, knownRequestIds, `recoveryEpochs[${index}]`));
+  recoveryEpochs.forEach((epoch, index) => {
+    if (epoch.number !== index + 1) corrupt('recoveryEpochs numbers must be contiguous, unique, and in append order starting at 1');
+  });
+  const activeRecoveryEpochNumber = integer(input.activeRecoveryEpochNumber, 'activeRecoveryEpochNumber');
+  if (!recoveryEpochs.some((epoch) => epoch.number === activeRecoveryEpochNumber)) {
+    corrupt('activeRecoveryEpochNumber references an unknown epoch');
+  }
+  return { recoveryEpochs, activeRecoveryEpochNumber };
 }
 
 export function parseAdaptiveRunState(value: unknown): AdaptiveRunState {
   const input = object(value, 'adaptive state');
-  strict(input, ['schemaVersion', 'goal', 'policy', 'startedAt', 'updatedAt', 'workRequests', 'grantDecisions', 'workUnits', 'events', 'totalAgentInvocations', 'grantedEstimatedCostUnits', 'continuation', 'recoveryEpoch'], 'adaptive state');
+  strict(input, ['schemaVersion', 'goal', 'policy', 'startedAt', 'updatedAt', 'workRequests', 'grantDecisions', 'workUnits', 'events', 'totalAgentInvocations', 'grantedEstimatedCostUnits', 'continuation', 'recoveryEpoch', 'recoveryEpochs', 'activeRecoveryEpochNumber'], 'adaptive state');
   if (input.schemaVersion !== 1) corrupt('schemaVersion must be 1');
   let policy;
   try { policy = parseAdaptivePolicy(input.policy); } catch (error) { corrupt(error instanceof Error ? error.message : String(error)); }
@@ -356,10 +390,17 @@ export function parseAdaptiveRunState(value: unknown): AdaptiveRunState {
     .filter((decision) => decision.outcome === 'GRANTED')
     .reduce((sum, decision) => sum + (workRequests.find((request) => request.id === decision.requestId)?.estimatedCostUnits ?? 0), 0);
   if (Math.abs(grantedEstimatedCostUnits - expectedCost) > Number.EPSILON * Math.max(1, expectedCost)) corrupt('estimated-cost counter does not equal granted request costs');
-  const recoveryEpoch = input.recoveryEpoch === undefined ? undefined : parseRecoveryEpoch(input.recoveryEpoch, requestIds);
-  if (grantDecisions.some((decision) => decision.recoveryEpochNumber !== undefined
-    && (recoveryEpoch === undefined || decision.recoveryEpochNumber !== recoveryEpoch.number || !recoveryEpoch.requestIds.includes(decision.requestId)))) {
-    corrupt('a grant decision references a recovery epoch that does not match the persisted epoch/scope');
+  const { recoveryEpochs, activeRecoveryEpochNumber } = parseRecoveryEpochHistory(input, requestIds);
+  // Historical provenance: a decision stamped with epoch N is validated
+  // against epoch N's OWN persisted record, wherever it sits in
+  // recoveryEpochs — never only against whichever epoch is currently
+  // active. A later epoch N+1 must never invalidate an N decision.
+  if (grantDecisions.some((decision) => {
+    if (decision.recoveryEpochNumber === undefined) return false;
+    const epoch = recoveryEpochs?.find((candidate) => candidate.number === decision.recoveryEpochNumber);
+    return epoch === undefined || !epoch.requestIds.includes(decision.requestId);
+  })) {
+    corrupt('a grant decision references a recovery epoch that does not match any persisted epoch/scope');
   }
   return {
     schemaVersion: 1, goal: string(input.goal, 'goal'), policy: policy!,
@@ -367,6 +408,6 @@ export function parseAdaptiveRunState(value: unknown): AdaptiveRunState {
     workRequests, grantDecisions, workUnits, events,
     totalAgentInvocations, grantedEstimatedCostUnits,
     ...(continuation === undefined ? {} : { continuation }),
-    ...(recoveryEpoch === undefined ? {} : { recoveryEpoch }),
+    ...(recoveryEpochs === undefined ? {} : { recoveryEpochs, activeRecoveryEpochNumber: activeRecoveryEpochNumber! }),
   };
 }

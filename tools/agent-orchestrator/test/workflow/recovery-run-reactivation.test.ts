@@ -352,7 +352,7 @@ test('idempotency: reactivation never fires twice and RUNNING is a no-op', async
 test('negative A: BLOCKED with no recovery epoch is never reactivated', async () => {
   const { fixture, runsRoot, runId, blocked, clock } = await setUpBlockedRun();
   try {
-    assert.equal(blocked.adaptive!.recoveryEpoch, undefined);
+    assert.equal(blocked.adaptive!.recoveryEpochs, undefined);
     const resumed = await AgentOrchestrator.resume(runId, { repositoryPath: fixture.repository, runsRoot, agents: freshAgents(), clock: clock.now });
     assert.equal(resumed.snapshot().status, 'BLOCKED');
   } finally {

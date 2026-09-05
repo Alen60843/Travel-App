@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 import type { Agent, AgentName, AgentRequest, AgentResult } from '../../src/agents';
+import type { GitClient } from '../../src/git';
 import { AgentOrchestrator } from '../../src/orchestrator';
 import type { RunState, TaskRunState } from '../../src/state';
 import { createTemporaryRepository } from '../git/helpers';
@@ -219,9 +220,15 @@ function latestDecisionFor(state: RunState, requestId: string) {
   return [...state.adaptive!.grantDecisions].reverse().find((d) => d.requestId === requestId);
 }
 
+function activeEpochOf(state: RunState) {
+  return state.adaptive!.recoveryEpochs?.find((epoch) => epoch.number === state.adaptive!.activeRecoveryEpochNumber);
+}
+
 async function markRecovered(
   orchestrator: AgentOrchestrator,
+  git: GitClient,
   taskId: string,
+  file: string,
   kind: 'salvage' | 'handoff_repair',
 ): Promise<void> {
   const before = await orchestrator.stateStore.load();
@@ -230,13 +237,19 @@ async function markRecovered(
   const { mkdir } = await import('node:fs/promises');
   await mkdir(join(orchestrator.stateStore.runDirectory, 'handoffs'), { recursive: true });
   await writeFile(handoffPath, JSON.stringify({
-    status: 'complete', summary: `recovered ${taskId}`, filesChanged: [taskId], decisions: [],
+    status: 'complete', summary: `recovered ${taskId}`, filesChanged: [file], decisions: [],
     tests: [], openQuestions: [], reviewRequested: [],
   }), 'utf8');
+  // A real commit — later steps (a targeted review's actual diff/worktree
+  // prep) need a real, resolvable SHA, not a synthetic placeholder.
+  await writeFile(join(task.worktreePath!, file), `corrected ${file}\n`, 'utf8');
+  await git.run(task.worktreePath!, ['add', '--', file]);
+  await git.run(task.worktreePath!, ['commit', '-m', `recovered ${taskId}`]);
+  const commitSha = (await git.run(task.worktreePath!, ['rev-parse', 'HEAD'])).stdout.trim();
   const recovered: TaskRunState = kind === 'salvage'
     ? {
         ...task, status: 'SUCCEEDED', handoffPath,
-        commit: { sha: '3'.repeat(40), parentSha: before.baseSha, changedFiles: [task.id] },
+        commit: { sha: commitSha, parentSha: before.baseSha, changedFiles: [file] },
         salvage: {
           authorizedAt: before.createdAt,
           verification: { worktreeHeadSha: before.baseSha, trackedDiffFingerprint: 'fp', verifyConfigFingerprint: 'cfg', result: 'passed' },
@@ -244,7 +257,7 @@ async function markRecovered(
       }
     : {
         ...task, status: 'SUCCEEDED', handoffPath,
-        commit: { sha: '4'.repeat(40), parentSha: before.baseSha, changedFiles: [task.id] },
+        commit: { sha: commitSha, parentSha: before.baseSha, changedFiles: [file] },
         handoffRepairAttempts: [
           ...task.handoffRepairAttempts,
           { method: 'agent', succeeded: true, timestamp: before.createdAt, repairExecutorId: 'metadata-repairer', repairAdapter: 'claude' },
@@ -282,8 +295,8 @@ test('real-dogfood-shaped acceptance: F001/F002 re-verification requests born WA
     const started = await AgentOrchestrator.resume(runId, {
       repositoryPath: fixture.repository, runsRoot, agents: { codex: new ReconciliationAgent('codex'), claude: new ReconciliationAgent('claude') }, clock: clock.now,
     });
-    await markRecovered(started, f001.taskId, 'salvage');
-    await markRecovered(started, f002.taskId, 'handoff_repair');
+    await markRecovered(started, fixture.git, f001.taskId, 'f001.txt', 'salvage');
+    await markRecovered(started, fixture.git, f002.taskId, 'f002.txt', 'handoff_repair');
 
     // A plain resume() reconciles the adaptive units (prior task's fix) and
     // materializes F001/F002 re-verification requests — but the original
@@ -356,8 +369,8 @@ test('crash/resume: the recovery epoch survives reconstruction with the exact sa
     const started = await AgentOrchestrator.resume(runId, {
       repositoryPath: fixture.repository, runsRoot, agents: { codex: new ReconciliationAgent('codex'), claude: new ReconciliationAgent('claude') }, clock: clock.now,
     });
-    await markRecovered(started, f001.taskId, 'salvage');
-    await markRecovered(started, f002.taskId, 'handoff_repair');
+    await markRecovered(started, fixture.git, f001.taskId, 'f001.txt', 'salvage');
+    await markRecovered(started, fixture.git, f002.taskId, 'f002.txt', 'handoff_repair');
     await AgentOrchestrator.resume(runId, {
       repositoryPath: fixture.repository, runsRoot, agents: { codex: new ReconciliationAgent('codex'), claude: new ReconciliationAgent('claude') }, clock: clock.now,
     });
@@ -365,7 +378,7 @@ test('crash/resume: the recovery epoch survives reconstruction with the exact sa
     const authorization = await AgentOrchestrator.authorizeRecoveryPolicy(runId, {
       recoveryBudget: { maxWallClockMs: 3_600_000 },
     }, { repositoryPath: fixture.repository, runsRoot, agents: { codex: new ReconciliationAgent('codex'), claude: new ReconciliationAgent('claude') }, clock: clock.now });
-    const epochBefore = authorization.orchestrator.snapshot().adaptive!.recoveryEpoch!;
+    const epochBefore = activeEpochOf(authorization.orchestrator.snapshot())!;
     assert.equal(epochBefore.number, 1);
 
     // Simulate a crash: advance the fake clock (real time keeps passing
@@ -374,7 +387,7 @@ test('crash/resume: the recovery epoch survives reconstruction with the exact sa
     const reconstructed = await AgentOrchestrator.resume(runId, {
       repositoryPath: fixture.repository, runsRoot, agents: { codex: new ReconciliationAgent('codex'), claude: new ReconciliationAgent('claude') }, clock: clock.now,
     });
-    const epochAfter = reconstructed.snapshot().adaptive!.recoveryEpoch!;
+    const epochAfter = activeEpochOf(reconstructed.snapshot())!;
     assert.equal(epochAfter.number, epochBefore.number, 'exact same epoch ID');
     assert.equal(epochAfter.startedAt, epochBefore.startedAt, 'exact same startedAt — elapsed time is computed from persisted state, not process uptime');
     assert.equal(
@@ -382,6 +395,131 @@ test('crash/resume: the recovery epoch survives reconstruction with the exact sa
       authorization.orchestrator.snapshot().adaptive!.events.filter((e) => e.type === 'RECOVERY_EPOCH_AUTHORIZED').length,
       'no second authorization event from merely resuming',
     );
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+// --- §10: multi-epoch real shape regression ---
+
+test('multi-epoch: a genuinely new policy (integrationRecovery added) creates Epoch 2 without invalidating Epoch 1\'s completed F001/F002 review decisions', async () => {
+  const { fixture, runsRoot, runId, completed, clock } = await setUp();
+  try {
+    const f001 = findByFile(completed, 'f001.txt');
+    const f002 = findByFile(completed, 'f002.txt');
+    clock.advance(20_000);
+    const started = await AgentOrchestrator.resume(runId, {
+      repositoryPath: fixture.repository, runsRoot, agents: { codex: new ReconciliationAgent('codex'), claude: new ReconciliationAgent('claude') }, clock: clock.now,
+    });
+    await markRecovered(started, fixture.git, f001.taskId, 'f001.txt', 'salvage');
+    await markRecovered(started, fixture.git, f002.taskId, 'f002.txt', 'handoff_repair');
+    await AgentOrchestrator.resume(runId, {
+      repositoryPath: fixture.repository, runsRoot, agents: { codex: new ReconciliationAgent('codex'), claude: new ReconciliationAgent('claude') }, clock: clock.now,
+    });
+
+    // Epoch 1: recoveryBudget only — grants F001/F002's targeted reviews.
+    await AgentOrchestrator.authorizeRecoveryPolicy(runId, {
+      recoveryBudget: { maxWallClockMs: 3_600_000 },
+    }, { repositoryPath: fixture.repository, runsRoot, agents: { codex: new ReconciliationAgent('codex'), claude: new ReconciliationAgent('claude') }, clock: clock.now });
+
+    // Run the two granted targeted reviews all the way to SUCCEEDED.
+    let runningOrchestrator = await AgentOrchestrator.resume(runId, {
+      repositoryPath: fixture.repository, runsRoot, agents: { codex: new ReconciliationAgent('codex'), claude: new ReconciliationAgent('claude') }, clock: clock.now,
+    });
+    await runningOrchestrator.stateStore.save({ ...(await runningOrchestrator.stateStore.load()), status: 'RUNNING' });
+    runningOrchestrator = await AgentOrchestrator.resume(runId, {
+      repositoryPath: fixture.repository, runsRoot, agents: { codex: new ReconciliationAgent('codex'), claude: new ReconciliationAgent('claude') }, clock: clock.now,
+    });
+    const finished = await runningOrchestrator.execute();
+    assert.equal(finished.status, 'COMPLETED', JSON.stringify(finished.errors));
+
+    const epoch1Before = activeEpochOf(finished)!;
+    assert.equal(epoch1Before.number, 1);
+    const f001Request = finished.adaptive!.workRequests.find((r) => r.id === finished.adaptive!.workUnits.find((u) => u.id === f001.unitId)!.requestId)!;
+    const f002Request = finished.adaptive!.workRequests.find((r) => r.id === finished.adaptive!.workUnits.find((u) => u.id === f002.unitId)!.requestId)!;
+    const f001Reverification = reverificationRequest(finished, f001Request.authorization!.canonicalFindingKey)!;
+    const f002Reverification = reverificationRequest(finished, f002Request.authorization!.canonicalFindingKey)!;
+    const f001DecisionsBefore = finished.adaptive!.grantDecisions.filter((d) => d.requestId === f001Reverification.id);
+    const f002DecisionsBefore = finished.adaptive!.grantDecisions.filter((d) => d.requestId === f002Reverification.id);
+    assert.equal(f001DecisionsBefore.length, 2);
+    assert.equal(f001DecisionsBefore[1]?.recoveryEpochNumber, 1);
+    const f001UnitBefore = structuredClone(finished.adaptive!.workUnits.find((u) => u.requestId === f001Reverification.id));
+    const f002UnitBefore = structuredClone(finished.adaptive!.workUnits.find((u) => u.requestId === f002Reverification.id));
+    const workUnitCountBefore = finished.adaptive!.workUnits.length;
+    const workRequestCountBefore = finished.adaptive!.workRequests.length;
+
+    // Epoch 2: a genuinely different policy (integrationRecovery added) —
+    // the semantic hash changes even though recoveryBudget itself did not.
+    const secondAuthorization = await AgentOrchestrator.authorizeRecoveryPolicy(runId, {
+      recoveryBudget: { maxWallClockMs: 3_600_000 },
+      integrationRecovery: { prepare: ['pnpm install --frozen-lockfile', 'pnpm --filter @tripwith/shared build'] },
+    }, { repositoryPath: fixture.repository, runsRoot, agents: { codex: new ReconciliationAgent('codex'), claude: new ReconciliationAgent('claude') }, clock: clock.now });
+
+    const after = secondAuthorization.orchestrator.snapshot();
+    const epoch1After = after.adaptive!.recoveryEpochs!.find((e) => e.number === 1)!;
+    const epoch2After = after.adaptive!.recoveryEpochs!.find((e) => e.number === 2)!;
+    assert.deepEqual(epoch1After, epoch1Before, 'Epoch 1 remains persisted unchanged');
+    assert.ok(epoch2After !== undefined, 'Epoch 2 is appended');
+    assert.equal(after.adaptive!.activeRecoveryEpochNumber, 2, 'active epoch becomes 2');
+    assert.equal(after.adaptive!.recoveryEpochs!.length, 2);
+
+    // No STATE_CORRUPT on reload — Epoch 1's GrantDecisions remain valid.
+    const reloaded = await AgentOrchestrator.resume(runId, {
+      repositoryPath: fixture.repository, runsRoot, agents: { codex: new ReconciliationAgent('codex'), claude: new ReconciliationAgent('claude') }, clock: clock.now,
+    });
+    const reloadedState = reloaded.snapshot();
+    assert.deepEqual(reloadedState.adaptive!.grantDecisions.filter((d) => d.requestId === f001Reverification.id), f001DecisionsBefore, 'F001 decisions unchanged, no duplicate');
+    assert.deepEqual(reloadedState.adaptive!.grantDecisions.filter((d) => d.requestId === f002Reverification.id), f002DecisionsBefore, 'F002 decisions unchanged, no duplicate');
+    assert.deepEqual(reloadedState.adaptive!.workUnits.find((u) => u.requestId === f001Reverification.id), f001UnitBefore, 'no duplicate/re-executed F001 review unit');
+    assert.deepEqual(reloadedState.adaptive!.workUnits.find((u) => u.requestId === f002Reverification.id), f002UnitBefore, 'no duplicate/re-executed F002 review unit');
+    assert.equal(reloadedState.adaptive!.workUnits.length, workUnitCountBefore, 'no new work units created merely by authorizing Epoch 2');
+    assert.equal(reloadedState.adaptive!.workRequests.length, workRequestCountBefore, 'no new work requests created merely by authorizing Epoch 2');
+    // Epoch 2 has no adaptive scope of its own — integrationRecovery never
+    // touches adaptive WorkRequests/GrantDecisions at all.
+    assert.deepEqual(epoch2After.requestIds, []);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test('crash/resume with two epochs: both survive exactly, active epoch remains 2, no duplicate re-arbitration', async () => {
+  const { fixture, runsRoot, runId, completed, clock } = await setUp();
+  try {
+    const f001 = findByFile(completed, 'f001.txt');
+    const f002 = findByFile(completed, 'f002.txt');
+    clock.advance(20_000);
+    const started = await AgentOrchestrator.resume(runId, {
+      repositoryPath: fixture.repository, runsRoot, agents: { codex: new ReconciliationAgent('codex'), claude: new ReconciliationAgent('claude') }, clock: clock.now,
+    });
+    await markRecovered(started, fixture.git, f001.taskId, 'f001.txt', 'salvage');
+    await markRecovered(started, fixture.git, f002.taskId, 'f002.txt', 'handoff_repair');
+    await AgentOrchestrator.resume(runId, {
+      repositoryPath: fixture.repository, runsRoot, agents: { codex: new ReconciliationAgent('codex'), claude: new ReconciliationAgent('claude') }, clock: clock.now,
+    });
+    await AgentOrchestrator.authorizeRecoveryPolicy(runId, {
+      recoveryBudget: { maxWallClockMs: 3_600_000 },
+    }, { repositoryPath: fixture.repository, runsRoot, agents: { codex: new ReconciliationAgent('codex'), claude: new ReconciliationAgent('claude') }, clock: clock.now });
+    const secondAuthorization = await AgentOrchestrator.authorizeRecoveryPolicy(runId, {
+      recoveryBudget: { maxWallClockMs: 3_600_000 },
+      integrationRecovery: { prepare: ['pnpm install --frozen-lockfile', 'pnpm --filter @tripwith/shared build'] },
+    }, { repositoryPath: fixture.repository, runsRoot, agents: { codex: new ReconciliationAgent('codex'), claude: new ReconciliationAgent('claude') }, clock: clock.now });
+    const before = secondAuthorization.orchestrator.snapshot();
+    assert.equal(before.adaptive!.recoveryEpochs!.length, 2);
+    assert.equal(before.adaptive!.activeRecoveryEpochNumber, 2);
+
+    clock.advance(60_000);
+    const reconstructed = await AgentOrchestrator.resume(runId, {
+      repositoryPath: fixture.repository, runsRoot, agents: { codex: new ReconciliationAgent('codex'), claude: new ReconciliationAgent('claude') }, clock: clock.now,
+    });
+    const after = reconstructed.snapshot();
+    assert.deepEqual(after.adaptive!.recoveryEpochs, before.adaptive!.recoveryEpochs, 'both epochs survive exactly');
+    assert.equal(after.adaptive!.activeRecoveryEpochNumber, 2, 'active epoch remains 2');
+    assert.equal(
+      after.adaptive!.events.filter((e) => e.type === 'RECOVERY_EPOCH_AUTHORIZED').length,
+      before.adaptive!.events.filter((e) => e.type === 'RECOVERY_EPOCH_AUTHORIZED').length,
+      'no epoch recreated, no policy reauthorization',
+    );
+    assert.equal(after.adaptive!.grantDecisions.length, before.adaptive!.grantDecisions.length, 'no duplicate re-arbitration');
   } finally {
     await fixture.dispose();
   }

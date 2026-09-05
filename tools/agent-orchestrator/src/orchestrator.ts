@@ -1703,7 +1703,7 @@ export class AgentOrchestrator {
   private async reactivateBlockedRunAfterRecoveryEpoch(): Promise<void> {
     if (this.state.status !== 'BLOCKED') return;
     if (this.state.strategy !== 'adaptive' || this.state.adaptive === undefined) return;
-    if (this.state.adaptive.recoveryEpoch === undefined) return;
+    if (this.state.adaptive.recoveryEpochs === undefined || this.state.adaptive.recoveryEpochs.length === 0) return;
     // Integration failures/conflicts and task-level human-review blocks are
     // never this mechanism's concern, whatever the adaptive layer now says.
     if (this.state.integration.status === 'BLOCKED') return;
@@ -1725,7 +1725,7 @@ export class AgentOrchestrator {
     if (supersededRequestIds.length === 0) return;
     await this.mutate((current) => ({ ...current, status: 'RUNNING' }));
     await this.event('RUN_RECOVERY_REACTIVATED', undefined, {
-      recoveryEpochNumber: this.state.adaptive.recoveryEpoch.number,
+      recoveryEpochNumber: this.state.adaptive.activeRecoveryEpochNumber,
       supersededRequestIds,
     });
   }
