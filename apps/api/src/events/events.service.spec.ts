@@ -172,6 +172,12 @@ describe('EventsService', () => {
     await expect(
       service.updateEvent(OTHER_USER_ID, EVENT_ID, { title: 'Attacker edit' }),
     ).rejects.toBeInstanceOf(EventNotFoundError);
+    await expect(
+      service.publishEvent(OTHER_USER_ID, EVENT_ID),
+    ).rejects.toBeInstanceOf(EventNotFoundError);
+    await expect(
+      service.cancelEvent(OTHER_USER_ID, EVENT_ID),
+    ).rejects.toBeInstanceOf(EventNotFoundError);
   });
 
   it('updates mutable DRAFT fields while rejecting empty, protected, and published patches', async () => {
