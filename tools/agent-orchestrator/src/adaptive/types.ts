@@ -153,6 +153,7 @@ export const GRANT_REASONS = [
   'DUPLICATE_REQUEST',
   'ALREADY_SATISFIED',
   'HUMAN_APPROVAL_REQUIRED',
+  'RECOVERY_WALL_CLOCK_BUDGET_EXCEEDED',
 ] as const;
 
 export type GrantReason = (typeof GRANT_REASONS)[number];
@@ -166,6 +167,28 @@ export interface GrantDecision {
   readonly effectivePriority: number;
   readonly decidedAt: string;
   readonly sequence: number;
+  /** Present only when `requestId` is bound to an active RecoveryEpochState at decision time — see AdaptiveRunState.recoveryEpoch. */
+  readonly recoveryEpochNumber?: number;
+}
+
+/**
+ * An operator-authorized, explicitly bounded wall-clock budget for work
+ * causally associated with an explicitly recovered task/canonical finding
+ * (never inferred from request IDs or names — requestIds is populated once,
+ * at authorization time, from real recovery provenance). The original run's
+ * own startedAt/policy.limits.maxWallClockMs are never modified; this is an
+ * entirely separate, independently-measured clock that only the listed
+ * requests may use. Epoch identity is bound to policyHash: re-authorizing
+ * the same normalized recovery policy reuses this exact epoch (no clock
+ * reset, no extra budget); a genuinely different policy hash creates the
+ * next epoch (number + 1) with a fresh startedAt.
+ */
+export interface RecoveryEpochState {
+  readonly number: number;
+  readonly policyHash: string;
+  readonly startedAt: string;
+  readonly maxWallClockMs: number;
+  readonly requestIds: readonly string[];
 }
 
 export interface WorkAttempt {
@@ -242,6 +265,7 @@ export const ADAPTIVE_EVENT_TYPES = [
   'CORRECTION_REQUEST_CREATED',
   'CORRECTION_GRANTED',
   'REVERIFICATION_CREATED',
+  'RECOVERY_EPOCH_AUTHORIZED',
 ] as const;
 export type AdaptiveEventType = (typeof ADAPTIVE_EVENT_TYPES)[number];
 
@@ -269,6 +293,8 @@ export interface AdaptiveRunState {
   readonly grantedEstimatedCostUnits: number;
   /** Immutable evidence copied into this run before any continuation agent launches. */
   readonly continuation?: AdaptiveContinuationState;
+  /** See RecoveryEpochState. Absent until an operator explicitly authorizes a recovery-budget overlay. */
+  readonly recoveryEpoch?: RecoveryEpochState;
 }
 
 export interface CapabilityAvailability {

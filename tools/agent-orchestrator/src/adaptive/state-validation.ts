@@ -5,6 +5,7 @@ import type {
   AdaptiveRunState,
   DynamicWorkUnit,
   GrantDecision,
+  RecoveryEpochState,
   WorkRequest,
 } from './types';
 import { ADAPTIVE_EVENT_TYPES, GRANT_REASONS } from './types';
@@ -183,15 +184,17 @@ function parseRequest(value: unknown, index: number): WorkRequest {
 
 function parseDecision(value: unknown, index: number): GrantDecision {
   const input = object(value, `grantDecisions[${index}]`);
-  strict(input, ['id', 'requestId', 'outcome', 'reason', 'detail', 'effectivePriority', 'decidedAt', 'sequence'], `grantDecisions[${index}]`);
+  strict(input, ['id', 'requestId', 'outcome', 'reason', 'detail', 'effectivePriority', 'decidedAt', 'sequence', 'recoveryEpochNumber'], `grantDecisions[${index}]`);
   const outcome = string(input.outcome, 'decision outcome');
   const reason = string(input.reason, 'decision reason');
   if (!['GRANTED', 'WAITING', 'DENIED'].includes(outcome)) corrupt('decision outcome is invalid');
   if (!GRANT_REASONS.includes(reason as never)) corrupt('decision reason is invalid');
+  const recoveryEpochNumber = input.recoveryEpochNumber === undefined ? undefined : integer(input.recoveryEpochNumber, 'decision recoveryEpochNumber');
   return {
     id: string(input.id, 'decision id'), requestId: string(input.requestId, 'decision requestId'),
     outcome: outcome as GrantDecision['outcome'], reason: reason as GrantDecision['reason'], detail: string(input.detail, 'decision detail'),
     effectivePriority: integer(input.effectivePriority, 'decision effectivePriority'), decidedAt: iso(input.decidedAt, 'decision decidedAt'), sequence: integer(input.sequence, 'decision sequence'),
+    ...(recoveryEpochNumber === undefined ? {} : { recoveryEpochNumber }),
   };
 }
 
@@ -241,9 +244,25 @@ function parseUnit(value: unknown, index: number): DynamicWorkUnit {
   };
 }
 
+function parseRecoveryEpoch(value: unknown, knownRequestIds: ReadonlySet<string>): RecoveryEpochState {
+  const input = object(value, 'recoveryEpoch');
+  strict(input, ['number', 'policyHash', 'startedAt', 'maxWallClockMs', 'requestIds'], 'recoveryEpoch');
+  const number = integer(input.number, 'recoveryEpoch.number');
+  if (number < 1) corrupt('recoveryEpoch.number must be at least 1');
+  const policyHash = hash(input.policyHash, 'recoveryEpoch.policyHash');
+  const startedAt = iso(input.startedAt, 'recoveryEpoch.startedAt');
+  const maxWallClockMs = integer(input.maxWallClockMs, 'recoveryEpoch.maxWallClockMs');
+  if (maxWallClockMs < 1) corrupt('recoveryEpoch.maxWallClockMs must be positive');
+  const requestIds = array(input.requestIds, 'recoveryEpoch.requestIds')
+    .map((id, index) => string(id, `recoveryEpoch.requestIds[${index}]`));
+  if (new Set(requestIds).size !== requestIds.length) corrupt('recoveryEpoch.requestIds must be unique');
+  if (requestIds.some((id) => !knownRequestIds.has(id))) corrupt('recoveryEpoch.requestIds references an unknown request');
+  return { number, policyHash, startedAt, maxWallClockMs, requestIds };
+}
+
 export function parseAdaptiveRunState(value: unknown): AdaptiveRunState {
   const input = object(value, 'adaptive state');
-  strict(input, ['schemaVersion', 'goal', 'policy', 'startedAt', 'updatedAt', 'workRequests', 'grantDecisions', 'workUnits', 'events', 'totalAgentInvocations', 'grantedEstimatedCostUnits', 'continuation'], 'adaptive state');
+  strict(input, ['schemaVersion', 'goal', 'policy', 'startedAt', 'updatedAt', 'workRequests', 'grantDecisions', 'workUnits', 'events', 'totalAgentInvocations', 'grantedEstimatedCostUnits', 'continuation', 'recoveryEpoch'], 'adaptive state');
   if (input.schemaVersion !== 1) corrupt('schemaVersion must be 1');
   let policy;
   try { policy = parseAdaptivePolicy(input.policy); } catch (error) { corrupt(error instanceof Error ? error.message : String(error)); }
@@ -337,11 +356,17 @@ export function parseAdaptiveRunState(value: unknown): AdaptiveRunState {
     .filter((decision) => decision.outcome === 'GRANTED')
     .reduce((sum, decision) => sum + (workRequests.find((request) => request.id === decision.requestId)?.estimatedCostUnits ?? 0), 0);
   if (Math.abs(grantedEstimatedCostUnits - expectedCost) > Number.EPSILON * Math.max(1, expectedCost)) corrupt('estimated-cost counter does not equal granted request costs');
+  const recoveryEpoch = input.recoveryEpoch === undefined ? undefined : parseRecoveryEpoch(input.recoveryEpoch, requestIds);
+  if (grantDecisions.some((decision) => decision.recoveryEpochNumber !== undefined
+    && (recoveryEpoch === undefined || decision.recoveryEpochNumber !== recoveryEpoch.number || !recoveryEpoch.requestIds.includes(decision.requestId)))) {
+    corrupt('a grant decision references a recovery epoch that does not match the persisted epoch/scope');
+  }
   return {
     schemaVersion: 1, goal: string(input.goal, 'goal'), policy: policy!,
     startedAt: iso(input.startedAt, 'startedAt'), updatedAt: iso(input.updatedAt, 'updatedAt'),
     workRequests, grantDecisions, workUnits, events,
     totalAgentInvocations, grantedEstimatedCostUnits,
     ...(continuation === undefined ? {} : { continuation }),
+    ...(recoveryEpoch === undefined ? {} : { recoveryEpoch }),
   };
 }

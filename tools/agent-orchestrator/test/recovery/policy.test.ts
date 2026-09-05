@@ -195,3 +195,79 @@ test('handoffRepair.additionalAttempts hashes identically regardless of surround
   });
   assert.equal(hashRecoveryPolicy(a), hashRecoveryPolicy(b));
 });
+
+// --- recoveryBudget.maxWallClockMs (recovery execution budget epoch) ---
+
+test('recoveryBudget.maxWallClockMs parses successfully', () => {
+  const overlay = parseRecoveryPolicyOverlay({ recoveryBudget: { maxWallClockMs: 3_600_000 } });
+  assert.deepEqual(overlay.recoveryBudget, { maxWallClockMs: 3_600_000 });
+});
+
+test('a zero recoveryBudget.maxWallClockMs is rejected (must be strictly positive)', () => {
+  assert.throws(
+    () => parseRecoveryPolicyOverlay({ recoveryBudget: { maxWallClockMs: 0 } }),
+    (error: unknown) => isOrchestratorError(error, 'CONFIG_INVALID'),
+  );
+});
+
+test('a negative recoveryBudget.maxWallClockMs is rejected', () => {
+  assert.throws(
+    () => parseRecoveryPolicyOverlay({ recoveryBudget: { maxWallClockMs: -1 } }),
+    (error: unknown) => isOrchestratorError(error, 'CONFIG_INVALID'),
+  );
+});
+
+test('a non-integer (floating point) recoveryBudget.maxWallClockMs is rejected', () => {
+  assert.throws(
+    () => parseRecoveryPolicyOverlay({ recoveryBudget: { maxWallClockMs: 1.5 } }),
+    (error: unknown) => isOrchestratorError(error, 'CONFIG_INVALID'),
+  );
+});
+
+test('a NaN recoveryBudget.maxWallClockMs is rejected', () => {
+  assert.throws(
+    () => parseRecoveryPolicyOverlay({ recoveryBudget: { maxWallClockMs: Number.NaN } }),
+    (error: unknown) => isOrchestratorError(error, 'CONFIG_INVALID'),
+  );
+});
+
+test('an unreasonably large recoveryBudget.maxWallClockMs is rejected (bounded maximum)', () => {
+  assert.throws(
+    () => parseRecoveryPolicyOverlay({ recoveryBudget: { maxWallClockMs: 365 * 24 * 60 * 60 * 1000 } }),
+    (error: unknown) => isOrchestratorError(error, 'CONFIG_INVALID'),
+  );
+});
+
+test('an unknown recoveryBudget key is rejected', () => {
+  assert.throws(
+    () => parseRecoveryPolicyOverlay({ recoveryBudget: { maxWallClockMs: 3_600_000, resetOriginalBudget: true } }),
+    (error: unknown) => isOrchestratorError(error, 'CONFIG_INVALID'),
+  );
+});
+
+test('recoveryBudget.maxWallClockMs participates in the semantic policy hash', () => {
+  const a = parseRecoveryPolicyOverlay({ recoveryBudget: { maxWallClockMs: 3_600_000 } });
+  const b = parseRecoveryPolicyOverlay({ recoveryBudget: { maxWallClockMs: 7_200_000 } });
+  const withoutOverlay = parseRecoveryPolicyOverlay({});
+  assert.notEqual(hashRecoveryPolicy(a), hashRecoveryPolicy(b));
+  assert.notEqual(hashRecoveryPolicy(a), hashRecoveryPolicy(withoutOverlay));
+});
+
+test('recoveryBudget.maxWallClockMs hashes identically regardless of surrounding key order/formatting', () => {
+  const a = parseRecoveryPolicyOverlay({
+    salvage: { verify: [] },
+    recoveryBudget: { maxWallClockMs: 3_600_000 },
+    handoffRepair: { additionalAttempts: 1 },
+  });
+  const b = parseRecoveryPolicyOverlay({
+    handoffRepair: { additionalAttempts: 1 },
+    recoveryBudget: { maxWallClockMs: 3_600_000 },
+    salvage: { verify: [] },
+  });
+  assert.equal(hashRecoveryPolicy(a), hashRecoveryPolicy(b));
+});
+
+test('no recoveryBudget field preserves current behavior (absent, not defaulted)', () => {
+  const overlay = parseRecoveryPolicyOverlay({ handoffRepair: { additionalAttempts: 1 } });
+  assert.equal(overlay.recoveryBudget, undefined);
+});

@@ -56,13 +56,15 @@ export interface RecoveryPolicyOverlay {
   readonly salvage?: { readonly verify: readonly IntegrationCommand[] };
   readonly executors?: readonly RecoveryExecutorConfig[];
   readonly handoffRepair?: { readonly additionalAttempts: number };
+  readonly recoveryBudget?: { readonly maxWallClockMs: number };
 }
 
-const TOP_LEVEL_KEYS = new Set(['salvage', 'executors', 'handoffRepair']);
+const TOP_LEVEL_KEYS = new Set(['salvage', 'executors', 'handoffRepair', 'recoveryBudget']);
 const SALVAGE_KEYS = new Set(['verify']);
 const EXECUTOR_KEYS = new Set(['id', 'adapter', 'roles', 'capabilities', 'model', 'available']);
 const CAPABILITY_KEYS = new Set(['capability', 'minimumLevel']);
 const HANDOFF_REPAIR_KEYS = new Set(['additionalAttempts']);
+const RECOVERY_BUDGET_KEYS = new Set(['maxWallClockMs']);
 
 /**
  * Bounded well above any realistic authorized extension — this is an
@@ -71,6 +73,9 @@ const HANDOFF_REPAIR_KEYS = new Set(['additionalAttempts']);
  * not to express a real operational ceiling.
  */
 const MAX_ADDITIONAL_HANDOFF_REPAIR_ATTEMPTS = 100;
+
+/** 30 days — rejects an obvious config mistake (a stray extra digit), not a real operational ceiling on a legitimate long recovery window. */
+const MAX_RECOVERY_WALL_CLOCK_MS = 30 * 24 * 60 * 60 * 1000;
 
 function assertKnownKeys(value: Record<string, unknown>, allowed: ReadonlySet<string>, path: string): void {
   for (const key of Object.keys(value)) {
@@ -156,10 +161,23 @@ export function parseRecoveryPolicyOverlay(value: unknown): RecoveryPolicyOverla
     );
     handoffRepair = { additionalAttempts };
   }
+  let recoveryBudget: { readonly maxWallClockMs: number } | undefined;
+  if (value.recoveryBudget !== undefined) {
+    if (!isRecord(value.recoveryBudget)) invalid('recoveryBudget', 'must be an object');
+    assertKnownKeys(value.recoveryBudget, RECOVERY_BUDGET_KEYS, 'recoveryBudget');
+    const maxWallClockMs = boundedInteger(
+      value.recoveryBudget.maxWallClockMs,
+      'recoveryBudget.maxWallClockMs',
+      1,
+      MAX_RECOVERY_WALL_CLOCK_MS,
+    );
+    recoveryBudget = { maxWallClockMs };
+  }
   return {
     ...(salvage === undefined ? {} : { salvage }),
     ...(executors === undefined ? {} : { executors }),
     ...(handoffRepair === undefined ? {} : { handoffRepair }),
+    ...(recoveryBudget === undefined ? {} : { recoveryBudget }),
   };
 }
 

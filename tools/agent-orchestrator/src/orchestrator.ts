@@ -752,6 +752,9 @@ export class AgentOrchestrator {
       recoveryPolicyHistory: [...(state.recoveryPolicyHistory ?? []), snapshot],
     }));
     await orchestrator.event('RECOVERY_POLICY_AUTHORIZED', undefined, { policyHash });
+    if (policy.recoveryBudget !== undefined) {
+      await orchestrator.authorizeRecoveryEpoch(policyHash, policy.recoveryBudget.maxWallClockMs);
+    }
     return { orchestrator, policyHash };
   }
 
@@ -1475,6 +1478,7 @@ export class AgentOrchestrator {
       CORRECTION_GRANTED: 'ADAPTIVE_CORRECTION_GRANTED',
       REVERIFICATION_CREATED: 'ADAPTIVE_REVERIFICATION_CREATED',
       WORK_UNIT_RECOVERED: 'ADAPTIVE_WORK_UNIT_RECOVERED',
+      RECOVERY_EPOCH_AUTHORIZED: 'ADAPTIVE_RECOVERY_EPOCH_AUTHORIZED',
     };
     for (const entry of entries) {
       let name = names[entry.type];
@@ -1602,6 +1606,57 @@ export class AgentOrchestrator {
       if (kind === undefined) continue;
       await this.completeRecoveredAdaptiveTask(unit.id, kind);
     }
+  }
+
+  /**
+   * The exact, narrow recovery scope this feature is allowed to touch:
+   * targeted reverification requests (`authorization.purpose ===
+   * 'reverification'`) whose source correction (`authorization.
+   * sourceWorkUnitId`) is a task with real persisted recovery evidence
+   * (recoveryEvidenceKind — the same handoff-repair/salvage proof
+   * completeRecoveredAdaptiveTask requires). Never inferred from request
+   * IDs or finding names — this is the actual causal provenance chain: a
+   * reverification exists ONLY because reconcileAdaptiveCorrectionFlow saw
+   * its correction unit reach SUCCEEDED, and that correction can only have
+   * reached SUCCEEDED while still WALL_CLOCK-denied-adjacent (i.e. after
+   * the original run's own budget was already exhausted) via an explicitly
+   * authorized recovery.
+   */
+  private recoveryScopedReverificationRequestIds(): readonly string[] {
+    if (this.state.adaptive === undefined) return [];
+    return this.state.adaptive.workRequests
+      .filter((request) => request.authorization?.purpose === 'reverification')
+      .filter((request) => recoveryEvidenceKind(this.state.tasks[request.authorization!.sourceWorkUnitId]) !== undefined)
+      .map((request) => request.id);
+  }
+
+  /**
+   * §5/§6/§13/§14: binds (or reuses) the operator-authorized recovery
+   * execution budget epoch and performs the one bounded re-arbitration pass
+   * for whatever recovery-scoped requests are still stuck in
+   * DENIED/WALL_CLOCK_BUDGET_EXCEEDED. The original run's own
+   * startedAt/policy.limits.maxWallClockMs, and every other limit
+   * (maxAgentInvocations, maxTotalWorkUnits, maxConcurrentAgents,
+   * maxDecompositionDepth, maxFanOutPerWorkUnit, maxSynthesisInputs,
+   * maxEstimatedCostUnits), are completely untouched — see
+   * AdaptiveCoordinator.authorizeRecoveryEpoch for the actual state
+   * transition and its idempotency semantics (same policyHash reuses the
+   * same epoch identity/clock; a different one starts the next epoch).
+   */
+  private async authorizeRecoveryEpoch(policyHash: string, maxWallClockMs: number): Promise<void> {
+    if (this.state.adaptive === undefined) return;
+    const requestIds = this.recoveryScopedReverificationRequestIds();
+    let emitted: readonly AdaptiveEvent[] = [];
+    await this.mutate((current) => {
+      const coordinator = this.adaptiveCoordinator(current);
+      const previousEvents = current.adaptive!.events.length;
+      coordinator.authorizeRecoveryEpoch({ policyHash, maxWallClockMs, requestIds });
+      const adaptive = coordinator.snapshot();
+      emitted = adaptive.events.slice(previousEvents);
+      return { ...current, adaptive };
+    });
+    await this.emitAdaptiveEvents(emitted);
+    await this.advanceAdaptiveScheduling();
   }
 
   private async authorizeAdaptiveRetry(

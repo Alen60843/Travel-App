@@ -14,6 +14,7 @@ import type {
   WorkRequestDraft,
   DynamicWorkUnit,
   CanonicalFindingAuthorization,
+  RecoveryEpochState,
 } from './types';
 import { parseAdaptivePolicy, parseWorkRequestDraft } from './validation';
 import { parseAdaptiveRunState } from './state-validation';
@@ -245,6 +246,9 @@ export class AdaptiveCoordinator {
   private decide(request: WorkRequest, outcome: GrantDecision['outcome'], reason: GrantReason, detail: string): GrantDecision {
     const previous = this.latestDecision(request.id);
     if (previous?.outcome === outcome && previous.reason === reason && outcome === 'WAITING') return previous;
+    const recoveryEpochNumber = this.state.recoveryEpoch?.requestIds.includes(request.id) === true
+      ? this.state.recoveryEpoch.number
+      : undefined;
     const decision: GrantDecision = {
       id: nextId('decision', this.state.grantDecisions.length),
       requestId: request.id,
@@ -254,6 +258,7 @@ export class AdaptiveCoordinator {
       effectivePriority: this.effectivePriority(request),
       decidedAt: iso(this.clock),
       sequence: this.state.grantDecisions.length + 1,
+      ...(recoveryEpochNumber === undefined ? {} : { recoveryEpochNumber }),
     };
     this.state = { ...this.state, grantDecisions: [...this.state.grantDecisions, decision], updatedAt: decision.decidedAt };
     this.event('GRANT_DECIDED', `${outcome}: ${reason} — ${detail}`, { requestId: request.id, decisionId: decision.id });
@@ -344,7 +349,22 @@ export class AdaptiveCoordinator {
     if (capability.status === 'TEMPORARILY_UNAVAILABLE') return { outcome: 'WAITING', reason: 'PROVIDER_TEMPORARILY_UNAVAILABLE', detail: capability.detail ?? 'capable executors are temporarily unavailable' };
     if (this.state.workUnits.length >= policy.limits.maxTotalWorkUnits && this.existingUnit(request.id) === undefined) return { outcome: 'DENIED', reason: 'MAX_TOTAL_WORK_UNITS', detail: 'work-unit budget exhausted' };
     if (this.state.totalAgentInvocations >= policy.limits.maxAgentInvocations) return { outcome: 'DENIED', reason: 'MAX_AGENT_INVOCATIONS', detail: 'agent-invocation budget exhausted' };
-    if (this.clock.now().getTime() - Date.parse(this.state.startedAt) > policy.limits.maxWallClockMs) return { outcome: 'DENIED', reason: 'WALL_CLOCK_BUDGET_EXCEEDED', detail: 'run wall-clock budget exhausted' };
+    // A request bound to an authorized recovery epoch (see
+    // authorizeRecoveryEpoch) is measured against that epoch's own
+    // independently-tracked start/budget instead of the original run's —
+    // the original wall-clock rule/history is never touched for any other
+    // request, and this request itself keeps using the epoch clock on
+    // every future arbitration pass, not just the one that admitted it.
+    const recoveryEpoch = this.state.recoveryEpoch?.requestIds.includes(request.id) === true
+      ? this.state.recoveryEpoch
+      : undefined;
+    const wallClockStartedAt = recoveryEpoch?.startedAt ?? this.state.startedAt;
+    const wallClockBudgetMs = recoveryEpoch?.maxWallClockMs ?? policy.limits.maxWallClockMs;
+    if (this.clock.now().getTime() - Date.parse(wallClockStartedAt) > wallClockBudgetMs) {
+      return recoveryEpoch === undefined
+        ? { outcome: 'DENIED', reason: 'WALL_CLOCK_BUDGET_EXCEEDED', detail: 'run wall-clock budget exhausted' }
+        : { outcome: 'DENIED', reason: 'RECOVERY_WALL_CLOCK_BUDGET_EXCEEDED', detail: `recovery epoch ${recoveryEpoch.number} wall-clock budget exhausted` };
+    }
     const projectedCost = this.state.grantedEstimatedCostUnits + (request.estimatedCostUnits ?? 0);
     if (policy.limits.maxEstimatedCostUnits !== undefined && projectedCost > policy.limits.maxEstimatedCostUnits) return { outcome: 'DENIED', reason: 'BUDGET_EXCEEDED', detail: 'estimated-cost budget exhausted' };
     const conflicting = this.activeUnits().find((unit) => unit.resourceClaims.some((held) => request.resourceClaims.some((wanted) => claimsConflict(held, wanted))));
@@ -361,35 +381,78 @@ export class AdaptiveCoordinator {
         return !this.terminalDecision(request.id) && (unit === undefined || unit.status === 'REQUESTED' || unit.status === 'WAITING');
       })
       .sort((left, right) => this.effectivePriority(right) - this.effectivePriority(left) || left.sequence - right.sequence);
-    const decisions: GrantDecision[] = [];
-    for (const request of candidates) {
-      const ineligible = this.validateEligibility(request);
-      if (ineligible !== undefined) {
-        decisions.push(this.decide(request, ineligible.outcome, ineligible.reason, ineligible.detail));
-        continue;
-      }
-      const decision = this.decide(request, 'GRANTED', 'ELIGIBLE', 'deterministic policy checks passed');
-      const existing = this.existingUnit(request.id);
-      const attempt: WorkAttempt = { number: (existing?.attempts.length ?? 0) + 1, grantDecisionId: decision.id, status: 'GRANTED' };
-      const unit: DynamicWorkUnit = existing === undefined ? {
-        id: nextId('work', this.state.workUnits.length), requestId: request.id,
-        ...(request.parentWorkUnitId === undefined ? {} : { parentWorkUnitId: request.parentWorkUnitId }),
-        role: request.role, concern: request.concern, objective: request.objective, reason: request.reason,
-        dependencyRequestIds: request.dependencies, capabilities: request.capabilities,
-        resourceClaims: request.resourceClaims, depth: request.depth, status: 'GRANTED',
-        createdAt: decision.decidedAt, updatedAt: decision.decidedAt, attempts: [attempt],
-      } : { ...existing, status: 'GRANTED', updatedAt: decision.decidedAt, attempts: [...existing.attempts, attempt] };
-      this.state = existing === undefined
-        ? { ...this.state, workUnits: [...this.state.workUnits, unit] }
-        : replaceUnit(this.state, unit);
-      this.state = { ...this.state, totalAgentInvocations: this.state.totalAgentInvocations + 1, grantedEstimatedCostUnits: this.state.grantedEstimatedCostUnits + (request.estimatedCostUnits ?? 0) };
-      if (existing === undefined) this.event('WORK_UNIT_CREATED', 'work unit materialized after grant', { requestId: request.id, workUnitId: unit.id, decisionId: decision.id });
-      if (request.authorization?.purpose === 'correction') {
-        this.event('CORRECTION_GRANTED', request.authorization.canonicalFindingKey, { requestId: request.id, workUnitId: unit.id, decisionId: decision.id });
-      }
-      decisions.push(decision);
+    return candidates.map((request) => this.evaluateRequest(request));
+  }
+
+  /** The single per-request evaluate-and-grant body, shared by arbitrate() and authorizeRecoveryEpoch()'s re-arbitration pass. */
+  private evaluateRequest(request: WorkRequest): GrantDecision {
+    const ineligible = this.validateEligibility(request);
+    if (ineligible !== undefined) {
+      return this.decide(request, ineligible.outcome, ineligible.reason, ineligible.detail);
     }
-    return decisions;
+    const decision = this.decide(request, 'GRANTED', 'ELIGIBLE', 'deterministic policy checks passed');
+    const existing = this.existingUnit(request.id);
+    const attempt: WorkAttempt = { number: (existing?.attempts.length ?? 0) + 1, grantDecisionId: decision.id, status: 'GRANTED' };
+    const unit: DynamicWorkUnit = existing === undefined ? {
+      id: nextId('work', this.state.workUnits.length), requestId: request.id,
+      ...(request.parentWorkUnitId === undefined ? {} : { parentWorkUnitId: request.parentWorkUnitId }),
+      role: request.role, concern: request.concern, objective: request.objective, reason: request.reason,
+      dependencyRequestIds: request.dependencies, capabilities: request.capabilities,
+      resourceClaims: request.resourceClaims, depth: request.depth, status: 'GRANTED',
+      createdAt: decision.decidedAt, updatedAt: decision.decidedAt, attempts: [attempt],
+    } : { ...existing, status: 'GRANTED', updatedAt: decision.decidedAt, attempts: [...existing.attempts, attempt] };
+    this.state = existing === undefined
+      ? { ...this.state, workUnits: [...this.state.workUnits, unit] }
+      : replaceUnit(this.state, unit);
+    this.state = { ...this.state, totalAgentInvocations: this.state.totalAgentInvocations + 1, grantedEstimatedCostUnits: this.state.grantedEstimatedCostUnits + (request.estimatedCostUnits ?? 0) };
+    if (existing === undefined) this.event('WORK_UNIT_CREATED', 'work unit materialized after grant', { requestId: request.id, workUnitId: unit.id, decisionId: decision.id });
+    if (request.authorization?.purpose === 'correction') {
+      this.event('CORRECTION_GRANTED', request.authorization.canonicalFindingKey, { requestId: request.id, workUnitId: unit.id, decisionId: decision.id });
+    }
+    return decision;
+  }
+
+  /**
+   * Binds (or reuses) an operator-authorized recovery execution budget
+   * epoch, then performs the one, narrow, explicit re-arbitration pass this
+   * feature exists for: requests already in `requestIds` (recovery-scoped,
+   * proven by the caller via real evidence — never inferred here from
+   * request IDs or names) whose ONLY current blocker is the original run's
+   * exhausted wall-clock budget get exactly one fresh GrantDecision
+   * appended, evaluated under the (now-active) epoch clock. The prior
+   * DENIED decision is never removed or rewritten — decide() always
+   * appends. A request already resolved (GRANTED/WAITING/terminal for a
+   * non-wall-clock reason) is left completely alone, which is what makes
+   * this safe to call repeatedly: re-authorizing the same policyHash binds
+   * the SAME epoch (no clock reset, no extra budget) and re-arbitrates only
+   * whatever, if anything, is still stuck in DENIED/WALL_CLOCK_BUDGET_EXCEEDED.
+   */
+  authorizeRecoveryEpoch(options: {
+    readonly policyHash: string;
+    readonly maxWallClockMs: number;
+    readonly requestIds: readonly string[];
+  }): GrantDecision[] {
+    const existing = this.state.recoveryEpoch;
+    const now = iso(this.clock);
+    const freshRequestIds = [...new Set(options.requestIds)];
+    const epoch: RecoveryEpochState = existing === undefined
+      ? { number: 1, policyHash: options.policyHash, startedAt: now, maxWallClockMs: options.maxWallClockMs, requestIds: freshRequestIds }
+      : existing.policyHash === options.policyHash
+        // Same semantic policy still active: reuse this exact epoch identity
+        // (no clock reset, no extra budget) — only ever widen its tracked
+        // scope with newly-discovered recovery-scoped requests.
+        ? { ...existing, requestIds: [...new Set([...existing.requestIds, ...options.requestIds])] }
+        // A genuinely different policy authorizes the NEXT epoch, scoped to
+        // exactly what this authorization covers — a prior epoch's scope
+        // belongs to that prior epoch's identity, not this one.
+        : { number: existing.number + 1, policyHash: options.policyHash, startedAt: now, maxWallClockMs: options.maxWallClockMs, requestIds: freshRequestIds };
+    this.state = { ...this.state, recoveryEpoch: epoch, updatedAt: now };
+    this.event('RECOVERY_EPOCH_AUTHORIZED', `epoch ${epoch.number}`, {});
+    const reconsider = epoch.requestIds
+      .map((id) => this.state.workRequests.find((request) => request.id === id))
+      .filter((request): request is WorkRequest => request !== undefined)
+      .filter((request) => this.terminalDecision(request.id) && this.latestDecision(request.id)?.reason === 'WALL_CLOCK_BUDGET_EXCEEDED');
+    return reconsider.map((request) => this.evaluateRequest(request));
   }
 
   start(workUnitId: string): void {
