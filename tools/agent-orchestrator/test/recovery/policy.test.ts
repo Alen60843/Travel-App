@@ -126,3 +126,72 @@ test('hashRecoveryPolicy is deterministic and content-sensitive', () => {
   assert.notEqual(hashRecoveryPolicy(a), hashRecoveryPolicy(c));
   assert.match(hashRecoveryPolicy(a), /^[0-9a-f]{64}$/);
 });
+
+// --- handoffRepair.additionalAttempts (audited repair-budget extension) ---
+
+test('handoffRepair.additionalAttempts parses as a plain integer', () => {
+  const overlay = parseRecoveryPolicyOverlay({ handoffRepair: { additionalAttempts: 1 } });
+  assert.deepEqual(overlay.handoffRepair, { additionalAttempts: 1 });
+});
+
+test('handoffRepair.additionalAttempts of 0 is valid (an explicit no-op extension)', () => {
+  const overlay = parseRecoveryPolicyOverlay({ handoffRepair: { additionalAttempts: 0 } });
+  assert.deepEqual(overlay.handoffRepair, { additionalAttempts: 0 });
+});
+
+test('a negative additionalAttempts is rejected', () => {
+  assert.throws(
+    () => parseRecoveryPolicyOverlay({ handoffRepair: { additionalAttempts: -1 } }),
+    (error: unknown) => isOrchestratorError(error, 'CONFIG_INVALID'),
+  );
+});
+
+test('a non-integer (floating point) additionalAttempts is rejected', () => {
+  assert.throws(
+    () => parseRecoveryPolicyOverlay({ handoffRepair: { additionalAttempts: 1.5 } }),
+    (error: unknown) => isOrchestratorError(error, 'CONFIG_INVALID'),
+  );
+});
+
+test('a NaN additionalAttempts is rejected', () => {
+  assert.throws(
+    () => parseRecoveryPolicyOverlay({ handoffRepair: { additionalAttempts: Number.NaN } }),
+    (error: unknown) => isOrchestratorError(error, 'CONFIG_INVALID'),
+  );
+});
+
+test('an unreasonably large additionalAttempts is rejected (bounded maximum)', () => {
+  assert.throws(
+    () => parseRecoveryPolicyOverlay({ handoffRepair: { additionalAttempts: 1_000_000 } }),
+    (error: unknown) => isOrchestratorError(error, 'CONFIG_INVALID'),
+  );
+});
+
+test('an unknown handoffRepair key is rejected', () => {
+  assert.throws(
+    () => parseRecoveryPolicyOverlay({ handoffRepair: { additionalAttempts: 1, unlimited: true } }),
+    (error: unknown) => isOrchestratorError(error, 'CONFIG_INVALID'),
+  );
+});
+
+test('handoffRepair.additionalAttempts participates in the semantic policy hash', () => {
+  const a = parseRecoveryPolicyOverlay({ handoffRepair: { additionalAttempts: 1 } });
+  const b = parseRecoveryPolicyOverlay({ handoffRepair: { additionalAttempts: 2 } });
+  const withoutOverlay = parseRecoveryPolicyOverlay({});
+  assert.notEqual(hashRecoveryPolicy(a), hashRecoveryPolicy(b));
+  assert.notEqual(hashRecoveryPolicy(a), hashRecoveryPolicy(withoutOverlay));
+});
+
+test('handoffRepair.additionalAttempts hashes identically regardless of surrounding key order', () => {
+  const a = parseRecoveryPolicyOverlay({
+    salvage: { verify: [] },
+    handoffRepair: { additionalAttempts: 1 },
+    executors: [],
+  });
+  const b = parseRecoveryPolicyOverlay({
+    executors: [],
+    handoffRepair: { additionalAttempts: 1 },
+    salvage: { verify: [] },
+  });
+  assert.equal(hashRecoveryPolicy(a), hashRecoveryPolicy(b));
+});

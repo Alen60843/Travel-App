@@ -559,6 +559,18 @@ export class AgentOrchestrator {
     if (latestRecoveryPolicy?.salvage !== undefined) {
       config = { ...config, salvage: latestRecoveryPolicy.salvage };
     }
+    // Effective budget = the phase's own base maxHandoffRepairAttempts plus
+    // whatever additionalAttempts an operator has explicitly, auditably
+    // authorized via agents:authorize-recovery-policy. STATE semantics, not
+    // transaction semantics: this reads the latest authorized snapshot's
+    // value directly, so re-authorizing the same additionalAttempts twice
+    // never stacks — the effective budget is base + that one number, always.
+    if (latestRecoveryPolicy?.handoffRepair !== undefined) {
+      config = {
+        ...config,
+        maxHandoffRepairAttempts: config.maxHandoffRepairAttempts + latestRecoveryPolicy.handoffRepair.additionalAttempts,
+      };
+    }
     return new AgentOrchestrator({
       config,
       repositoryRoot,

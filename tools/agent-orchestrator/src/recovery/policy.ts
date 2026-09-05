@@ -55,12 +55,22 @@ export interface RecoveryExecutorConfig {
 export interface RecoveryPolicyOverlay {
   readonly salvage?: { readonly verify: readonly IntegrationCommand[] };
   readonly executors?: readonly RecoveryExecutorConfig[];
+  readonly handoffRepair?: { readonly additionalAttempts: number };
 }
 
-const TOP_LEVEL_KEYS = new Set(['salvage', 'executors']);
+const TOP_LEVEL_KEYS = new Set(['salvage', 'executors', 'handoffRepair']);
 const SALVAGE_KEYS = new Set(['verify']);
 const EXECUTOR_KEYS = new Set(['id', 'adapter', 'roles', 'capabilities', 'model', 'available']);
 const CAPABILITY_KEYS = new Set(['capability', 'minimumLevel']);
+const HANDOFF_REPAIR_KEYS = new Set(['additionalAttempts']);
+
+/**
+ * Bounded well above any realistic authorized extension — this is an
+ * audited, human-authorized budget increase, not an open-ended dial. The
+ * bound exists only to reject obvious config mistakes (a stray extra zero),
+ * not to express a real operational ceiling.
+ */
+const MAX_ADDITIONAL_HANDOFF_REPAIR_ATTEMPTS = 100;
 
 function assertKnownKeys(value: Record<string, unknown>, allowed: ReadonlySet<string>, path: string): void {
   for (const key of Object.keys(value)) {
@@ -134,9 +144,22 @@ export function parseRecoveryPolicyOverlay(value: unknown): RecoveryPolicyOverla
     if (!Array.isArray(value.executors)) invalid('executors', 'must be an array');
     executors = value.executors.map((entry, index) => parseExecutor(entry, `executors[${index}]`));
   }
+  let handoffRepair: { readonly additionalAttempts: number } | undefined;
+  if (value.handoffRepair !== undefined) {
+    if (!isRecord(value.handoffRepair)) invalid('handoffRepair', 'must be an object');
+    assertKnownKeys(value.handoffRepair, HANDOFF_REPAIR_KEYS, 'handoffRepair');
+    const additionalAttempts = boundedInteger(
+      value.handoffRepair.additionalAttempts,
+      'handoffRepair.additionalAttempts',
+      0,
+      MAX_ADDITIONAL_HANDOFF_REPAIR_ATTEMPTS,
+    );
+    handoffRepair = { additionalAttempts };
+  }
   return {
     ...(salvage === undefined ? {} : { salvage }),
     ...(executors === undefined ? {} : { executors }),
+    ...(handoffRepair === undefined ? {} : { handoffRepair }),
   };
 }
 
