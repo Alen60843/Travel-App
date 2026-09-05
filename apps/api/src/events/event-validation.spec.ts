@@ -55,4 +55,8 @@ describe('Event validation', () => {
     expect(() => assertEventVisibility(EventVisibility.Unlisted)).not.toThrow();
     expect(() => assertEventVisibility('FRIENDS')).toThrow(InvalidEventValueError);
   });
+
+  it('accepts trust scores with at most two decimal places despite floating-point imprecision', () => {
+    expect(() => assertEventTrustScore(1.1)).not.toThrow();
+  });
 });

@@ -5,6 +5,7 @@ import { InvalidEventValueError } from './events.errors';
 const TIMESTAMP =
   /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(?:Z|([+-])(\d{2}):(\d{2}))$/;
 const CURRENCY = /^[A-Z]{3}$/;
+const TRUST_SCORE = /^\d+(?:\.\d{1,2})?$/;
 const VISIBILITIES = new Set<string>(['PUBLIC', 'UNLISTED', 'PRIVATE']);
 const DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31] as const;
 
@@ -117,7 +118,7 @@ export function assertEventTrustScore(value: number): void {
     !Number.isFinite(value) ||
     value < 0 ||
     value > 10 ||
-    Math.round(value * 100) !== value * 100
+    !TRUST_SCORE.test(value.toString())
   ) {
     throw new InvalidEventValueError(
       'minTrustScore',
