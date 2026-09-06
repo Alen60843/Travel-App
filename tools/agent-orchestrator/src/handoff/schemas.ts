@@ -1,4 +1,5 @@
 import { OrchestratorError } from '../errors';
+import { parseWorkRequestDraft, type WorkRequestDraft } from '../adaptive';
 
 export const HANDOFF_STATUSES = ['complete', 'blocked', 'failed'] as const;
 export type HandoffStatus = (typeof HANDOFF_STATUSES)[number];
@@ -14,6 +15,8 @@ export interface HandoffTest {
 
 export const FINDING_DECISIONS = ['confirmed', 'rejected'] as const;
 export type FindingDecision = (typeof FINDING_DECISIONS)[number];
+export const FINDING_RESOLUTIONS = ['resolved', 'unresolved', 'not_applicable'] as const;
+export type FindingResolution = (typeof FINDING_RESOLUTIONS)[number];
 
 /**
  * A Fixer's verdict on exactly one Verifier finding. §5: the Fixer must not
@@ -23,7 +26,11 @@ export type FindingDecision = (typeof FINDING_DECISIONS)[number];
  */
 export interface FindingResponse {
   readonly findingId: string;
+  /** Trusted assignment key is context-required for canonical-finding tasks. */
+  readonly canonicalFindingKey?: string;
   readonly decision: FindingDecision;
+  /** Required by canonical-finding tasks; optional for legacy/generic handoffs. */
+  readonly resolution?: FindingResolution;
   readonly evidence: string;
   /** Populated when decision is "confirmed": what was changed. */
   readonly fix?: string;
@@ -61,6 +68,7 @@ export interface StructuredHandoff {
   readonly attackSurface?: readonly string[];
   /** Present on correction/"Fixer" tasks: see FindingResponse. */
   readonly findingResponses?: readonly FindingResponse[];
+  readonly additionalWorkRequests?: readonly WorkRequestDraft[];
 }
 
 /** Exported so handoff/repair.ts can rename a malformed key to the exact bare form the validator below accepts, without duplicating this list. */
@@ -76,12 +84,15 @@ export const HANDOFF_KEYS = new Set([
   'knownRisks',
   'attackSurface',
   'findingResponses',
+  'additionalWorkRequests',
 ]);
 const TEST_KEYS = new Set(['command', 'result', 'details']);
 /** Exported for the same reason as HANDOFF_KEYS above. */
 export const FINDING_RESPONSE_KEYS = new Set([
   'findingId',
+  'canonicalFindingKey',
   'decision',
+  'resolution',
   'evidence',
   'fix',
   'verification',
@@ -163,9 +174,19 @@ function parseFindingResponse(value: unknown, index: number): FindingResponse {
   if (!(FINDING_DECISIONS as readonly string[]).includes(decision)) {
     invalid(`${path}.decision`, `must be one of ${FINDING_DECISIONS.join(', ')}`);
   }
+  const resolution = object.resolution === undefined
+    ? undefined
+    : text(object.resolution, `${path}.resolution`);
+  if (resolution !== undefined && !(FINDING_RESOLUTIONS as readonly string[]).includes(resolution)) {
+    invalid(`${path}.resolution`, `must be one of ${FINDING_RESOLUTIONS.join(', ')}`);
+  }
   return {
     findingId,
+    ...(object.canonicalFindingKey === undefined
+      ? {}
+      : { canonicalFindingKey: text(object.canonicalFindingKey, `${path}.canonicalFindingKey`) }),
     decision: decision as FindingDecision,
+    ...(resolution === undefined ? {} : { resolution: resolution as FindingResolution }),
     evidence: text(object.evidence, `${path}.evidence`),
     ...(object.fix === undefined ? {} : { fix: text(object.fix, `${path}.fix`) }),
     ...(object.verification === undefined
@@ -209,6 +230,15 @@ export function validateHandoff(value: unknown): StructuredHandoff {
   const assumptions = optionalTextArray(object.assumptions, 'handoff.assumptions');
   const knownRisks = optionalTextArray(object.knownRisks, 'handoff.knownRisks');
   const attackSurface = optionalTextArray(object.attackSurface, 'handoff.attackSurface');
+  let additionalWorkRequests: WorkRequestDraft[] | undefined;
+  if (object.additionalWorkRequests !== undefined) {
+    if (!Array.isArray(object.additionalWorkRequests)) invalid('handoff.additionalWorkRequests', 'must be an array');
+    try {
+      additionalWorkRequests = object.additionalWorkRequests.map(parseWorkRequestDraft);
+    } catch (error) {
+      invalid('handoff.additionalWorkRequests', error instanceof Error ? error.message : String(error), error);
+    }
+  }
   return {
     status: status as HandoffStatus,
     summary: text(object.summary, 'handoff.summary'),
@@ -221,5 +251,6 @@ export function validateHandoff(value: unknown): StructuredHandoff {
     ...(knownRisks === undefined ? {} : { knownRisks }),
     ...(attackSurface === undefined ? {} : { attackSurface }),
     ...(findingResponses === undefined ? {} : { findingResponses }),
+    ...(additionalWorkRequests === undefined ? {} : { additionalWorkRequests }),
   };
 }

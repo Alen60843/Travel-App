@@ -7,10 +7,12 @@ import {
   invalid,
   isRecord,
   nonEmptyString,
+  parseAgentWorktree,
   parseIntegration,
   parsePhaseConfig,
   repositoryRelativePath,
   type IntegrationConfig,
+  type AgentWorktreeConfig,
   type PhaseConfig,
 } from '../config';
 import { OrchestratorError } from '../errors';
@@ -116,6 +118,7 @@ export interface SolverVerifierPhaseFile {
   readonly concurrency?: number;
   readonly agentRetries?: number;
   readonly agentTimeoutMs?: number;
+  readonly agentWorktree: AgentWorktreeConfig;
   readonly workflow: SolverVerifierWorkflow;
   readonly deterministicGate: IntegrationConfig;
 }
@@ -128,6 +131,7 @@ const TOP_LEVEL_KEYS = new Set([
   'concurrency',
   'agentRetries',
   'agentTimeoutMs',
+  'agentWorktree',
   'workflow',
   'deterministicGate',
 ]);
@@ -282,6 +286,7 @@ export function parseSolverVerifierPhaseFile(value: unknown): SolverVerifierPhas
           ),
         }),
     workflow: parseWorkflow(value.workflow),
+    agentWorktree: parseAgentWorktree(value.agentWorktree),
     deterministicGate: parseIntegration(value.deterministicGate ?? {}),
   };
 }
@@ -437,6 +442,7 @@ export function expandSolverVerifierWorkflow(file: SolverVerifierPhaseFile): Pha
     maxReviewRounds,
     ...(file.agentRetries === undefined ? {} : { agentRetries: file.agentRetries }),
     ...(file.agentTimeoutMs === undefined ? {} : { agentTimeoutMs: file.agentTimeoutMs }),
+    agentWorktree: file.agentWorktree,
     tasks,
     integration: file.deterministicGate,
   });

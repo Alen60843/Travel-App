@@ -8,6 +8,8 @@ export const TASK_MODES = [
   'implementation',
   'review',
   'correction',
+  'testing',
+  'synthesis',
   'final_review',
   'escalation',
   'integration',
@@ -238,7 +240,7 @@ export function parseTaskSpec(value: unknown, index: number): TaskSpec {
   // its job is to arbitrate a disagreement and record a decision, not to
   // change code itself. A phase that genuinely wants the Judge to also patch
   // something can still set writer: true explicitly with ownership globs.
-  const defaultWriter = ['implementation', 'correction', 'integration'].includes(mode);
+  const defaultWriter = ['implementation', 'correction', 'testing', 'integration'].includes(mode);
   const writer = value.writer ?? defaultWriter;
   if (typeof writer !== 'boolean') {
     invalid(`${path}.writer`, 'must be a boolean');

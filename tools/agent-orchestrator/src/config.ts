@@ -13,8 +13,25 @@ export interface IntegrationCommand {
 }
 
 export interface IntegrationConfig {
+  readonly prepare: readonly IntegrationCommand[];
   readonly commands: readonly IntegrationCommand[];
   readonly diagnostics: readonly IntegrationCommand[];
+}
+
+export interface AgentWorktreeConfig {
+  readonly prepare: readonly IntegrationCommand[];
+}
+
+/**
+ * Categorically separate from AgentWorktreeConfig.prepare: prepare answers
+ * "is this environment usable" (e.g. installing dependencies); verify
+ * answers "is the salvaged code actually correct" (e.g. running the real
+ * test suite). Never defaulted from, aliased to, or satisfied by prepare —
+ * a phase with agentWorktree.prepare configured but no salvage.verify has
+ * zero usable verification for salvage.
+ */
+export interface SalvageConfig {
+  readonly verify: readonly IntegrationCommand[];
 }
 
 export interface PhaseConfig {
@@ -26,8 +43,12 @@ export interface PhaseConfig {
   readonly maxReviewRounds: number;
   readonly agentRetries: number;
   readonly agentTimeoutMs: number;
+  readonly agentWorktree: AgentWorktreeConfig;
   readonly tasks: readonly TaskSpec[];
   readonly integration: IntegrationConfig;
+  /** Generic recovery config: bounds how many bounded handoff-repair attempts (framing/deterministic/agent) recover-handoffs will make for a task before refusing further attempts. Applies to static and adaptive workflows alike — recover-handoffs is not adaptive-only. */
+  readonly maxHandoffRepairAttempts: number;
+  readonly salvage: SalvageConfig;
 }
 
 const TOP_LEVEL_KEYS = new Set([
@@ -39,11 +60,16 @@ const TOP_LEVEL_KEYS = new Set([
   'maxReviewRounds',
   'agentRetries',
   'agentTimeoutMs',
+  'agentWorktree',
   'tasks',
   'integration',
+  'maxHandoffRepairAttempts',
+  'salvage',
 ]);
-const INTEGRATION_KEYS = new Set(['commands', 'diagnostics']);
+const INTEGRATION_KEYS = new Set(['prepare', 'commands', 'diagnostics']);
 const COMMAND_KEYS = new Set(['command', 'required', 'timeoutMs']);
+const AGENT_WORKTREE_KEYS = new Set(['prepare']);
+const SALVAGE_KEYS = new Set(['verify']);
 
 // Exported (not just used internally) so src/workflow/solver-verifier.ts can
 // build a plain-object PhaseConfig shape with the same validation rules
@@ -111,7 +137,7 @@ export function repositoryRelativePath(value: unknown, path: string): string {
   return result;
 }
 
-function parseCommand(
+export function parseCommand(
   value: unknown,
   path: string,
   defaultRequired: boolean,
@@ -144,7 +170,7 @@ function parseCommand(
   };
 }
 
-function parseCommandList(
+export function parseCommandList(
   value: unknown,
   path: string,
   defaultRequired: boolean,
@@ -162,13 +188,14 @@ function parseCommandList(
 
 export function parseIntegration(value: unknown): IntegrationConfig {
   if (value === undefined) {
-    return { commands: [], diagnostics: [] };
+    return { prepare: [], commands: [], diagnostics: [] };
   }
   if (!isRecord(value)) {
     invalid('integration', 'must be an object');
   }
   assertKnownKeys(value, INTEGRATION_KEYS, 'integration');
   return {
+    prepare: parseCommandList(value.prepare, 'integration.prepare', true),
     commands: parseCommandList(value.commands, 'integration.commands', true),
     diagnostics: parseCommandList(
       value.diagnostics,
@@ -176,6 +203,20 @@ export function parseIntegration(value: unknown): IntegrationConfig {
       false,
     ),
   };
+}
+
+export function parseAgentWorktree(value: unknown): AgentWorktreeConfig {
+  if (value === undefined) return { prepare: [] };
+  if (!isRecord(value)) invalid('agentWorktree', 'must be an object');
+  assertKnownKeys(value, AGENT_WORKTREE_KEYS, 'agentWorktree');
+  return { prepare: parseCommandList(value.prepare, 'agentWorktree.prepare', true) };
+}
+
+export function parseSalvage(value: unknown): SalvageConfig {
+  if (value === undefined) return { verify: [] };
+  if (!isRecord(value)) invalid('salvage', 'must be an object');
+  assertKnownKeys(value, SALVAGE_KEYS, 'salvage');
+  return { verify: parseCommandList(value.verify, 'salvage.verify', true) };
 }
 
 /** Validate a decoded YAML/JSON value and apply conservative defaults. */
@@ -267,13 +308,27 @@ export function parsePhaseConfig(value: unknown): PhaseConfig {
       1_000,
       24 * 60 * 60 * 1_000,
     ),
+    agentWorktree: parseAgentWorktree(value.agentWorktree),
     tasks,
     integration: parseIntegration(value.integration),
+    maxHandoffRepairAttempts: boundedInteger(
+      value.maxHandoffRepairAttempts ?? 2,
+      'maxHandoffRepairAttempts',
+      1,
+      100,
+    ),
+    salvage: parseSalvage(value.salvage),
   };
 }
 
-/** Parse strict YAML. Aliases are disabled to keep task files bounded and auditable. */
-export function parsePhaseConfigYaml(source: string): PhaseConfig {
+/**
+ * Parse strict YAML into a plain JS value. Aliases are disabled (maxAliasCount:
+ * 0) to keep any file parsed this way bounded and auditable — shared by every
+ * strict YAML entry point in this package (phase files, recovery policy
+ * overlays), so the same anti-DoS/alias-expansion posture applies everywhere,
+ * not just to phase files.
+ */
+export function parseStrictYaml(source: string): unknown {
   let document;
   try {
     document = parseDocument(source, {
@@ -288,7 +343,15 @@ export function parsePhaseConfigYaml(source: string): PhaseConfig {
     invalid('$', document.errors.map((error) => error.message).join('; '));
   }
   try {
-    return parsePhaseConfig(document.toJS({ maxAliasCount: 0 }));
+    return document.toJS({ maxAliasCount: 0 });
+  } catch (error) {
+    invalid('$', 'could not decode YAML', error);
+  }
+}
+
+export function parsePhaseConfigYaml(source: string): PhaseConfig {
+  try {
+    return parsePhaseConfig(parseStrictYaml(source));
   } catch (error) {
     if (error instanceof OrchestratorError) {
       throw error;

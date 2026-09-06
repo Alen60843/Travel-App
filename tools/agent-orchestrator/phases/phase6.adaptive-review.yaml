@@ -1,0 +1,435 @@
+mode: adaptive
+
+phase: phase6-adaptive-review
+
+name: Phase 6 Events — Adaptive Independent Review
+
+# IMPORTANT:
+# Review the already-successful Phase 6 implementation.
+# Do NOT rerun the original implementation task.
+baseBranch: agent/run-20260903203914-cc2b57d4/events-core-api
+
+canonicalDesignDocument: docs/superpowers/specs/2026-08-20-tripwith-phase-1-design.md
+
+goal: >
+  Independently review the already-implemented Phase 6 Workstream A Event
+  lifecycle at commit b4bc2c56962754e9dad6118db00b28a885d0ceea.
+  Dynamically arbitrate the justified review work, execute only granted
+  read-only review units, synthesize their evidence, and when canonical
+  material findings require changes, authorize bounded correction work,
+  targeted re-verification, and deterministic integration only after approval.
+
+constraints:
+  - Reviewers and synthesizers must remain read-only.
+  - Corrections may write only inside the explicit correctionPolicy ownership.
+  - Write authority must come from canonical findings and phase correction policy, never from a read-only reviewer child.
+  - Do not rerun the original events-core-api implementation.
+  - Reviewers must remain read-only.
+  - Start from the actual implementation diff and inspect additional files only for concrete evidence.
+  - Do not perform broad repository exploration.
+  - Report only material evidence-backed findings.
+  - Do not merge or push.
+  - Deterministic verification remains authoritative.
+  - Successful sibling review and correction work must be preserved if another unit fails.
+  - Integration must not start while unresolved material findings remain.
+
+policy:
+
+  # These are concerns the Arbiter is ALLOWED to authorize.
+  # They are not a fixed number of Agents.
+  allowedConcerns:
+    - security
+    - database_lifecycle
+    - api_validation
+    - testing
+    - synthesis
+
+  # Read-only review may inspect these directly relevant areas.
+  allowedOwnership:
+    - apps/api/src/events/**
+    - apps/api/src/auth/**
+    - apps/api/src/trips/**
+    - apps/api/src/explorer/**
+    - apps/api/src/database/entities/events.entity.ts
+    - apps/api/src/database/migrations/sql/1787184000000-InitialSchema.up.sql
+    - packages/shared/src/enums.ts
+
+  allowedResources: []
+
+  requireEvidenceForExpansion: true
+
+  # Only canonical persisted findings may authorize root writer work.
+  correctionPolicy:
+    allowedOwnership:
+      - apps/api/src/events/**
+    allowedRoles:
+      - correction
+      - testing
+    requireCanonicalFinding: true
+    maxRounds: 2
+
+  # Prevent starvation while keeping arbitration deterministic.
+  agingIntervalMs: 30000
+  agingStep: 5
+
+  # Critical expansion requires human authorization.
+  humanApprovalRisks:
+    - critical
+
+  limits:
+
+    # This is a ceiling, NOT the desired Agent count.
+    #
+    # 1 justified request  -> 1 Agent
+    # 3 safe requests      -> up to 3 concurrent Agents
+    # 8 requests           -> only eligible work receives GRANT
+    maxConcurrentAgents: 3
+
+    # Includes review/synthesis invocations.
+    maxAgentInvocations: 10
+
+    maxTotalWorkUnits: 14
+    maxDecompositionDepth: 3
+    maxFanOutPerWorkUnit: 6
+
+    # Four outputs can be synthesized directly.
+    # Larger future fan-out will automatically create hierarchical synthesis.
+    maxSynthesisInputs: 4
+
+    maxWallClockMs: 3600000
+    maxEstimatedCostUnits: 100
+
+
+# ================================================================
+# INITIAL EVIDENCE-BACKED CANDIDATE REQUESTS
+#
+# These are requests presented to the Arbiter.
+#
+# They are NOT pre-created Agents.
+#
+# Arbiter may:
+#   GRANT
+#   WAIT
+#   DENY
+#
+# Later Agents may also propose additional evidence-backed requests.
+# ================================================================
+
+initialCandidates:
+
+  # --------------------------------------------------------------
+  # Candidate 1 — Security / Authorization
+  # --------------------------------------------------------------
+  - role: review
+    concern: security
+
+    objective: >
+      Verify authentication, Event ownership, IDOR resistance, host identity
+      integrity, protected-field handling, and authorization of publish/cancel.
+
+    reason: >
+      Phase 6 introduces authenticated Event-management endpoints and host-only
+      lifecycle mutations, creating an authorization boundary that requires
+      independent adversarial verification.
+
+    evidence:
+      - kind: file
+        reference: apps/api/src/events/events.controller.ts
+        summary: Authenticated Event management endpoints were introduced.
+
+      - kind: file
+        reference: apps/api/src/events/events.service.ts
+        summary: Host ownership and lifecycle authorization are enforced here.
+
+      - kind: file
+        reference: apps/api/src/events/dto/update-event.dto.ts
+        summary: Client-controlled mutable fields require protected-field review.
+
+    resourceClaims:
+      - kind: repository_path
+        key: apps/api/src/events/**
+        mode: read
+
+      - kind: repository_path
+        key: apps/api/src/auth/**
+        mode: read
+
+    capabilities:
+      - capability: review
+        minimumLevel: 1
+
+      - capability: security_review
+        minimumLevel: 1
+
+    risk: high
+    priority: 90
+
+
+  # --------------------------------------------------------------
+  # Candidate 2 — PostgreSQL / Lifecycle
+  # --------------------------------------------------------------
+  - role: review
+    concern: database_lifecycle
+
+    objective: >
+      Verify transaction boundaries, pessimistic locking, Event lifecycle
+      transitions, cancellation consistency, PostgreSQL lifecycle invariants,
+      and audit actor/reason attribution.
+
+    reason: >
+      The Event lifecycle depends on both application transactions and existing
+      PostgreSQL state-machine/audit invariants, so correctness crosses the
+      Service/Repository/database boundary.
+
+    evidence:
+      - kind: file
+        reference: apps/api/src/events/events.repository.ts
+        summary: Repository introduces transactional locking and persistence.
+
+      - kind: file
+        reference: apps/api/src/events/events.service.ts
+        summary: Publish and cancel lifecycle commands execute here.
+
+      - kind: file
+        reference: apps/api/src/events/events.int-spec.ts
+        summary: Integration coverage exercises database-backed lifecycle behavior.
+
+      - kind: file
+        reference: apps/api/src/database/migrations/sql/1787184000000-InitialSchema.up.sql
+        summary: Canonical Event lifecycle and audit constraints are defined here.
+
+    resourceClaims:
+      - kind: repository_path
+        key: apps/api/src/events/**
+        mode: read
+
+      - kind: repository_path
+        key: apps/api/src/database/entities/events.entity.ts
+        mode: read
+
+      - kind: repository_path
+        key: apps/api/src/database/migrations/sql/1787184000000-InitialSchema.up.sql
+        mode: read
+
+      - kind: repository_path
+        key: packages/shared/src/enums.ts
+        mode: read
+
+    capabilities:
+      - capability: review
+        minimumLevel: 1
+
+      - capability: postgresql
+        minimumLevel: 1
+
+    risk: high
+    priority: 90
+
+
+  # --------------------------------------------------------------
+  # Candidate 3 — API / Validation
+  # --------------------------------------------------------------
+  - role: review
+    concern: api_validation
+
+    objective: >
+      Verify DTO and API contracts, Event validation, timestamps, categories,
+      meeting-point handling, management projections, explicit lifecycle
+      commands, and consistency with existing TripWith API conventions.
+
+    reason: >
+      Workstream A adds a complete authenticated Event-management surface and
+      substantial input-validation logic.
+
+    evidence:
+      - kind: file
+        reference: apps/api/src/events/dto/create-event.dto.ts
+        summary: New Event creation contract.
+
+      - kind: file
+        reference: apps/api/src/events/dto/update-event.dto.ts
+        summary: New Event mutation contract.
+
+      - kind: file
+        reference: apps/api/src/events/event-validation.ts
+        summary: Business and input validation logic.
+
+      - kind: file
+        reference: apps/api/src/events/events.controller.ts
+        summary: New HTTP management API surface.
+
+    resourceClaims:
+      - kind: repository_path
+        key: apps/api/src/events/**
+        mode: read
+
+      - kind: repository_path
+        key: apps/api/src/trips/**
+        mode: read
+
+      - kind: repository_path
+        key: apps/api/src/explorer/**
+        mode: read
+
+    capabilities:
+      - capability: review
+        minimumLevel: 1
+
+      - capability: typescript
+        minimumLevel: 1
+
+      - capability: api_contract
+        minimumLevel: 1
+
+    risk: medium
+    priority: 75
+
+
+  # --------------------------------------------------------------
+  # Candidate 4 — Tests / Regression Evidence
+  # --------------------------------------------------------------
+  - role: review
+    concern: testing
+
+    objective: >
+      Verify that the Workstream A test suite meaningfully proves its critical
+      Event lifecycle, ownership, validation and database invariants without
+      weakening existing repository behavior.
+
+    reason: >
+      Workstream A added substantial unit and integration coverage; the quality
+      and completeness of that evidence should be reviewed independently.
+
+    evidence:
+      - kind: file
+        reference: apps/api/src/events/events.service.spec.ts
+        summary: Core service behavior tests.
+
+      - kind: file
+        reference: apps/api/src/events/events.controller.spec.ts
+        summary: Controller and authenticated API behavior tests.
+
+      - kind: file
+        reference: apps/api/src/events/events.int-spec.ts
+        summary: PostgreSQL-backed lifecycle integration tests.
+
+      - kind: file
+        reference: apps/api/src/events/event-validation.spec.ts
+        summary: Validation boundary tests.
+
+    resourceClaims:
+      - kind: repository_path
+        key: apps/api/src/events/**
+        mode: read
+
+    capabilities:
+      - capability: review
+        minimumLevel: 1
+
+      - capability: testing
+        minimumLevel: 1
+
+    risk: medium
+    priority: 70
+
+
+# ================================================================
+# EXECUTORS
+#
+# The Arbiter does NOT choose Claude.
+# It first decides whether work deserves GRANT.
+#
+# Only afterward does the Router select an executor whose capabilities
+# satisfy the granted WorkRequest.
+# ================================================================
+
+executors:
+
+  - id: independent-reviewer
+    adapter: claude
+
+    roles:
+      - review
+      - synthesis
+      - final_review
+      - escalation
+
+    capabilities:
+      - capability: review
+        minimumLevel: 1
+
+      - capability: security_review
+        minimumLevel: 1
+
+      - capability: postgresql
+        minimumLevel: 1
+
+      - capability: typescript
+        minimumLevel: 1
+
+      - capability: api_contract
+        minimumLevel: 1
+
+      - capability: testing
+        minimumLevel: 1
+
+      - capability: synthesis
+        minimumLevel: 1
+
+    effort: high
+    model: sonnet
+    available: true
+
+
+  # Writer executor used only after a canonical finding passes
+  # correctionPolicy and the Arbiter grants write authority.
+  - id: correction-writer
+    adapter: codex
+
+    roles:
+      - correction
+      - testing
+
+    capabilities:
+      - capability: typescript_backend_editing
+        minimumLevel: 1
+
+      - capability: testing
+        minimumLevel: 1
+
+    effort: high
+    available: true
+
+
+# Retry is still bounded.
+agentRetries: 1
+
+# 20 minutes per invocation.
+# The previous single reviewer consumed >60 minutes; adaptive reviewers
+# must remain specialized and bounded.
+agentTimeoutMs: 1200000
+
+
+# ================================================================
+# DETERMINISTIC GATE
+#
+# This adaptive run is a REVIEW run, not final Phase 6 integration.
+# Keep this gate narrow. The original Phase 6 workflow will later perform
+# its full integration/database gate after corrections are accepted.
+# ================================================================
+
+integration:
+
+  prepare:
+    - command: pnpm install --frozen-lockfile
+      required: true
+      timeoutMs: 900000
+
+  commands:
+    - command: pnpm --filter @tripwith/api typecheck
+      required: true
+
+    - command: pnpm --filter @tripwith/api build
+      required: true
+
+  diagnostics: []

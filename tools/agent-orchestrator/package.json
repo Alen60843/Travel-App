@@ -17,6 +17,9 @@
     "metrics": "pnpm --silent run build && node dist/cli.js metrics",
     "cleanup": "pnpm --silent run build && node dist/cli.js cleanup",
     "recover-handoffs": "pnpm --silent run build && node dist/cli.js recover-handoffs",
+    "retry-agent": "pnpm --silent run build && node dist/cli.js retry-agent",
+    "salvage-task": "pnpm --silent run build && node dist/cli.js salvage-task",
+    "authorize-recovery-policy": "pnpm --silent run build && node dist/cli.js authorize-recovery-policy",
     "retry-integration": "pnpm --silent run build && node dist/cli.js retry-integration",
     "apply-integration-fix": "pnpm --silent run build && node dist/cli.js apply-integration-fix"
   },

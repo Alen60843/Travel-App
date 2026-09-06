@@ -184,7 +184,9 @@ test('timeout first requests graceful termination and then force-kills an uncoop
     terminationGraceMs: 40,
   });
 
-  const result = await agent.run(makeRequest(fixture, { timeoutMs: 250 }));
+  // Leave enough startup time for the fake process to install its SIGTERM
+  // handler; this test is about grace-period escalation, not spawn latency.
+  const result = await agent.run(makeRequest(fixture, { timeoutMs: 750 }));
 
   assert.equal(result.status, 'timed_out');
   assert.equal(result.failureCode, 'AGENT_TIMEOUT');

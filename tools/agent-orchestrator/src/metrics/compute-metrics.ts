@@ -248,9 +248,9 @@ export async function computeRunMetrics(
       skipReason: runState.status === 'SKIPPED' ? (runState.skipReason ?? null) : null,
       implementationOutcome: lastAttempt?.outcome ?? null,
       handoffOutcome: runState.handoffOutcome ?? null,
-      handoffRepairAttempted: runState.handoffRepairAttempted ?? false,
-      handoffRepairSucceeded: runState.handoffRepairAttempted === true
-        ? (runState.handoffRepairSucceeded ?? false)
+      handoffRepairAttempted: runState.handoffRepairAttempts.length > 0,
+      handoffRepairSucceeded: runState.handoffRepairAttempts.length > 0
+        ? (runState.handoffRepairAttempts.at(-1)!.succeeded)
         : null,
       attempts: runState.agentAttempts.length,
       durationMs: taskDurationMs(runState),
