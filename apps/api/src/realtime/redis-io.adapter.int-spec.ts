@@ -22,7 +22,10 @@ import { RedisIoAdapter } from './redis-io.adapter';
  * still passes; there is nothing in this file's control flow left
  * unclosed. Don't spend time chasing it.
  */
-const REDIS_CACHE_URL = 'redis://localhost:6398';
+const REDIS_CACHE_URL =
+  process.env.TEST_REDIS_CACHE_URL ??
+  process.env.REDIS_CACHE_URL ??
+  'redis://localhost:6398';
 
 // Nothing listens on this port in this environment (verified). Used to prove
 // connectToRedis() fails loudly and promptly instead of hanging or silently
