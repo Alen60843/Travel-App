@@ -287,6 +287,15 @@ function parseRecoveryEpochHistory(
   recoveryEpochs.forEach((epoch, index) => {
     if (epoch.number !== index + 1) corrupt('recoveryEpochs numbers must be contiguous, unique, and in append order starting at 1');
   });
+  const claimedRequestIds = new Set<string>();
+  for (const epoch of recoveryEpochs) {
+    for (const requestId of epoch.requestIds) {
+      if (claimedRequestIds.has(requestId)) {
+        corrupt(`recoveryEpochs must not claim request ${requestId} in more than one epoch`);
+      }
+      claimedRequestIds.add(requestId);
+    }
+  }
   const activeRecoveryEpochNumber = integer(input.activeRecoveryEpochNumber, 'activeRecoveryEpochNumber');
   if (!recoveryEpochs.some((epoch) => epoch.number === activeRecoveryEpochNumber)) {
     corrupt('activeRecoveryEpochNumber references an unknown epoch');

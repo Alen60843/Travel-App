@@ -38,6 +38,20 @@ test('one persisted recovery policy snapshot round-trips exactly', () => {
   assert.deepEqual(state.recoveryPolicyHistory, [snapshot]);
 });
 
+test('a syntactically valid policyHash must match the normalized persisted policy', () => {
+  const policy: RecoveryPolicyOverlay = { salvage: { verify: [{ command: 'true', required: true }] } };
+  assert.throws(
+    () => validateRunState(baseRunState({
+      recoveryPolicyHistory: [{
+        authorizedAt: '2026-01-01T00:00:00.000Z',
+        policyHash: 'f'.repeat(64),
+        policy,
+      }],
+    })),
+    (error: unknown) => (error as { code?: string }).code === 'STATE_CORRUPT',
+  );
+});
+
 test('multiple snapshots are preserved in append order', () => {
   const first: RecoveryPolicyOverlay = { salvage: { verify: [{ command: 'true', required: true }] } };
   const second: RecoveryPolicyOverlay = {

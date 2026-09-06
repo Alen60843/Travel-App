@@ -24,7 +24,11 @@ class UnusedAgent implements Agent {
 
 function phaseYaml(
   baseBranch: string,
-  options: { readonly verify?: readonly string[]; readonly verifyCommand?: string } = {},
+  options: {
+    readonly verify?: readonly string[];
+    readonly verifyCommand?: string;
+    readonly prepareCommand?: string;
+  } = {},
 ): string {
   const verifyCommand = options.verifyCommand ?? 'true';
   const quoted = (command: string): string => JSON.stringify(command);
@@ -41,13 +45,17 @@ canonicalDesignDocument: design.md
 concurrency: 2
 agentRetries: 0
 maxReviewRounds: 3
-${verifyBlock}tasks:
+${options.prepareCommand === undefined ? '' : `agentWorktree:
+  prepare:
+    - command: ${quoted(options.prepareCommand)}
+      required: true
+`}${verifyBlock}tasks:
   - id: timed-out-task
     title: Timed-out writer
     owner: codex
     mode: implementation
     effort: medium
-    files: [feature.txt]
+    files: [feature.txt, new-feature.txt]
 `;
 }
 
@@ -62,21 +70,24 @@ interface Scenario {
 async function createTimeoutScenario(options: {
   readonly verify?: readonly string[];
   readonly verifyCommand?: string;
+  readonly prepareCommand?: string;
   readonly leaveDirtyDiff?: boolean;
   readonly outsideOwnershipEdit?: boolean;
   readonly extraUntrackedFile?: boolean;
   readonly foreignCommit?: boolean;
 } = {}): Promise<Scenario> {
   const fixture = await createTemporaryRepository();
+  await writeFile(join(fixture.repository, '.gitignore'), '.salvage-cache\n', 'utf8');
   await writeFile(join(fixture.repository, 'design.md'), '# Design\n', 'utf8');
   await writeFile(join(fixture.repository, 'feature.txt'), 'base\n', 'utf8');
-  await fixture.git.run(fixture.repository, ['add', '--', 'design.md', 'feature.txt']);
+  await fixture.git.run(fixture.repository, ['add', '--', '.gitignore', 'design.md', 'feature.txt']);
   await fixture.git.run(fixture.repository, ['commit', '-m', 'add design and feature baseline']);
   const runsRoot = join(fixture.container, 'runs');
   const phaseFile = join(fixture.container, 'phase.yaml');
   await writeFile(phaseFile, phaseYaml(fixture.baseBranch, {
     ...(options.verify === undefined ? {} : { verify: options.verify }),
     ...(options.verifyCommand === undefined ? {} : { verifyCommand: options.verifyCommand }),
+    ...(options.prepareCommand === undefined ? {} : { prepareCommand: options.prepareCommand }),
   }), 'utf8');
 
   const orchestrator = await AgentOrchestrator.start(phaseFile, {
@@ -323,6 +334,129 @@ test('a verify command that mutates tracked source fails closed regardless of it
         return true;
       },
     );
+  } finally {
+    await scenario.fixture.dispose();
+  }
+});
+
+test('salvage preparation that mutates tracked source fails closed before verification and creates no commit', async () => {
+  const scenario = await createTimeoutScenario({
+    prepareCommand: 'sh -c "echo prepared-mutation >> feature.txt"',
+    verifyCommand: 'true',
+  });
+  try {
+    const beforeHead = await scenario.fixture.git.resolveCommit(scenario.worktreePath, 'HEAD');
+    await assert.rejects(
+      () => AgentOrchestrator.salvageTask(scenario.runId, 'timed-out-task', {
+        repositoryPath: scenario.fixture.repository,
+        runsRoot: scenario.runsRoot,
+        agents: { codex: new UnusedAgent('codex'), claude: new UnusedAgent('claude') },
+      }),
+      (error: unknown) => {
+        if (!isOrchestratorError(error, 'AGENT_WORKTREE_PREPARATION_FAILED')) throw error;
+        assert.equal(
+          (error.details as unknown as { reason?: string }).reason,
+          'prepare_mutated_salvage_candidate',
+        );
+        return true;
+      },
+    );
+    const after = await scenario.orchestrator.stateStore.load();
+    assert.equal(after.tasks['timed-out-task']?.commit, undefined);
+    assert.equal(await scenario.fixture.git.resolveCommit(scenario.worktreePath, 'HEAD'), beforeHead);
+    assert.match(await readFile(join(scenario.worktreePath, 'feature.txt'), 'utf8'), /salvageable work/);
+    assert.match(await readFile(join(scenario.worktreePath, 'feature.txt'), 'utf8'), /prepared-mutation/);
+  } finally {
+    await scenario.fixture.dispose();
+  }
+});
+
+test('salvage preparation may create ignored artifacts without changing the candidate', async () => {
+  const scenario = await createTimeoutScenario({
+    prepareCommand: 'sh -c "mkdir -p .salvage-cache && printf ready > .salvage-cache/prepared"',
+    verifyCommand: 'true',
+  });
+  try {
+    const result = await AgentOrchestrator.salvageTask(scenario.runId, 'timed-out-task', {
+      repositoryPath: scenario.fixture.repository,
+      runsRoot: scenario.runsRoot,
+      agents: { codex: new UnusedAgent('codex'), claude: new UnusedAgent('claude') },
+    });
+    assert.ok(result.commitSha);
+    assert.equal(result.orchestrator.snapshot().tasks['timed-out-task']?.status, 'SUCCEEDED');
+    assert.equal(
+      await readFile(join(scenario.worktreePath, '.salvage-cache', 'prepared'), 'utf8'),
+      'ready',
+    );
+  } finally {
+    await scenario.fixture.dispose();
+  }
+});
+
+test('salvage preparation that mutates an existing owned untracked candidate fails closed', async () => {
+  const scenario = await createTimeoutScenario({
+    prepareCommand: 'sh -c "printf changed-by-prepare > new-feature.txt"',
+    verifyCommand: 'true',
+  });
+  try {
+    const untrackedPath = join(scenario.worktreePath, 'new-feature.txt');
+    await writeFile(untrackedPath, 'timed-out-agent-content\n', 'utf8');
+    const beforeHead = await scenario.fixture.git.resolveCommit(scenario.worktreePath, 'HEAD');
+
+    await assert.rejects(
+      () => AgentOrchestrator.salvageTask(scenario.runId, 'timed-out-task', {
+        repositoryPath: scenario.fixture.repository,
+        runsRoot: scenario.runsRoot,
+        agents: { codex: new UnusedAgent('codex'), claude: new UnusedAgent('claude') },
+      }),
+      (error: unknown) => {
+        if (!isOrchestratorError(error, 'AGENT_WORKTREE_PREPARATION_FAILED')) throw error;
+        assert.equal(
+          (error.details as unknown as { reason?: string }).reason,
+          'prepare_mutated_salvage_candidate',
+        );
+        return true;
+      },
+    );
+
+    const after = await scenario.orchestrator.stateStore.load();
+    assert.equal(after.tasks['timed-out-task']?.commit, undefined);
+    assert.equal(await scenario.fixture.git.resolveCommit(scenario.worktreePath, 'HEAD'), beforeHead);
+    assert.equal(await readFile(untrackedPath, 'utf8'), 'changed-by-prepare');
+  } finally {
+    await scenario.fixture.dispose();
+  }
+});
+
+test('salvage.verify detects mutation of an already-present owned untracked file and creates no commit', async () => {
+  const scenario = await createTimeoutScenario({
+    verifyCommand: 'sh -c "printf changed-by-verify > new-feature.txt"',
+  });
+  try {
+    const untrackedPath = join(scenario.worktreePath, 'new-feature.txt');
+    await writeFile(untrackedPath, 'timed-out-agent-content\n', 'utf8');
+    const beforeHead = await scenario.fixture.git.resolveCommit(scenario.worktreePath, 'HEAD');
+
+    await assert.rejects(
+      () => AgentOrchestrator.salvageTask(scenario.runId, 'timed-out-task', {
+        repositoryPath: scenario.fixture.repository,
+        runsRoot: scenario.runsRoot,
+        agents: { codex: new UnusedAgent('codex'), claude: new UnusedAgent('claude') },
+      }),
+      (error: unknown) => {
+        if (!isOrchestratorError(error, 'SALVAGE_VERIFICATION_FAILED')) throw error;
+        assert.equal(
+          (error.details as unknown as { reason?: string }).reason,
+          'verify_mutated_tracked_source',
+        );
+        return true;
+      },
+    );
+
+    const after = await scenario.orchestrator.stateStore.load();
+    assert.equal(after.tasks['timed-out-task']?.commit, undefined);
+    assert.equal(await scenario.fixture.git.resolveCommit(scenario.worktreePath, 'HEAD'), beforeHead);
+    assert.equal(await readFile(untrackedPath, 'utf8'), 'changed-by-verify');
   } finally {
     await scenario.fixture.dispose();
   }

@@ -373,6 +373,20 @@ test('validation C: duplicate epoch numbers fail closed', () => {
   );
 });
 
+test('validation C2: one request cannot be claimed by more than one recovery epoch', () => {
+  const { subject, clock, first, second } = twoRequestCoordinator();
+  subject.authorizeRecoveryEpoch({ policyHash: EPOCH_POLICY_HASH_A, maxWallClockMs: 3_600_000, requestIds: [first] });
+  clock.advance(60_000);
+  subject.authorizeRecoveryEpoch({ policyHash: EPOCH_POLICY_HASH_B, maxWallClockMs: 7_200_000, requestIds: [second] });
+  const corrupted = JSON.parse(JSON.stringify(subject.snapshot()));
+  corrupted.recoveryEpochs[1].requestIds.push(first);
+
+  assert.throws(
+    () => parseAdaptiveRunState(corrupted),
+    (error: unknown) => isOrchestratorError(error, 'STATE_CORRUPT'),
+  );
+});
+
 test('validation D: activeRecoveryEpochNumber referencing a nonexistent epoch fails closed', () => {
   const { subject, first } = twoRequestCoordinator();
   subject.authorizeRecoveryEpoch({ policyHash: EPOCH_POLICY_HASH_A, maxWallClockMs: 3_600_000, requestIds: [first] });

@@ -1,7 +1,11 @@
 import { ERROR_CODES, OrchestratorError, type ErrorCode } from '../errors';
 import { parseAdaptiveRunState } from '../adaptive/state-validation';
 import type { AdaptiveRunState } from '../adaptive/types';
-import { parseRecoveryPolicyOverlay, type RecoveryPolicyOverlay } from '../recovery/policy';
+import {
+  hashRecoveryPolicy,
+  parseRecoveryPolicyOverlay,
+  type RecoveryPolicyOverlay,
+} from '../recovery/policy';
 import { TASK_STATUSES, type TaskStatus } from '../tasks/scheduler';
 import type { AgentName, TaskSpec } from '../tasks/task-schema';
 
@@ -921,6 +925,13 @@ function parseRecoveryPolicySnapshot(value: unknown, path: string): RecoveryPoli
     policy = parseRecoveryPolicyOverlay(value.policy);
   } catch (error) {
     throw new OrchestratorError('STATE_CORRUPT', `${path}.policy is invalid`, { cause: error });
+  }
+  const expectedPolicyHash = hashRecoveryPolicy(policy);
+  if (policyHash.toLowerCase() !== expectedPolicyHash) {
+    throw new OrchestratorError(
+      'STATE_CORRUPT',
+      `${path}.policyHash does not match the normalized policy`,
+    );
   }
   return { authorizedAt, policyHash, policy };
 }

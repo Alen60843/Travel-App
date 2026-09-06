@@ -44,7 +44,7 @@ export async function computeTrackedDiffFingerprint(
     ]),
   ]);
 
-  const untrackedPaths = parseUntrackedPaths(status.stdout).sort();
+  const untrackedPaths = [...parseUntrackedPaths(status.stdout)].sort();
   const untrackedObjects: string[] = [];
   for (const path of untrackedPaths) {
     // Hash the bytes through Git using the path's normal attributes/filters so

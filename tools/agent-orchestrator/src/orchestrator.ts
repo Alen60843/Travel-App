@@ -1085,12 +1085,50 @@ export class AgentOrchestrator {
 
     if (!checkpointValid) {
       if (orchestrator.config.agentWorktree.prepare.length > 0) {
+        // Preparation may make ignored/generated artifacts available, but it
+        // must never rewrite the timed-out writer's salvage candidate. Bind
+        // both HEAD and the complete commit-eligible dirty state before the
+        // first command so a formatter, fixer, generated non-ignored file, or
+        // accidental commit is detected before verification or commit.
+        const prePrepareHeadSha = await orchestrator.git.resolveCommit(checked.worktree.path, 'HEAD');
+        const prePrepareFingerprint = await computeTrackedDiffFingerprint(
+          orchestrator.git, checked.worktree.path, preparedHeadSha,
+        );
         const prepared = await new IntegrationGate().run({
           cwd: checked.worktree.path,
           logsDirectory: join(orchestrator.stateStore.runDirectory, 'logs', taskId, 'salvage-prepare'),
           commands: orchestrator.config.agentWorktree.prepare,
           ...(orchestrator.signal === undefined ? {} : { signal: orchestrator.signal }),
         });
+        const postPrepareHeadSha = await orchestrator.git.resolveCommit(checked.worktree.path, 'HEAD');
+        const postPrepareFingerprint = await computeTrackedDiffFingerprint(
+          orchestrator.git, checked.worktree.path, preparedHeadSha,
+        );
+        // Candidate mutation takes priority over the command's exit status:
+        // a failing prepare command is still not authorized to become a
+        // second writer. Leave the dirty worktree intact for operator
+        // inspection/recovery and create no commit.
+        if (postPrepareHeadSha !== prePrepareHeadSha
+          || postPrepareFingerprint !== prePrepareFingerprint) {
+          await orchestrator.event('AGENT_WORKTREE_PREPARATION_FAILED', taskId, {
+            reason: 'prepare_mutated_salvage_candidate',
+            prePrepareHeadSha,
+            postPrepareHeadSha,
+          });
+          throw new OrchestratorError(
+            'AGENT_WORKTREE_PREPARATION_FAILED',
+            `Refusing salvage for ${taskId}: worktree preparation modified the salvage candidate`,
+            {
+              details: {
+                runId,
+                taskId,
+                reason: 'prepare_mutated_salvage_candidate',
+                prePrepareHeadSha,
+                postPrepareHeadSha,
+              },
+            },
+          );
+        }
         if (!prepared.passed) {
           throw new OrchestratorError(
             'AGENT_WORKTREE_PREPARATION_FAILED',
