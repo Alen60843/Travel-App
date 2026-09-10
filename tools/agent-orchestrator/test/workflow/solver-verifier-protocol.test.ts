@@ -8,7 +8,7 @@ import { HANDOFF_KEYS, FINDING_RESPONSE_KEYS } from '../../src/handoff';
 import { isOrchestratorError } from '../../src/errors';
 import { AgentOrchestrator } from '../../src/orchestrator';
 import { FINDING_KEYS, REVIEW_KEYS } from '../../src/review/findings';
-import type { RunState } from '../../src/state';
+import type { RunEvent, RunState } from '../../src/state';
 import { WorktreeManager } from '../../src/git';
 import { createTemporaryRepository } from '../git/helpers';
 
@@ -1426,7 +1426,7 @@ function agentReturning(name: AgentName, structuredHandoff: unknown, rawStdout: 
 
 // 20. Live path: a review response prefaced with prose (the exact real
 // Claude failure mode) is recovered via framing, without any repair-agent
-// invocation (review recovery is framing-only, by design).
+// invocation.
 test('scenario 20: a review response prefaced with prose is recovered via framing on the live path', async () => {
   const { fixture, write } = await setUp();
   try {
@@ -1573,6 +1573,155 @@ test('scenario 21: a persisted FAILED/REVIEW_BLOCKED final_review recovers via f
     // SKIP the Judge, never invoke Opus after the fact.
     assert.equal(completed.tasks.judge?.status, 'SKIPPED');
     assert.deepEqual(recoveryClaude.invocations, [], 'Claude must never be re-invoked for either task');
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+for (const severity of ['medium', 'high', 'critical', 'low']) {
+  test(`live approved review with ${severity} finding preserves evidence and routes correction correctly`, async () => {
+    const { fixture, write } = await setUp();
+    try {
+      const phaseFile = await write({ maxCorrectionRounds: 1 });
+      const original = {
+        ...(changesRequestedReview() as { findings: Array<Record<string, unknown>> }),
+        status: 'approved',
+        additionalWorkRequests: [],
+      };
+      original.findings[0]!.severity = severity;
+      const codex = new ScenarioAgent('codex', {
+        solve: async (request) => {
+          await writeFile(join(request.worktreePath, 'feature.txt'), 'implemented', 'utf8');
+          return completeHandoff();
+        },
+        fix: (request) => {
+          assert.deepEqual(request.previousReviewFindings, original.findings);
+          return completeHandoff({ findingResponses: [{
+            findingId: 'F001', decision: 'rejected', evidence: 'The spec requires only the initial state.',
+            reason: 'The finding assumes a requirement absent from the spec.',
+          }] });
+        },
+      });
+      const claude = new ScenarioAgent('claude', {
+        verify: () => original,
+        reverify: () => approvedReview(),
+      });
+      const orchestrator = await AgentOrchestrator.start(phaseFile, {
+        repositoryPath: fixture.repository,
+        runsRoot: join(fixture.container, 'runs'),
+        agents: { codex, claude },
+      });
+      const completed = await orchestrator.execute();
+      assert.equal(completed.status, 'COMPLETED');
+      const material = severity !== 'low';
+      assert.deepEqual(JSON.parse(await readFile(completed.tasks.verify!.reviewPaths[0]!, 'utf8')), {
+        ...original, status: material ? 'changes_requested' : 'approved',
+      });
+      assert.equal(original.status, 'approved');
+      assert.equal(completed.tasks.fix?.status, material ? 'SUCCEEDED' : 'SKIPPED');
+      assert.deepEqual(codex.invocations, material ? ['solve', 'fix'] : ['solve']);
+      assert.deepEqual(claude.invocations, material ? ['verify', 'reverify'] : ['verify']);
+      const repairs = completed.tasks.verify!.handoffRepairAttempts;
+      assert.equal(repairs.length, material ? 1 : 0);
+      if (material) {
+        assert.equal(repairs[0]?.method, 'deterministic');
+        assert.equal(repairs[0]?.succeeded, true);
+      }
+    } finally {
+      await fixture.dispose();
+    }
+  });
+}
+
+test('recover-handoffs normalizes a persisted approved/material review after two failed repairs without rerunning the reviewer', async () => {
+  const { fixture, write } = await setUp();
+  try {
+    const phaseFile = await write({ maxCorrectionRounds: 1 });
+    const runsRoot = join(fixture.container, 'runs');
+    const started = await AgentOrchestrator.start(phaseFile, {
+      repositoryPath: fixture.repository,
+      runsRoot,
+      agents: {
+        codex: new ScenarioAgent('codex', {
+          solve: async (request) => {
+            await writeFile(join(request.worktreePath, 'feature.txt'), 'implemented', 'utf8');
+            return completeHandoff();
+          },
+        }),
+        claude: new ScenarioAgent('claude', { verify: () => null }),
+      },
+    });
+    const failed = await started.execute();
+    assert.equal(failed.tasks.verify?.error?.code, 'REVIEW_BLOCKED');
+    assert.equal(failed.tasks.fix?.status, 'BLOCKED');
+
+    // Reconstruct the pre-fix dogfood failure only in this temporary repository.
+    // The writer already succeeded; the read-only reviewer process succeeded,
+    // but its preserved JSON has an approved/material contradiction.
+    const original = {
+      ...(changesRequestedReview() as { findings: Array<Record<string, unknown>> }),
+      status: 'approved',
+      additionalWorkRequests: [],
+    };
+    original.findings[0]!.severity = 'medium';
+    const rawStdout = `${JSON.stringify(original)}\n`;
+    const stdoutPath = join(started.stateStore.runDirectory, 'logs', `${failed.runId}.verify.claude.attempt-1.stdout.log`);
+    await writeFile(stdoutPath, rawStdout, 'utf8');
+    const previousRepairs = [1, 2].map(() => ({
+      method: 'none' as const, succeeded: false, failureReason: 'evidence_insufficient' as const, timestamp: failed.createdAt,
+    }));
+    await started.stateStore.save({
+      ...failed,
+      tasks: { ...failed.tasks, verify: {
+        ...failed.tasks.verify!,
+        error: { code: 'REVIEW_BLOCKED', message: 'review.status: approved may contain only non-blocking low findings', at: failed.createdAt },
+        handoffRepairAttempts: previousRepairs,
+      } },
+    });
+    const codex = new ScenarioAgent('codex', {
+      fix: async (request) => {
+        assert.deepEqual(request.previousReviewFindings, original.findings);
+        await writeFile(join(request.worktreePath, 'feature.txt'), 'implemented corrected', 'utf8');
+        return completeHandoff({ findingResponses: [{
+          findingId: 'F001', decision: 'confirmed', evidence: 'reproduced',
+          fix: 'appended corrected state', verification: 'cat feature.txt',
+        }] });
+      },
+    });
+    const claude = new ScenarioAgent('claude', { reverify: () => approvedReview() });
+    const { orchestrator, recovered, skipped } = await AgentOrchestrator.recoverHandoffFailures(failed.runId, {
+      repositoryPath: fixture.repository, runsRoot, agents: { codex, claude },
+    });
+    assert.deepEqual(recovered, ['verify']);
+    assert.deepEqual(skipped, []);
+    assert.deepEqual(codex.invocations, []);
+    assert.deepEqual(claude.invocations, []);
+    const after = orchestrator.snapshot();
+    assert.equal(after.tasks.verify?.status, 'SUCCEEDED');
+    assert.equal(after.tasks.verify?.handoffOutcome, 'valid');
+    assert.equal(after.tasks.verify?.commit, undefined);
+    assert.deepEqual(after.tasks.verify?.agentAttempts, failed.tasks.verify?.agentAttempts);
+    assert.deepEqual(after.tasks.solve?.commit, failed.tasks.solve?.commit);
+    assert.equal(after.tasks.fix?.status, 'PENDING');
+    assert.deepEqual(JSON.parse(await readFile(after.tasks.verify!.reviewPaths[0]!, 'utf8')), {
+      ...original, status: 'changes_requested',
+    });
+    const repairs = after.tasks.verify!.handoffRepairAttempts;
+    assert.equal(repairs.length, 3);
+    assert.deepEqual(repairs.slice(0, 2), previousRepairs);
+    assert.equal(repairs[2]?.method, 'deterministic');
+    assert.equal(repairs[2]?.succeeded, true);
+    const events = (await readFile(join(started.stateStore.runDirectory, 'events.jsonl'), 'utf8'))
+      .trim().split('\n').map((line) => JSON.parse(line) as RunEvent);
+    assert.ok(events.some((event) => event.name === 'HANDOFF_REPAIR_ATTEMPTED'
+      && event.taskId === 'verify' && event.data?.method === 'deterministic' && event.data.succeeded === true));
+
+    const completed = await orchestrator.execute();
+    assert.equal(completed.status, 'COMPLETED');
+    assert.equal(completed.tasks.fix?.status, 'SUCCEEDED');
+    assert.deepEqual(codex.invocations, ['fix']);
+    assert.deepEqual(claude.invocations, ['reverify'], 'the original verify task must never rerun');
+    assert.equal(await readFile(stdoutPath, 'utf8'), rawStdout, 'preserve original stdout byte for byte');
   } finally {
     await fixture.dispose();
   }

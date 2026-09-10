@@ -218,3 +218,29 @@ export function parseReview(input: string | unknown): StructuredReview {
   }
   return validateReview(value);
 }
+
+/** Recover only an approved verdict contradicted by a material finding. */
+export function normalizeApprovedReview(input: unknown): StructuredReview | null {
+  try {
+    const value: unknown = typeof input === 'string' ? JSON.parse(input) : input;
+    const candidate = object(value, 'review');
+    if (
+      candidate.status !== 'approved'
+      || !Array.isArray(candidate.findings)
+      || !candidate.findings.some((finding: unknown) => {
+        if (typeof finding !== 'object' || finding === null || Array.isArray(finding)) return false;
+        const severity = (finding as Record<string, unknown>).severity;
+        return severity === 'medium' || severity === 'high' || severity === 'critical';
+      })
+    ) {
+      return null;
+    }
+    const normalized = { ...candidate, status: 'changes_requested' };
+    validateReview(normalized);
+    // Preserve the original fields exactly, including optional work-request
+    // fields for which the validator's parsed return value supplies defaults.
+    return normalized as unknown as StructuredReview;
+  } catch {
+    return null;
+  }
+}

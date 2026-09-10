@@ -46,7 +46,7 @@ import {
   type RecoveryPolicyOverlay,
 } from './recovery/policy';
 import { extractStructuredPayload } from './protocol';
-import { parseReview, validateReview, type StructuredReview } from './review/findings';
+import { normalizeApprovedReview, parseReview, validateReview, type StructuredReview } from './review/findings';
 import {
   StateStore,
   assertResumeBaseUnmoved,
@@ -2884,13 +2884,9 @@ export class AgentOrchestrator {
   }
 
   /**
-   * §10/§11 (real Phase 5 dogfood recovery): review parsing has no
-   * deterministic-key-repair or agent-repair tier — Fix A already gives
-   * reviews exact bare keys, so the only real failure mode left is framing
-   * (surrounding prose), which extractStructuredPayload alone resolves. A
-   * candidate that is syntactically valid JSON but semantically wrong (bad
-   * status, unknown key, missing evidence, ...) still fails validateReview
-   * exactly as before — this never loosens what a "valid" review means.
+   * Recover an approved verdict with material findings by changing only its
+   * status and revalidating, then fall back to the existing framing recovery.
+   * All other semantic errors remain blocked; no review repair invokes an agent.
    */
   private async parseOrRecoverReview(
     task: TaskSpec,
@@ -2907,16 +2903,18 @@ export class AgentOrchestrator {
       if (!isOrchestratorError(error, 'REVIEW_BLOCKED')) {
         throw error;
       }
-      const framed = extractStructuredPayload(rawStdout, validateReview);
-      const record: HandoffRepairAttemptRecord = framed.ok
-        ? { method: 'framing', succeeded: true, timestamp: this.clock().toISOString() }
+      const normalized = normalizeApprovedReview(rawStructuredHandoff);
+      const framed = normalized === null ? extractStructuredPayload(rawStdout, validateReview) : null;
+      const recovered = normalized ?? (framed?.ok ? framed.value : null);
+      const record: HandoffRepairAttemptRecord = recovered !== null
+        ? { method: normalized !== null ? 'deterministic' : 'framing', succeeded: true, timestamp: this.clock().toISOString() }
         : { method: 'none', succeeded: false, failureReason: 'evidence_insufficient', timestamp: this.clock().toISOString() };
       await this.event('HANDOFF_REPAIR_ATTEMPTED', task.id, {
         method: record.method,
         succeeded: record.succeeded,
         ...(record.failureReason === undefined ? {} : { failureReason: record.failureReason }),
       });
-      if (!framed.ok) {
+      if (recovered === null) {
         return {
           review: null,
           error,
@@ -2924,7 +2922,7 @@ export class AgentOrchestrator {
         };
       }
       return {
-        review: framed.value,
+        review: recovered,
         error: null,
         outcome: { outcome: 'valid', repairAttempted: true, repairRecord: record },
       };
