@@ -47,6 +47,7 @@ import {
 } from './recovery/policy';
 import { extractStructuredPayload } from './protocol';
 import { normalizeApprovedReview, parseReview, validateReview, type StructuredReview } from './review/findings';
+import { completedReviewRounds, REVIEW_MODES } from './review/lineage';
 import {
   StateStore,
   assertResumeBaseUnmoved,
@@ -130,7 +131,6 @@ interface PreparedTask {
   readonly actualDependencyDiff: string;
 }
 
-const REVIEW_MODES = new Set(['review', 'synthesis', 'final_review']);
 const MAX_AGENT_DIFF_BYTES = 2 * 1024 * 1024;
 const INFRASTRUCTURE_FAILURES = new Set(['not_found', 'spawn_error', 'timed_out']);
 /** §6: bounded — a repair reformats existing text, it never does real work. */
@@ -2112,9 +2112,11 @@ export class AgentOrchestrator {
       return;
     }
     if (REVIEW_MODES.has(task.mode)) {
-      const completedRounds = ancestorTasks(task, new TaskGraph(this.config.tasks))
-        .filter((ancestor) => REVIEW_MODES.has(ancestor.mode))
-        .filter((ancestor) => this.state.tasks[ancestor.id]?.status === 'SUCCEEDED').length;
+      const completedRounds = completedReviewRounds(
+        task,
+        new TaskGraph(this.config.tasks),
+        (taskId) => this.state.tasks[taskId]?.status === 'SUCCEEDED',
+      );
       assertReviewRoundAllowed(completedRounds, this.config.maxReviewRounds);
       await this.event('REVIEW_STARTED', task.id, { round: completedRounds + 1 });
     }

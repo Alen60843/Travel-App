@@ -116,6 +116,7 @@ export interface TaskRunState {
   readonly preparation?: IntegrationPreparationState;
   readonly commit?: TaskCommitState;
   readonly agentAttempts: readonly AgentAttemptState[];
+  /** Task-local review completions (including reconciled verdicts), not the lineage's round number. */
   readonly reviewRounds: number;
   readonly handoffPath?: string;
   readonly reviewPaths: readonly string[];
