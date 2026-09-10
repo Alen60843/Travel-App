@@ -1,3 +1,8 @@
+import {
+  formatRepositoryContextHints,
+  resolveRepositoryContextHints,
+} from '../context/repository-context';
+
 export type AgentName = 'codex' | 'claude';
 
 export type AgentRole =
@@ -107,6 +112,15 @@ export interface Agent {
   run(request: AgentRequest): Promise<AgentResult>;
 }
 
+const GRAPH_CONTEXT_ROLES = new Set<AgentRole>([
+  'implementation',
+  'review',
+  'correction',
+  'testing',
+  'final_review',
+  'integration',
+]);
+
 export function defaultAccessForRole(role: AgentRole): AgentAccess {
   return role === 'review'
     || role === 'synthesis'
@@ -120,6 +134,12 @@ export function defaultAccessForRole(role: AgentRole): AgentAccess {
 
 export function buildAgentPrompt(request: AgentRequest): string {
   const access = request.access ?? defaultAccessForRole(request.role);
+  const repositoryContext = GRAPH_CONTEXT_ROLES.has(request.role)
+    ? resolveRepositoryContextHints(request.worktreePath, request.taskSpecification)
+    : null;
+  const repositoryContextSection = repositoryContext === null
+    ? []
+    : ['', formatRepositoryContextHints(repositoryContext)];
 
   return [
     'You are executing one bounded task for the TripWith local development orchestrator.',
@@ -148,6 +168,7 @@ export function buildAgentPrompt(request: AgentRequest): string {
     '',
     'Agent kernel:',
     agentKernelContract(access),
+    ...repositoryContextSection,
     '',
     'Role contract:',
     roleContract(request),
