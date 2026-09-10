@@ -88,7 +88,7 @@ export class EventsRepository {
   async setTransitionContext(
     manager: EntityManager,
     actorUserId: string,
-    reason: 'host_publish' | 'host_cancel',
+    reason: 'host_publish' | 'host_cancel' | 'capacity_reached',
   ): Promise<void> {
     await manager.query(
       `SELECT set_config('tripwith.actor_user_id', $1, true),
