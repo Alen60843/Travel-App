@@ -1,0 +1,135 @@
+# Phase 7 — Chat & Realtime
+# Pre-implementation audit only. This run must not modify product code.
+# Its purpose is to reconstruct the current repository truth, identify the
+# smallest missing Phase 7 capabilities, and derive the implementation DAG.
+# Graph Context v1 is intentionally dogfooded here: the task names only a few
+# semantic/file seeds and expects the resolver + agent evidence discipline to
+# discover the directly relevant neighborhood.
+
+phase: "7-audit"
+name: Phase 7 Chat & Realtime — pre-implementation audit
+baseBranch: phase7/chat-realtime-design
+canonicalDesignDocument: docs/superpowers/specs/2026-08-20-tripwith-phase-1-design.md
+concurrency: 1
+agentRetries: 1
+maxReviewRounds: 1
+maxHandoffRepairAttempts: 2
+agentTimeoutMs: 3600000
+
+tasks:
+  - id: phase7-chat-realtime-audit
+    title: Phase 7 Chat and Realtime repository audit
+    owner: codex
+    effort: high
+    mode: implementation
+    writer: false
+    files: []
+    dependsOn: []
+    instructions: |
+      READ-ONLY PRE-IMPLEMENTATION AUDIT. Do not edit files, create commits,
+      install dependencies, change Git state, or implement Phase 7 code.
+
+      Reconstruct the CURRENT repository truth for Phase 7 Chat & Realtime and
+      derive the smallest coherent implementation DAG from evidence. Treat the
+      canonical design as requirements/context, not proof that code exists.
+      Verify every material claim against the current worktree.
+
+      Start from these bounded seeds, then follow directly relevant repository
+      relationships as needed rather than performing broad exploration:
+        - docs/superpowers/specs/2026-08-20-tripwith-phase-1-design.md
+        - apps/api/src/realtime/rooms.ts
+        - ChatRoomType
+        - ChatMemberEntity
+        - MessageEntity
+        - EventParticipantEntity
+
+      AUDIT OBJECTIVES:
+
+      1. CURRENT CAPABILITY MAP
+         Establish what already exists and what does not for:
+           - MATCH room creation and membership
+           - EVENT room creation and membership
+           - persisted messages and per-room ordering
+           - message idempotency / client retry semantics
+           - Socket.IO authentication and room joining
+           - persist-before-broadcast delivery
+           - reconnect / catch-up by sequence
+           - read cursor / unread semantics
+           - presence / last-seen semantics
+           - authorization boundaries for reading, sending, joining and presence
+
+      2. EXISTING AUTHORITIES / INVARIANTS
+         Identify which facts are owned by PostgreSQL, which are disposable
+         Redis state, and which are application decisions. In particular verify
+         existing chat_rooms/chat_members/messages schema guarantees, sequence
+         assignment, matching-created room membership, and the existing Event
+         participant lifecycle. Do not duplicate database guarantees in the
+         proposed application design.
+
+      3. PHASE 6 -> PHASE 7 CONTRACT
+         Determine the exact current transaction/service path that creates an
+         approved EventParticipant. Establish the smallest safe integration
+         point for EVENT chat membership. Decide whether room creation/member
+         activation can reuse the existing schema unchanged or whether a schema
+         change is actually required. Never propose a migration merely for
+         convenience.
+
+      4. REALTIME CONTRACT
+         Inspect the existing RealtimeModule/gateway/auth/socket types and state
+         precisely what Phase 7 must add. Preserve the architecture rule that a
+         message is committed before broadcast and that reconnect recovery is
+         sequence-based, not timestamp-based. Distinguish durable PostgreSQL
+         truth from disposable Redis presence/pubsub state.
+
+      5. SECURITY / PRIVACY
+         Define authorization requirements for:
+           - joining chat:{roomId}
+           - fetching history / messages after seq
+           - sending a message
+           - advancing last_read_seq
+           - seeing another user's presence
+         Identify IDOR, stale-membership, unmatch/leave-event, spoofed sender,
+         duplicate-send, payload-size, and cross-room leakage risks that the
+         implementation/tests must falsify.
+
+      6. DERIVE THE IMPLEMENTATION DAG
+         Do NOT assume a preselected list of workstreams. Produce an evidence-
+         based DAG of the smallest implementation units. For each node report:
+           - responsibility
+           - direct dependencies
+           - likely ownership globs
+           - existing contracts it reuses
+           - required tests
+           - whether it can run in parallel with other nodes
+         Separate foundational contracts from MATCH chat, EVENT chat, read
+         state/reconnect, and presence only when the repository evidence really
+         supports those boundaries.
+
+      7. PHASE BOUNDARY
+         Explicitly list what should remain OUT of Phase 7 (for example future
+         trust/moderation/payment/provider features) so the implementation does
+         not expand scope accidentally.
+
+      8. GRAPH CONTEXT DOGFOOD NOTE
+         In the handoff decisions, include a short "GRAPH_CONTEXT_DOGFOOD"
+         entry stating whether the supplied repository-context hints were useful,
+         which hinted paths materially helped, and which important files (if any)
+         had to be discovered outside the hints. Do not claim token savings that
+         were not measured.
+
+      REQUIRED HANDOFF CONTENT:
+        - concise current-state capability map
+        - confirmed existing invariants/authorities
+        - explicit missing Phase 7 capabilities
+        - recommended dependency DAG / implementation order
+        - proposed ownership boundaries for each implementation node
+        - required verification strategy, including DB-backed concurrency or
+          realtime integration tests where materially necessary
+        - unresolved architectural questions only when repository evidence truly
+          cannot decide them
+
+      Do not implement anything. This audit exists to make the following Phase 7
+      implementation plan smaller, safer, and evidence-based.
+
+# There are intentionally no integration commands. A read-only audit has no
+# product diff to integrate; the persisted structured handoff is the artifact.
