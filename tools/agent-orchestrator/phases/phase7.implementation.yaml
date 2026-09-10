@@ -1,0 +1,467 @@
+# Phase 7 — Chat & Realtime
+# Evidence-derived implementation DAG from run-20260910095505-d6b3c3e9.
+# The audit found that MATCH room provisioning and the durable chat schema
+# already exist; Phase 7 should make that foundation usable rather than rebuild it.
+
+phase: 7
+name: Phase 7 Chat & Realtime — implementation
+baseBranch: phase7/chat-realtime-design
+canonicalDesignDocument: docs/superpowers/specs/2026-08-20-tripwith-phase-1-design.md
+concurrency: 2
+agentRetries: 1
+maxReviewRounds: 2
+maxHandoffRepairAttempts: 2
+agentTimeoutMs: 3600000
+
+agentWorktree:
+  prepare:
+    - command: pnpm install --frozen-lockfile
+      required: true
+      timeoutMs: 900000
+    - command: pnpm --filter @tripwith/shared build
+      required: true
+      timeoutMs: 300000
+
+salvage:
+  verify:
+    - command: pnpm --filter @tripwith/api typecheck
+      required: true
+      timeoutMs: 600000
+    - command: pnpm --filter @tripwith/api test -- --runInBand
+      required: true
+      timeoutMs: 1800000
+
+tasks:
+  # N1 — durable chat domain/core. Existing MATCH provisioning becomes usable here.
+  - id: phase7-durable-chat-core
+    title: Durable chat core, authorization and sequence protocol
+    owner: codex
+    effort: high
+    mode: implementation
+    files:
+      - apps/api/src/chat/**
+      - packages/shared/src/chat*.ts
+      - packages/shared/src/index.ts
+    dependsOn: []
+    instructions: |
+      Implement the smallest complete durable Chat domain on top of the schema that
+      already exists. Do not add a migration unless current repository evidence
+      proves a correctness requirement cannot be expressed with the existing
+      chat_rooms/chat_members/messages model.
+
+      Reuse the existing MATCH room + membership provisioning in swipes; do not
+      create a second MATCH provisioning path. PostgreSQL remains authoritative for
+      rooms, memberships, messages, sequence allocation and read cursors.
+
+      Required capabilities:
+        - current-room authorization for authenticated callers
+        - room listing for rooms the caller is currently authorized to use
+        - TEXT message send with bounded non-empty clientMessageId
+        - sender, seq, timestamps and SYSTEM type are server-owned
+        - plain INSERT path that preserves tw_assign_message_seq semantics
+        - identical retry returns the original committed message/seq
+        - changed payload under the same clientMessageId returns a stable conflict
+        - bounded room history and seq > afterSeq catch-up with high-water metadata
+        - monotonic last_read_seq advancement only for the caller, never above room last_seq
+        - unread serialization from the existing last_seq/last_read_seq contract
+        - safe bigint serialization using current repository conventions
+
+      Authorization must re-check durable current state rather than trusting cached
+      Socket.IO room membership. MATCH authorization additionally requires the live
+      match to remain unmatched (unmatched_at IS NULL) and fresh account/block policy.
+
+      Preserve sequence positions during recovery. Do not compute MAX(seq)+1, assign
+      seq in TypeScript, use COUNT(*) as unread truth, or use INSERT ... ON CONFLICT
+      on messages in a way that can fire the BEFORE INSERT sequence trigger and
+      advance last_seq for a duplicate.
+
+      Scope baseline for Phase 7 v1:
+        - client send supports TEXT only
+        - IMAGE/LOCATION/SYSTEM creation, attachments, edits/deletes and typing
+          indicators remain out of scope
+        - soft-deleted/tombstoned positions must not stall sequence recovery
+
+      Tests are mandatory. Include real PostgreSQL coverage for concurrent sends,
+      duplicate/lost-ack retry behavior, changed-payload key reuse, rollback,
+      room isolation, cursor races and sequence catch-up.
+
+  - id: phase7-durable-chat-review
+    title: Independent review of durable chat core
+    owner: claude
+    model: sonnet
+    effort: high
+    mode: review
+    files: []
+    dependsOn:
+      - phase7-durable-chat-core
+    instructions: |
+      Adversarially review only the durable chat core diff and directly relevant
+      schema/contracts. Attempt to falsify authorization, idempotency, sequence
+      correctness, bigint handling, cursor monotonicity, room isolation and retry
+      behavior. In particular detect any message upsert/conflict path capable of
+      consuming an extra sequence number. Report only material evidence-backed findings.
+
+  - id: phase7-durable-chat-correction
+    title: Correct durable chat findings
+    owner: codex
+    effort: high
+    mode: correction
+    files:
+      - apps/api/src/chat/**
+      - packages/shared/src/chat*.ts
+      - packages/shared/src/index.ts
+    dependsOn:
+      - phase7-durable-chat-review
+    condition:
+      reviewOf: phase7-durable-chat-review
+      skipIfStatus:
+        - approved
+    instructions: |
+      Classify every assigned finding with current repository evidence and correct
+      confirmed defects only. Preserve PostgreSQL sequence/membership authority and
+      do not broaden into transport, EVENT lifecycle, presence or migrations.
+
+  - id: phase7-durable-chat-final-review
+    title: Final review of durable chat corrections
+    owner: claude
+    model: sonnet
+    effort: high
+    mode: final_review
+    files: []
+    dependsOn:
+      - phase7-durable-chat-correction
+    condition:
+      reviewOf: phase7-durable-chat-review
+      skipIfStatus:
+        - approved
+    instructions: |
+      Re-check the original durable-chat findings against the corrected diff and
+      database-backed evidence. Approve only when no material correctness or
+      authorization defect remains.
+
+  # N2 — may run in parallel with N3 once N1 is stable.
+  - id: phase7-event-chat-integration
+    title: EVENT room and participant membership integration
+    owner: codex
+    effort: high
+    mode: implementation
+    files:
+      - apps/api/src/events/**
+    dependsOn:
+      - phase7-durable-chat-final-review
+    instructions: |
+      Integrate EVENT chat membership into the existing Phase 6 event/join lifecycle
+      using the durable chat interfaces from N1. Reuse the existing EVENT room
+      uniqueness and chat_members primary key; do not add a convenience migration.
+
+      In the existing EntityManager transaction and lock order, immediately after a
+      participant is successfully inserted, find/create the EVENT room, ensure host
+      membership from events.host_user_id, and activate the approved participant.
+      Failure must roll back approval, participant, chat membership and any FULL
+      transition atomically. Never open a nested independent transaction and never
+      allocate participant seats from chat code.
+
+      Existing Phase 6 participants must not be stranded. Provide an idempotent,
+      authorized EVENT-room resolver/reconciliation path that can materialize the
+      host and current active participants without changing seat accounting or
+      resetting an existing member read cursor.
+
+      Phase 7 lifecycle policy:
+        - CANCELLED events: fail closed for chat join/send/history
+        - COMPLETED events: authorized host/current participants may read retained
+          history, but sending is disabled
+        - active joinable/in-progress lifecycle states: authorized members may read/send
+        - participant withdrawal is not invented here; if durable revoked state exists,
+          authorization must reject it
+
+      Do not require the host to be an EventParticipant. Tests must cover manual and
+      auto approval, host access without a participant row, existing-participant
+      reconciliation, duplicate approval/retry, cancellation/completion policy,
+      rollback on membership failure and the real final-seat race.
+
+  - id: phase7-event-chat-review
+    title: Independent review of EVENT chat integration
+    owner: claude
+    model: sonnet
+    effort: high
+    mode: review
+    files: []
+    dependsOn:
+      - phase7-event-chat-integration
+    instructions: |
+      Verify transactionality, lock ordering, host authority, existing-participant
+      reconciliation, lifecycle policy and absence of seat/counter duplication.
+      Attempt to prove that an approved participant can be left without membership
+      or that chat failure can commit independently of approval.
+
+  - id: phase7-event-chat-correction
+    title: Correct EVENT chat integration findings
+    owner: codex
+    effort: high
+    mode: correction
+    files:
+      - apps/api/src/events/**
+    dependsOn:
+      - phase7-event-chat-review
+    condition:
+      reviewOf: phase7-event-chat-review
+      skipIfStatus:
+        - approved
+    instructions: |
+      Correct confirmed EVENT integration findings only. Preserve the existing
+      EventsRepository transaction/capacity/payment-safe guarantees and N1 contracts.
+
+  - id: phase7-event-chat-final-review
+    title: Final review of EVENT chat corrections
+    owner: claude
+    model: sonnet
+    effort: high
+    mode: final_review
+    files: []
+    dependsOn:
+      - phase7-event-chat-correction
+    condition:
+      reviewOf: phase7-event-chat-review
+      skipIfStatus:
+        - approved
+    instructions: |
+      Re-verify the corrected EVENT integration and its transaction/concurrency tests.
+
+  # N3 — transport can run beside N2 after N1 because ownership is disjoint.
+  - id: phase7-chat-realtime-transport
+    title: Authenticated Chat realtime transport
+    owner: codex
+    effort: high
+    mode: implementation
+    files:
+      - apps/api/src/realtime/**
+      - apps/api/src/chat/transport/**
+      - apps/api/src/app.module.ts
+    dependsOn:
+      - phase7-durable-chat-final-review
+    instructions: |
+      Add the smallest typed Socket.IO Chat transport over N1 without moving business
+      authority into the gateway. Preserve RealtimeModule.forRoot authenticator
+      injection and the existing RedisIoAdapter.
+
+      Required capabilities:
+        - server-built chat:{roomId} room helper
+        - typed chat events/acks/errors
+        - handler readiness must not race async authentication
+        - joining a chat room requires fresh N1 authorization
+        - send delegates to durable N1 persistence first, then publishes only after
+          the transaction has committed
+        - duplicate/lost-ack client retries receive the durable original ack
+        - reconnect delegates to sequence catch-up rather than timestamp heuristics
+        - publish failure never rolls back or reports the committed message as absent
+        - before content delivery, recipients must be currently eligible; cached
+          Socket.IO membership alone is not authorization
+
+      A stale subscribed socket must not continue receiving content after durable
+      membership/match/event/account revocation. Cross-instance eviction may be used
+      as cleanup but never as the sole security control.
+
+      Tests must include real Socket.IO frames, outsider join denial, sender spoofing,
+      auth-readiness race, rollback/no-broadcast, ack loss/retry, cross-room leakage,
+      stale-recipient revocation and two-instance Redis fanout where practical.
+
+  - id: phase7-chat-realtime-review
+    title: Independent review of Chat realtime transport
+    owner: claude
+    model: sonnet
+    effort: high
+    mode: review
+    files: []
+    dependsOn:
+      - phase7-chat-realtime-transport
+    instructions: |
+      Adversarially verify authentication readiness, room authorization, persist-before-
+      broadcast, retry acknowledgements, stale-recipient security, cross-room leakage
+      and cross-instance behavior. Do not redesign the durable chat core.
+
+  - id: phase7-chat-realtime-correction
+    title: Correct Chat realtime transport findings
+    owner: codex
+    effort: high
+    mode: correction
+    files:
+      - apps/api/src/realtime/**
+      - apps/api/src/chat/transport/**
+      - apps/api/src/app.module.ts
+    dependsOn:
+      - phase7-chat-realtime-review
+    condition:
+      reviewOf: phase7-chat-realtime-review
+      skipIfStatus:
+        - approved
+    instructions: |
+      Correct confirmed transport findings only. Keep PostgreSQL/N1 authoritative and
+      Redis/pubsub disposable.
+
+  - id: phase7-chat-realtime-final-review
+    title: Final review of Chat realtime corrections
+    owner: claude
+    model: sonnet
+    effort: high
+    mode: final_review
+    files: []
+    dependsOn:
+      - phase7-chat-realtime-correction
+    condition:
+      reviewOf: phase7-chat-realtime-review
+      skipIfStatus:
+        - approved
+    instructions: |
+      Re-check transport findings and the corrected socket/integration evidence.
+
+  # N4 — depends on N3 because it coordinates gateway lifecycle/protocol surfaces.
+  - id: phase7-presence
+    title: Privacy-authorized multi-instance presence
+    owner: codex
+    effort: high
+    mode: implementation
+    files:
+      - apps/api/src/chat/presence/**
+      - apps/api/src/chat/transport/**
+      - apps/api/src/realtime/**
+    dependsOn:
+      - phase7-chat-realtime-final-review
+    instructions: |
+      Implement disposable presence in CACHE_REDIS only, using per-session/socket TTL
+      leases and heartbeat. Aggregate multiple devices and API instances; one disconnect
+      must not mark a user offline while another live lease exists. Expiry must repair
+      crashed processes/missed disconnects.
+
+      Presence is never authorization and must not be persisted into users.updated_at.
+      Use server timestamps and best-effort lastSeen; Redis loss/outage returns unknown,
+      not authoritative offline.
+
+      Phase 7 visibility policy: presence may be queried/subscribed only for a target
+      with whom the caller currently shares an authorized conversation, both accounts
+      remain usable, and no block exists in either direction. No separate global
+      presence-visibility preference or durable last-seen storage is added in Phase 7.
+
+      Tests must cover multiple devices, two API instances, duplicate/reordered
+      disconnects, TTL expiry after process death, Redis loss, unauthorized enumeration,
+      spoofed target identity and revocation while connected.
+
+  - id: phase7-presence-review
+    title: Independent review of presence
+    owner: claude
+    model: sonnet
+    effort: high
+    mode: review
+    files: []
+    dependsOn:
+      - phase7-presence
+    instructions: |
+      Verify multi-device/multi-instance lease correctness, Redis-loss semantics,
+      privacy authorization and revocation behavior. Treat presence as disposable and
+      never as a source of durable authorization truth.
+
+  - id: phase7-presence-correction
+    title: Correct presence findings
+    owner: codex
+    effort: high
+    mode: correction
+    files:
+      - apps/api/src/chat/presence/**
+      - apps/api/src/chat/transport/**
+      - apps/api/src/realtime/**
+    dependsOn:
+      - phase7-presence-review
+    condition:
+      reviewOf: phase7-presence-review
+      skipIfStatus:
+        - approved
+    instructions: |
+      Correct confirmed presence findings only without adding durable schema or a new
+      Redis authority boundary.
+
+  - id: phase7-presence-final-review
+    title: Final review of presence corrections
+    owner: claude
+    model: sonnet
+    effort: high
+    mode: final_review
+    files: []
+    dependsOn:
+      - phase7-presence-correction
+    condition:
+      reviewOf: phase7-presence-review
+      skipIfStatus:
+        - approved
+    instructions: |
+      Re-check the corrected presence behavior and privacy/revocation evidence.
+
+  # N5 — focused composed-system tests after all feature units are stable.
+  - id: phase7-composed-verification
+    title: Phase 7 composed integration and regression tests
+    owner: codex
+    effort: high
+    mode: testing
+    files:
+      - apps/api/test/phase7-chat-realtime/**
+    dependsOn:
+      - phase7-event-chat-final-review
+      - phase7-chat-realtime-final-review
+      - phase7-presence-final-review
+    instructions: |
+      Add only focused composed-system verification fixtures/tests needed to prove the
+      integrated Phase 7 behavior. Do not reimplement feature logic in test helpers.
+
+      Prove at minimum:
+        - reciprocal MATCH -> existing room/members -> authorized durable/realtime chat
+        - manual and automatic EVENT approval -> host/member EVENT chat access
+        - EVENT completion is read-only and cancellation fails closed
+        - commit-before-emit failure is repaired by seq catch-up
+        - concurrent duplicate send does not consume extra sequence values
+        - cursor advancement is monotonic and room-scoped
+        - stale/revoked recipients do not receive later content
+        - multi-instance presence remains correct under disconnect/TTL/Redis loss
+        - existing Swipe, Events, Auth and DB invariants remain intact
+
+  - id: phase7-final-review
+    title: Final independent Phase 7 review
+    owner: claude
+    model: sonnet
+    effort: extra_high
+    mode: final_review
+    files: []
+    dependsOn:
+      - phase7-composed-verification
+    instructions: |
+      Perform one bounded final review of the composed Phase 7 diff and evidence.
+      Verify authorization, transactionality, sequence/idempotency, reconnect recovery,
+      EVENT integration, stale-recipient security, presence privacy and phase-boundary
+      discipline. Approve when no material defect remains; do not reopen unrelated
+      future features.
+
+integration:
+  prepare:
+    - command: pnpm install --frozen-lockfile
+      required: true
+      timeoutMs: 900000
+    - command: pnpm --filter @tripwith/shared build
+      required: true
+      timeoutMs: 300000
+  commands:
+    - pnpm --filter @tripwith/shared typecheck
+    - pnpm --filter @tripwith/api typecheck
+    - pnpm --filter @tripwith/api build
+    - pnpm --filter @tripwith/shared test
+    - command: pnpm --filter @tripwith/api test -- --runInBand --detectOpenHandles
+      required: true
+      timeoutMs: 1800000
+    - pnpm run check:enums
+    - command: pnpm --filter @tripwith/api db:verify
+      required: true
+      timeoutMs: 1800000
+  diagnostics:
+    - pnpm audit --prod
+
+# Explicit Phase 7 boundary: no provider-inquiry chat, marketplace/provider
+# subscriptions, payment capture/refund, trust/review scoring, moderation/report
+# workflows, SOS/live tracking, push/email delivery, attachment/storage pipeline,
+# edit/delete, typing indicators, mobile UI, or complete unmatch/participant-
+# withdrawal product flows unless separately authorized.
