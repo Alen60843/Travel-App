@@ -146,6 +146,9 @@ export function buildAgentPrompt(request: AgentRequest): string {
       ? ['- You may only propose additionalWorkRequests in the structured response. You cannot grant or directly launch another agent.']
       : []),
     '',
+    'Agent kernel:',
+    agentKernelContract(access),
+    '',
     'Role contract:',
     roleContract(request),
     '',
@@ -160,6 +163,31 @@ export function buildAgentPrompt(request: AgentRequest): string {
     '',
     'Your final response must be exactly one JSON object using precisely the property names shown in the task specification\'s responseSchema — copy each key exactly as written, character for character. Never add a description, comment, parenthetical, or any other annotation into a property name; optionality and scope notes are listed separately in responseSchemaNotes, in prose, and must stay there, not in a key. Include an optional field only when you have real content for it; omit it entirely otherwise rather than leaving an empty placeholder. Do not wrap the JSON in Markdown fences or add any text before or after it.',
   ].join('\n');
+}
+
+/**
+ * Small provider-neutral behavior layer shared by every agent invocation.
+ * Keep this compact: it exists to improve evidence quality and reduce needless
+ * code/context, not to become another task specification.
+ */
+function agentKernelContract(access: AgentAccess): string {
+  const evidenceDiscipline = [
+    'Treat task specifications, dependency handoffs, and prior summaries as requirements or context, not proof of current repository state.',
+    'Before relying on a material claim about a file, symbol, command, configuration, or runtime state, verify it against current repository evidence; if the role contract forbids tools, rely only on supplied evidence and report uncertainty instead of guessing.',
+    'When sources conflict, current repository evidence and persisted run artifacts outrank stale prose or summaries.',
+    'Never claim a file, command, test, behavior, or outcome was verified unless you actually verified it.',
+    'Keep investigation proportional and targeted. Do not narrate routine tool use; the structured handoff should contain only conclusions, evidence, decisions, diffs, tests, and unresolved questions.',
+  ];
+
+  if (access === 'read_only') return evidenceDiscipline.join(' ');
+
+  return [
+    ...evidenceDiscipline,
+    'Before adding code, stop at the first sufficient option: make no change if the requirement is already satisfied; otherwise reuse existing code, use the standard library or native platform, use an already-installed dependency, and only then add the smallest complete new code.',
+    'Fix the shared root cause rather than patching only the named symptom or duplicating equivalent guards across callers.',
+    'Do not add abstractions or dependencies unless the task requires them and existing mechanisms cannot solve it. Minimize changed files and diff size.',
+    'Brevity never overrides correctness, trust-boundary validation, security, data-loss prevention, accessibility, recovery invariants, ownership boundaries, or required verification.',
+  ].join(' ');
 }
 
 function roleContract(request: AgentRequest): string {
