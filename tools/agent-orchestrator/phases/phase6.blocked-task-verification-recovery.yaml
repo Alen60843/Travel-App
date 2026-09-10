@@ -1,0 +1,234 @@
+# Phase 6 infrastructure dogfood follow-up
+# Recovery for a writer that produced a VALID blocked handoff after completing
+# its implementation, where the only missing evidence is deterministic
+# verification unavailable inside the provider sandbox (for example live local
+# PostgreSQL access). The operator must explicitly invoke the recovery command;
+# normal resume must never auto-promote a blocked task.
+
+phase: 6
+name: Orchestrator — verified blocked-writer recovery
+baseBranch: orchestrator/blocked-task-verification-recovery
+canonicalDesignDocument: docs/superpowers/specs/2026-09-04-orchestrator-recovery-hardening-design.md
+concurrency: 1
+agentRetries: 1
+maxReviewRounds: 2
+maxHandoffRepairAttempts: 2
+agentTimeoutMs: 3600000
+
+agentWorktree:
+  prepare:
+    - command: pnpm install --frozen-lockfile
+      required: true
+      timeoutMs: 900000
+
+salvage:
+  verify:
+    - command: pnpm --filter @tripwith/agent-orchestrator typecheck
+      required: true
+      timeoutMs: 600000
+    - command: pnpm --filter @tripwith/agent-orchestrator test
+      required: true
+      timeoutMs: 1200000
+    - command: pnpm --filter @tripwith/agent-orchestrator smoke
+      required: true
+      timeoutMs: 600000
+
+tasks:
+  - id: blocked-writer-verification-recovery
+    title: Recover a valid blocked writer after deterministic external-environment verification
+    owner: codex
+    effort: high
+    mode: implementation
+    files:
+      - package.json
+      - tools/agent-orchestrator/package.json
+      - tools/agent-orchestrator/src/**
+      - tools/agent-orchestrator/test/**
+      - tools/agent-orchestrator/README.md
+    dependsOn: []
+    instructions: |
+      Implement the SMALLEST COMPLETE recovery path for the real dogfood state
+      produced by run-20260910065424-d7ec13b6, without touching that run or any
+      apps/api source. The real persisted shape was:
+        - run.status = BLOCKED
+        - implementation task.status = BLOCKED
+        - task.error.code = REVIEW_BLOCKED
+        - latest agent attempt outcome = succeeded
+        - handoffOutcome = valid
+        - structured handoff status = blocked
+        - no task commit exists
+        - the preserved task worktree is dirty only inside task ownership
+        - provider sandbox could not reach 127.0.0.1:5432, but the operator can
+          run the deterministic phase verification from the host terminal.
+
+      FIRST inspect the current recovery machinery and reuse it. In particular
+      inspect salvageTask/checkSalvageEligibility, retryAgentFailure,
+      recoverHandoffFailures, ensureTaskCommit, computeTrackedDiffFingerprint,
+      dependencyOnlyDescendantsToReopen, state validation, CLI conventions, and
+      existing recovery tests. Do not create a parallel framework when the
+      hardened salvage primitives already solve the same integrity problems.
+
+      Desired operator surface:
+        pnpm agents:verify-blocked-task <run-id> <task-id>
+      (A different precise verb is acceptable only with a concrete existing CLI
+      convention; document it and add the root/package script consistently.)
+
+      REQUIRED SEMANTICS:
+        1. Explicit only. `resume` alone MUST NOT promote a BLOCKED task.
+        2. Narrow eligibility. Accept only a preserved writer task whose process
+           succeeded and whose accepted structured handoff is VALID but has
+           status `blocked`; reject review/debate tasks, process failures,
+           invalid/missing handoffs, tasks with a commit, clean/no-diff tasks,
+           moved HEAD, foreign commits, ownership violations, dependency drift,
+           unexpected commit-eligible untracked files, and already-integrated
+           work.
+        3. Do not key eligibility merely on provider prose. Use persisted
+           execution structure plus the parsed handoff. REVIEW_BLOCKED is not by
+           itself sufficient because review tasks can use the same error family.
+        4. Reuse the phase's already-authorized deterministic writer verification
+           commands when possible. Prefer `config.salvage.verify` rather than
+           adding a new recovery-policy/config schema unless current contracts
+           prove that reuse is semantically unsafe. No operator-supplied shell
+           command may be trusted as completion evidence.
+        5. Verification runs in the PRESERVED task worktree from the host CLI
+           process, so host-accessible PostgreSQL/Redis can be used. Persist logs,
+           exit/timing evidence and a diff/config-bound verification checkpoint.
+        6. Verification/preparation are read-only with respect to the candidate:
+           bind HEAD plus the complete commit-eligible dirty-state fingerprint
+           before/after; tracked or non-ignored-untracked mutation (or a commit)
+           fails closed. Ignored generated artifacts remain allowed, matching the
+           hardened salvage behavior.
+        7. Only after required verification succeeds may the orchestrator create
+           the canonical task commit through the same ensureTaskCommit +
+           ownership enforcement path used elsewhere. Never `git add/commit`
+           directly in recovery code.
+        8. Preserve the original blocked handoff/evidence append-only. Do not
+           rewrite history to pretend the provider ran tests it could not run.
+           Create/persist recovery evidence separately, and if downstream tasks
+           require a COMPLETE dependency handoff, synthesize a truthful recovered
+           completion artifact that retains the original decisions/risks plus the
+           deterministic host-verification evidence. Never destroy/overwrite the
+           original blocked artifact.
+        9. On success: task -> SUCCEEDED, run -> RUNNING, dependency-only
+           descendants previously blocked solely by this task reopen to their
+           correct READY/PENDING states, and a later normal `agents:resume`
+           continues the SAME run to review. No agent is invoked by the recovery
+           command itself.
+       10. If the run uses adaptive state, mirror recovery through the existing
+           recovery lifecycle or explicitly reject unsupported adaptive shape;
+           never leave TaskRunState and adaptive work-unit state contradictory.
+       11. State/history must parse after recovery and remain append-only. A
+           repeated recovery invocation after success must refuse/no-op safely and
+           must never create a second commit or duplicate history.
+       12. The operation must be crash-safe to at least the same standard as the
+           existing salvage path. Reuse existing checkpoints/helpers rather than
+           weakening guarantees.
+
+      REQUIRED TESTS (focused regression + acceptance):
+        - the exact real dogfood-shaped BLOCKED implementation is eligible
+        - valid blocked handoff + dirty owned diff + passing deterministic verify
+          becomes one canonical SUCCEEDED task commit and reopens dependents
+        - recovery invokes NO Codex/Claude provider
+        - resume alone does not recover it
+        - verification failure leaves task/worktree blocked and uncommitted
+        - verify/preparation mutation of tracked or existing/new non-ignored
+          untracked candidate content fails closed; ignored artifacts are allowed
+        - clean worktree, moved HEAD, foreign commit, ownership violation,
+          unexpected untracked file, missing/invalid/non-blocked handoff, process
+          failure, review-mode task, existing commit, unsatisfied dependency and
+          already-integrated state are rejected without mutation
+        - original blocked handoff remains byte-for-byte preserved; recovered
+          artifact/history truthfully records host deterministic verification
+        - second invocation after successful recovery does not duplicate commit
+          or recovery history
+        - crash/resume/checkpoint behavior does not trust stale verification after
+          candidate or verify-config change
+        - existing retry-agent, recover-handoffs, salvage-task, integration retry,
+          adaptive recovery and protected-run behavior remain unchanged.
+
+      Add concise README/CLI documentation only if useful. Do not add a new
+      dependency. Do not touch tools/agent-orchestrator/runs/**, apps/api/**,
+      migrations, or the Phase 6 Workstream B task worktree.
+
+  - id: blocked-writer-verification-review
+    title: Adversarial review of blocked-writer verification recovery
+    owner: claude
+    model: sonnet
+    effort: high
+    mode: review
+    files: []
+    dependsOn:
+      - blocked-writer-verification-recovery
+    instructions: |
+      Adversarially review the actual diff. Focus on false-positive promotion of
+      blocked work, handoff/history rewriting, verify-command injection, stale
+      verification reuse, candidate mutation, untracked-file blind spots,
+      foreign commits, ownership bypass, duplicate commits/history, dependency
+      reopening, adaptive/static state consistency, and accidental provider
+      invocation. Require concrete file/line or executable evidence. Reject any
+      solution that merely edits run.json/handoff JSON or weakens existing
+      salvage/recovery invariants.
+
+  - id: blocked-writer-verification-correction
+    title: Correct confirmed blocked-writer recovery findings
+    owner: codex
+    effort: high
+    mode: correction
+    files:
+      - package.json
+      - tools/agent-orchestrator/package.json
+      - tools/agent-orchestrator/src/**
+      - tools/agent-orchestrator/test/**
+      - tools/agent-orchestrator/README.md
+    dependsOn:
+      - blocked-writer-verification-review
+    condition:
+      reviewOf: blocked-writer-verification-review
+      skipIfStatus:
+        - approved
+    instructions: |
+      Classify each material finding CONFIRMED or REJECTED using current code and
+      tests. Fix only confirmed issues with the smallest coherent change. Preserve
+      every existing recovery invariant and do not touch real run artifacts or
+      application code.
+
+  - id: blocked-writer-verification-final-review
+    title: Final review of blocked-writer recovery corrections
+    owner: claude
+    model: sonnet
+    effort: high
+    mode: final_review
+    files: []
+    dependsOn:
+      - blocked-writer-verification-correction
+    condition:
+      reviewOf: blocked-writer-verification-review
+      skipIfStatus:
+        - approved
+    instructions: |
+      Re-check confirmed findings against the correction diff and executable test
+      evidence. Approve only if promotion remains explicit, evidence-bound,
+      append-only and provider-free.
+
+integration:
+  prepare:
+    - command: pnpm install --frozen-lockfile
+      required: true
+      timeoutMs: 900000
+  commands:
+    - command: pnpm --filter @tripwith/agent-orchestrator typecheck
+      required: true
+      timeoutMs: 600000
+    - command: pnpm --filter @tripwith/agent-orchestrator build
+      required: true
+      timeoutMs: 600000
+    - command: pnpm --filter @tripwith/agent-orchestrator test
+      required: true
+      timeoutMs: 1800000
+    - command: pnpm --filter @tripwith/agent-orchestrator smoke
+      required: true
+      timeoutMs: 600000
+    - command: git diff --check
+      required: true
+      timeoutMs: 120000
+  diagnostics: []

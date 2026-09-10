@@ -166,6 +166,8 @@ export interface SalvageVerificationCheckpoint {
   readonly worktreeHeadSha: string;
   readonly trackedDiffFingerprint: string;
   readonly verifyConfigFingerprint: string;
+  /** Separate completion artifact for a blocked writer; the original stays intact. */
+  readonly recoveredHandoffPath?: string;
   readonly result: 'passed';
 }
 
@@ -331,6 +333,7 @@ export const RUN_EVENT_NAMES = [
   'INTEGRATION_PREPARATION_STARTED',
   'INTEGRATION_PREPARATION_COMMAND_FINISHED',
   'INTEGRATION_PREPARATION_FAILED',
+  'SALVAGE_COMMAND_FINISHED',
   'SALVAGE_AUTHORIZED',
   'SALVAGE_VERIFIED',
   'SALVAGE_VERIFICATION_FAILED',
@@ -768,6 +771,7 @@ function parseSalvageVerificationCheckpoint(value: unknown, path: string): Salva
       assertFullSha(sha, `${path}.worktreeHeadSha`);
       return sha;
     })(),
+    ...(value.recoveredHandoffPath === undefined ? {} : { recoveredHandoffPath: string(value.recoveredHandoffPath, `${path}.recoveredHandoffPath`) }),
     trackedDiffFingerprint: string(value.trackedDiffFingerprint, `${path}.trackedDiffFingerprint`),
     verifyConfigFingerprint: string(value.verifyConfigFingerprint, `${path}.verifyConfigFingerprint`),
     result: 'passed',

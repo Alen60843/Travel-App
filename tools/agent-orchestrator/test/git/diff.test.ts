@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { writeFile } from 'node:fs/promises';
+import { chmod, symlink, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, test } from 'node:test';
 
@@ -174,4 +174,24 @@ test('computeTrackedDiffFingerprint is binary-sensitive for tracked content', as
   await writeFile(binaryPath, Buffer.from([0, 1, 2, 8, 4]));
   const second = await computeTrackedDiffFingerprint(repository.git, repository.repository, binaryBase);
   assert.notEqual(first, second);
+});
+
+test('fingerprint binds untracked executable mode and symlink targets, including dangling links', async () => {
+  const repository = await createTemporaryRepository();
+  repositories.push(repository);
+  const path = join(repository.repository, 'new-file');
+  await writeFile(path, 'content\n');
+  await chmod(path, 0o644);
+  const plain = await computeTrackedDiffFingerprint(repository.git, repository.repository, repository.baseSha);
+  await chmod(path, 0o755);
+  const executable = await computeTrackedDiffFingerprint(repository.git, repository.repository, repository.baseSha);
+  assert.notEqual(executable, plain);
+  await unlink(path);
+  await symlink('missing-target-a', path);
+  const link = await computeTrackedDiffFingerprint(repository.git, repository.repository, repository.baseSha);
+  await unlink(path);
+  await symlink('missing-target-b', path);
+  const changedLink = await computeTrackedDiffFingerprint(repository.git, repository.repository, repository.baseSha);
+  assert.notEqual(link, executable);
+  assert.notEqual(changedLink, link);
 });

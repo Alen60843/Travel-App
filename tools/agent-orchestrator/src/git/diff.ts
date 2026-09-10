@@ -1,4 +1,6 @@
 import { createHash } from 'node:crypto';
+import { lstat, readFile, readlink } from 'node:fs/promises';
+import { join } from 'node:path';
 
 import { GitClient, assertRevision, assertSha } from './git';
 
@@ -10,7 +12,8 @@ import { GitClient, assertRevision, assertSha } from './git';
  * - tracked changes use `git diff --binary --full-index`, so binary contents are
  *   represented rather than collapsing to the same "Binary files differ" text;
  * - porcelain status is included, binding path/status changes;
- * - every non-ignored untracked file is hashed by Git and included by path.
+ * - non-ignored untracked paths bind raw bytes, executable modes, symlink
+ *   targets, and (for regular files) the Git blob after attributes/filters.
  *
  * This is used both to detect a salvage.verify command silently mutating source
  * and to bind a SALVAGE_VERIFIED checkpoint to the exact dirty state it
@@ -33,6 +36,7 @@ export async function computeTrackedDiffFingerprint(
       '--binary',
       '--full-index',
       '--no-ext-diff',
+      '--no-textconv',
       '--no-color',
       baseSha,
     ]),
@@ -47,16 +51,17 @@ export async function computeTrackedDiffFingerprint(
   const untrackedPaths = [...parseUntrackedPaths(status.stdout)].sort();
   const untrackedObjects: string[] = [];
   for (const path of untrackedPaths) {
-    // Hash the bytes through Git using the path's normal attributes/filters so
-    // the digest tracks what `git add` would turn into a blob, not merely the
-    // existence of the untracked pathname.
-    const object = await git.run(worktreePath, [
-      'hash-object',
-      `--path=${path}`,
-      '--',
-      path,
-    ]);
-    untrackedObjects.push(`${path}\0${object.stdout.trim()}`);
+    // Bind bytes and mode as well as the Git blob. Following a symlink
+    // would hash its destination instead of the link Git actually commits.
+    const absolutePath = join(worktreePath, path);
+    const metadata = await lstat(absolutePath);
+    const bytes = metadata.isSymbolicLink() ? await readlink(absolutePath) : await readFile(absolutePath);
+    const rawDigest = createHash('sha256').update(bytes).digest('hex');
+    const mode = metadata.isSymbolicLink() ? '120000' : (metadata.mode & 0o111) !== 0 ? '100755' : '100644';
+    const object = metadata.isSymbolicLink() ? rawDigest : (await git.run(worktreePath, [
+      'hash-object', `--path=${path}`, '--', path,
+    ])).stdout.trim();
+    untrackedObjects.push(`${path}\0${mode}\0${rawDigest}\0${object}`);
   }
 
   return createHash('sha256')
