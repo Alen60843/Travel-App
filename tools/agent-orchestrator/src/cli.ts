@@ -45,9 +45,12 @@ verify-blocked-task explicitly verifies a valid blocked writer from the host CLI
 salvage.verify in its preserved worktree, retaining the original blocked handoff. It
 invokes no agent, rejects adaptive runs, and requires agents:resume afterward.
 
-salvage-task recovers useful work left behind by a task whose process timed out
-(AGENT_TIMEOUT) with a dirty, evidence-backed worktree diff -- the inverse case from
-retry-agent, which requires a CLEAN worktree. It refuses unless every changed tracked file is
+salvage-task recovers useful work left behind by a writer whose final attempt ended
+AGENT_TIMEOUT or AGENT_FAILED with a dirty, evidence-backed worktree diff -- the inverse case
+from retry-agent, which requires a CLEAN worktree. Neither path infers recoverability from
+provider stderr/error prose -- only the persisted error code and attempt outcome decide the
+eligibility class; the diff itself must still prove safe through every check below regardless
+of which of the two failed the attempt. It refuses unless every changed tracked file is
 inside the task's own ownership globs, there are no foreign commits or unexpected untracked
 files, and git diff --check passes. A dirty diff is only evidence, never success on its own:
 it runs agentWorktree.prepare (if configured) and the phase's salvage.verify commands --
@@ -55,7 +58,8 @@ categorically separate from prepare, and required for any task to be salvageable
 then the Orchestrator itself creates the commit, the same way agents:apply-integration-fix
 does. It never invokes an agent for the base flow; a task with a required canonical finding
 still needs one bounded, evidence-only repair call to complete its findingResponses, exactly
-like recover-handoffs. Run agents:resume afterward to continue the run.
+like recover-handoffs. It reopens only dependency-blocked descendants attributable to that
+task, the same way retry-agent does. Run agents:resume afterward to continue the run.
 authorize-recovery-policy loads and validates a recovery-only policy overlay (YAML file,
 salvage.verify and/or executors only) and appends one immutable, hashed snapshot to the run's
 recoveryPolicyHistory -- it NEVER edits the run's immutable phase.yaml snapshot, NEVER invokes

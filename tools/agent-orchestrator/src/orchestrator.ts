@@ -168,7 +168,7 @@ type HandoffRecoveryEligibilityReasonCode =
 /** Stable, machine-readable eligibility-failure classification for salvage-task — same pattern as HandoffRecoveryEligibilityReasonCode. */
 type SalvageEligibilityReasonCode =
   | 'BLOCKED_WRITER_INELIGIBLE'
-  | 'SALVAGE_NOT_TIMED_OUT'
+  | 'SALVAGE_ATTEMPT_NOT_ELIGIBLE'
   | 'SALVAGE_COMMIT_ALREADY_RECORDED'
   | 'SALVAGE_WORKTREE_NOT_REGISTERED'
   | 'SALVAGE_WORKTREE_HEAD_MOVED'
@@ -1039,8 +1039,8 @@ export class AgentOrchestrator {
   }
 
   /**
-   * Salvages useful work a timed-out writer left behind in its dirty
-   * worktree. A dirty diff is only evidence, never success on its own:
+   * Salvages useful work a failed or timed-out writer left behind in its
+   * dirty worktree. A dirty diff is only evidence, never success on its own:
    * eligibility (ownership/foreign-commit/diff-check-clean) -> deterministic
    * salvage.verify (never trusting operator prose) -> a diff/config-bound
    * SALVAGE_VERIFIED checkpoint -> the Orchestrator (never salvage code
@@ -1092,7 +1092,12 @@ export class AgentOrchestrator {
       if (originalHandoff.status !== 'blocked') throw new OrchestratorError('TASK_STATE_INVALID', 'Expected blocked handoff');
       validateCanonicalFindingResponses(originalHandoff, orchestrator.requiredCanonicalFindings(taskId));
     }
-    const reopenedTasks = blockedWriter ? orchestrator.dependencyOnlyDescendantsToReopen(taskId) : undefined;
+    // Reopen attributable dependency-blocked descendants and make the run
+    // resumable again, the same way retry-agent and verify-blocked-task
+    // already do — otherwise a successfully salvaged task would leave the
+    // run's top-level status stuck at FAILED/BLOCKED forever, and any
+    // descendant that failed only because this task did would never unblock.
+    const reopenedTasks = orchestrator.dependencyOnlyDescendantsToReopen(taskId);
 
     if (orchestrator.state.tasks[taskId]?.salvage === undefined) {
       await orchestrator.mutate((state) => updateTask(state, taskId, (task) => ({
@@ -1290,7 +1295,7 @@ export class AgentOrchestrator {
     )).stdout;
     const synthesizedHandoff = {
       status: 'complete',
-      summary: `Salvaged timed-out writer work for ${taskId} after deterministic verification.`,
+      summary: `Salvaged dirty writer work for ${taskId} after deterministic verification.`,
       filesChanged: [...checked.changedFiles],
       decisions: [],
       tests: orchestrator.config.salvage.verify.map((command) => ({
@@ -1334,7 +1339,7 @@ export class AgentOrchestrator {
       baseSha: preparedHeadSha,
       agent: taskSpec.owner,
       taskId,
-      summary: blockedWriter ? `Recovered blocked writer after host verification for ${taskId}` : `Salvaged timed-out writer work for ${taskId}`,
+      summary: blockedWriter ? `Recovered blocked writer after host verification for ${taskId}` : `Salvaged dirty writer work for ${taskId}`,
     });
     assertChangedFileOwnership(taskId, ensured.changedFiles, taskSpec.files);
     if (JSON.stringify([...ensured.changedFiles].sort()) !== JSON.stringify([...checked.changedFiles].sort())) {
@@ -1351,7 +1356,7 @@ export class AgentOrchestrator {
       sha: ensured.commitSha,
       parentSha: preparedHeadSha,
       changedFiles: [...ensured.changedFiles],
-    }, reopenedTasks);
+    }, reopenedTasks, blockedWriter ? 'blocked_writer_host_verification' : 'salvage');
     // §12: same post-recovery adaptive completion lifecycle as handoff
     // repair — no salvage.verify rerun, no second commit, no repeat repair;
     // this only mirrors the already-accepted success into the adaptive layer.
@@ -3379,6 +3384,7 @@ export class AgentOrchestrator {
     handoffPath: string,
     commit?: TaskCommitState,
     reopenedTasks?: readonly string[],
+    recoveryMode?: string,
   ): Promise<void> {
     await this.mutate((state) => {
       const succeeded = updateTask(state, taskId, (task) => {
@@ -3403,7 +3409,7 @@ export class AgentOrchestrator {
       return { ...succeeded, status: 'RUNNING', tasks };
     });
     await this.event('TASK_SUCCEEDED', taskId, reopenedTasks === undefined ? undefined : {
-      recoveryMode: 'blocked_writer_host_verification', commitSha: commit?.sha,
+      recoveryMode, commitSha: commit?.sha,
       handoffPath, reopenedTaskIds: reopenedTasks,
     });
     await this.finishAdaptiveUnit(taskId, 'SUCCEEDED');
@@ -3573,15 +3579,16 @@ export class AgentOrchestrator {
   }
 
   /**
-   * Salvage eligibility for a timed-out writer's dirty worktree — the
-   * structural mirror of checkAgentFailureRetryEligibility, inverted on
+   * Salvage eligibility for a failed or timed-out writer's dirty worktree —
+   * the structural mirror of checkAgentFailureRetryEligibility, inverted on
    * dirtiness: retry-agent requires a CLEAN preserved worktree (no partial
    * work); salvage requires a DIRTY one whose every changed tracked file is
    * inside the task's own ownership globs, with no foreign commits and no
-   * unexpected untracked files. AGENT_FAILED (a process crash) is
-   * deliberately out of scope here — only a completed AGENT_TIMEOUT attempt
-   * qualifies; a crashed process is a different failure shape and folding it
-   * in without a real example to validate against would be scope creep.
+   * unexpected untracked files. AGENT_FAILED and AGENT_TIMEOUT are both
+   * accepted eligibility classes for a completed final attempt — the class
+   * is derived only from persisted error code + attempt outcome, never
+   * inferred from provider stderr/error prose; every check below still
+   * applies identically regardless of which of the two failed the attempt.
    */
   private async checkSalvageEligibility(taskId: string, blockedWriter = false): Promise<
     | {
@@ -3596,10 +3603,12 @@ export class AgentOrchestrator {
     const taskSpec = this.config.tasks.find((task) => task.id === taskId);
     const taskState = this.state.tasks[taskId];
     if (taskSpec === undefined || taskState === undefined) {
-      return { eligible: false, reason: 'task id does not exist in this run', reasonCode: 'SALVAGE_NOT_TIMED_OUT' };
+      return { eligible: false, reason: 'task id does not exist in this run', reasonCode: 'SALVAGE_ATTEMPT_NOT_ELIGIBLE' };
     }
     const lastAttempt = taskState.agentAttempts.at(-1);
-    const timedOut = taskState.error?.code === 'AGENT_TIMEOUT' && lastAttempt?.outcome === 'timed_out';
+    const salvageableAttempt =
+      (taskState.error?.code === 'AGENT_TIMEOUT' && lastAttempt?.outcome === 'timed_out')
+      || (taskState.error?.code === 'AGENT_FAILED' && lastAttempt?.outcome === 'failed');
     if (blockedWriter && (
       this.state.strategy === 'adaptive' || this.state.adaptive !== undefined
       || this.state.status !== 'BLOCKED' || taskState.status !== 'BLOCKED'
@@ -3611,11 +3620,11 @@ export class AgentOrchestrator {
     )) {
       return { eligible: false, reason: 'requires a static blocked writer with a succeeded process, accepted blocked handoff, and required salvage.verify commands', reasonCode: 'BLOCKED_WRITER_INELIGIBLE' };
     }
-    if (!blockedWriter && ((taskState.status !== 'FAILED' && taskState.status !== 'BLOCKED') || !timedOut)) {
+    if (!blockedWriter && ((taskState.status !== 'FAILED' && taskState.status !== 'BLOCKED') || !salvageableAttempt)) {
       return {
         eligible: false,
-        reason: 'task did not end in a completed AGENT_TIMEOUT agent attempt',
-        reasonCode: 'SALVAGE_NOT_TIMED_OUT',
+        reason: 'task did not end in a completed AGENT_TIMEOUT or AGENT_FAILED agent attempt',
+        reasonCode: 'SALVAGE_ATTEMPT_NOT_ELIGIBLE',
       };
     }
     if (taskState.commit !== undefined) {

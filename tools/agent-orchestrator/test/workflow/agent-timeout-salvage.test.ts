@@ -22,12 +22,60 @@ class UnusedAgent implements Agent {
   }
 }
 
+/** A real, minimal successful writer for 'dependent-task' — proves a salvage-reopened descendant actually runs to completion on resume. */
+class DependentTaskAgent implements Agent {
+  readonly invocations: string[] = [];
+  constructor(readonly name: AgentName) {}
+  async run(request: AgentRequest): Promise<AgentResult> {
+    this.invocations.push(request.taskId);
+    if (request.taskId !== 'dependent-task') {
+      throw new Error(`unexpected agent invocation for task ${request.taskId}`);
+    }
+    await writeFile(join(request.worktreePath, 'dependent.txt'), 'implemented\n', 'utf8');
+    const timestamp = new Date().toISOString();
+    return {
+      agent: this.name,
+      runId: request.runId,
+      taskId: request.taskId,
+      status: 'succeeded',
+      failureCode: null,
+      exitCode: 0,
+      signal: null,
+      stdoutPath: join(request.artifactsDirectory, `${request.taskId}.stdout.log`),
+      stderrPath: join(request.artifactsDirectory, `${request.taskId}.stderr.log`),
+      structuredHandoff: {
+        status: 'complete',
+        summary: 'Implemented the dependent feature.',
+        filesChanged: ['dependent.txt'],
+        decisions: [],
+        tests: [{ command: 'fake-test', result: 'pass', details: 'fake evidence' }],
+        openQuestions: [],
+        reviewRequested: [],
+      },
+      changedFiles: [],
+      gitDiffSummary: null,
+      testsReported: [],
+      unresolvedQuestions: [],
+      startedAt: timestamp,
+      endedAt: timestamp,
+      durationMs: 0,
+      timedOut: false,
+      aborted: false,
+      errorMessage: null,
+    };
+  }
+}
+
 function phaseYaml(
   baseBranch: string,
   options: {
     readonly verify?: readonly string[];
     readonly verifyCommand?: string;
     readonly prepareCommand?: string;
+    /** 'review' produces a read-only, ownership-free task to prove salvage cannot be used to sneak a dirty diff past ownership. */
+    readonly taskMode?: 'implementation' | 'review';
+    /** Adds a second task depending on the salvaged one, to exercise dependency-failure reopening. */
+    readonly withDependent?: boolean;
   } = {},
 ): string {
   const verifyCommand = options.verifyCommand ?? 'true';
@@ -37,6 +85,7 @@ function phaseYaml(
     : options.verify.length === 0
       ? 'salvage:\n  verify: []\n'
       : `salvage:\n  verify:\n${options.verify.map((c) => `    - command: ${quoted(c)}\n      required: true\n`).join('')}`;
+  const taskMode = options.taskMode ?? 'implementation';
   return `
 phase: salvage-test
 name: Timed-out writer salvage
@@ -53,10 +102,16 @@ ${options.prepareCommand === undefined ? '' : `agentWorktree:
   - id: timed-out-task
     title: Timed-out writer
     owner: codex
+    mode: ${taskMode}
+    effort: medium
+${taskMode === 'review' ? '' : '    files: [feature.txt, new-feature.txt]\n'}${options.withDependent === true ? `  - id: dependent-task
+    title: Downstream dependent
+    owner: codex
     mode: implementation
     effort: medium
-    files: [feature.txt, new-feature.txt]
-`;
+    files: [dependent.txt]
+    dependsOn: [timed-out-task]
+` : ''}`;
 }
 
 interface Scenario {
@@ -75,6 +130,10 @@ async function createTimeoutScenario(options: {
   readonly outsideOwnershipEdit?: boolean;
   readonly extraUntrackedFile?: boolean;
   readonly foreignCommit?: boolean;
+  /** Which process-layer failure the final agent attempt recorded. Defaults to the original AGENT_TIMEOUT shape. */
+  readonly failureMode?: 'timed_out' | 'failed';
+  readonly taskMode?: 'implementation' | 'review';
+  readonly withDependent?: boolean;
 } = {}): Promise<Scenario> {
   const fixture = await createTemporaryRepository();
   await writeFile(join(fixture.repository, '.gitignore'), '.salvage-cache\n', 'utf8');
@@ -88,6 +147,8 @@ async function createTimeoutScenario(options: {
     ...(options.verify === undefined ? {} : { verify: options.verify }),
     ...(options.verifyCommand === undefined ? {} : { verifyCommand: options.verifyCommand }),
     ...(options.prepareCommand === undefined ? {} : { prepareCommand: options.prepareCommand }),
+    ...(options.taskMode === undefined ? {} : { taskMode: options.taskMode }),
+    ...(options.withDependent === undefined ? {} : { withDependent: options.withDependent }),
   }), 'utf8');
 
   const orchestrator = await AgentOrchestrator.start(phaseFile, {
@@ -121,7 +182,8 @@ async function createTimeoutScenario(options: {
     await fixture.git.run(worktree.path, ['commit', '-m', 'a foreign commit that should never exist here']);
   }
 
-  const timedOut: RunState = {
+  const failureMode = options.failureMode ?? 'timed_out';
+  const terminalState: RunState = {
     ...before,
     status: 'BLOCKED',
     tasks: {
@@ -139,17 +201,23 @@ async function createTimeoutScenario(options: {
           agent: 'codex',
           startedAt: before.createdAt,
           finishedAt: before.createdAt,
-          outcome: 'timed_out',
+          outcome: failureMode,
         }],
-        error: {
-          code: 'AGENT_TIMEOUT',
-          message: 'bounded execution timeout',
-          at: before.createdAt,
-        },
+        error: failureMode === 'failed'
+          ? { code: 'AGENT_FAILED', message: 'a genuine implementation failure ended after partial work', at: before.createdAt }
+          : { code: 'AGENT_TIMEOUT', message: 'bounded execution timeout', at: before.createdAt },
       },
+      ...(options.withDependent === true ? {
+        'dependent-task': {
+          ...before.tasks['dependent-task']!,
+          status: 'BLOCKED',
+          finishedAt: before.createdAt,
+          error: { code: 'TASK_DEPENDENCY_FAILED', message: 'A task dependency did not succeed', at: before.createdAt },
+        },
+      } : {}),
     },
   };
-  await orchestrator.stateStore.save(timedOut);
+  await orchestrator.stateStore.save(terminalState);
 
   return { fixture, runsRoot, runId, orchestrator, worktreePath: worktree.path };
 }
@@ -462,7 +530,11 @@ test('salvage.verify detects mutation of an already-present owned untracked file
   }
 });
 
-test('a task failure that is not AGENT_TIMEOUT (e.g. AGENT_FAILED) refuses salvage regardless of diff cleanliness', async () => {
+// A dirty AGENT_FAILED writer is no longer refused outright — see the
+// "AGENT_FAILED + dirty diff..." (succeeds) and "a clean AGENT_FAILED
+// worktree..." (still refused) tests below, which replaced this scenario
+// once AGENT_FAILED became a second accepted salvage eligibility class.
+test('a task failure that is neither AGENT_TIMEOUT nor AGENT_FAILED (e.g. a semantic REVIEW_BLOCKED) refuses salvage regardless of diff cleanliness', async () => {
   const scenario = await createTimeoutScenario({ verifyCommand: 'true' });
   try {
     // scenario.orchestrator's in-memory state predates createTimeoutScenario's
@@ -475,8 +547,8 @@ test('a task failure that is not AGENT_TIMEOUT (e.g. AGENT_FAILED) refuses salva
         ...before.tasks,
         'timed-out-task': {
           ...before.tasks['timed-out-task']!,
-          agentAttempts: [{ ...before.tasks['timed-out-task']!.agentAttempts[0]!, outcome: 'failed' }],
-          error: { code: 'AGENT_FAILED', message: 'a genuine implementation failure', at: before.createdAt },
+          agentAttempts: [{ ...before.tasks['timed-out-task']!.agentAttempts[0]!, outcome: 'succeeded' }],
+          error: { code: 'REVIEW_BLOCKED', message: 'a genuine semantic review failure', at: before.createdAt },
         },
       },
     });
@@ -488,7 +560,7 @@ test('a task failure that is not AGENT_TIMEOUT (e.g. AGENT_FAILED) refuses salva
       }),
       (error: unknown) => {
         if (!isOrchestratorError(error, 'TASK_STATE_INVALID')) throw error;
-        assert.equal((error.details as unknown as { reasonCode?: string }).reasonCode, 'SALVAGE_NOT_TIMED_OUT');
+        assert.equal((error.details as unknown as { reasonCode?: string }).reasonCode, 'SALVAGE_ATTEMPT_NOT_ELIGIBLE');
         return true;
       },
     );
@@ -508,7 +580,7 @@ test('a task with a recorded commit already cannot be salvaged again (duplicate 
     assert.ok(first.commitSha);
     // Once salvaged, the task is SUCCEEDED, so a second call correctly
     // refuses at the same first check that already makes a successful
-    // handoff repair permanently idempotent (SALVAGE_NOT_TIMED_OUT) —
+    // handoff repair permanently idempotent (SALVAGE_ATTEMPT_NOT_ELIGIBLE) —
     // SALVAGE_COMMIT_ALREADY_RECORDED exists for the case where a commit
     // is somehow recorded while status is still FAILED/BLOCKED, which
     // this normal-flow scenario never reaches. Either way, no second
@@ -521,10 +593,249 @@ test('a task with a recorded commit already cannot be salvaged again (duplicate 
       }),
       (error: unknown) => {
         if (!isOrchestratorError(error, 'TASK_STATE_INVALID')) throw error;
-        assert.equal((error.details as unknown as { reasonCode?: string }).reasonCode, 'SALVAGE_NOT_TIMED_OUT');
+        assert.equal((error.details as unknown as { reasonCode?: string }).reasonCode, 'SALVAGE_ATTEMPT_NOT_ELIGIBLE');
         return true;
       },
     );
+  } finally {
+    await scenario.fixture.dispose();
+  }
+});
+
+
+// --- AGENT_FAILED as a second dirty-writer salvage eligibility class -----
+//
+// Extends the exact same deterministic proof AGENT_TIMEOUT already goes
+// through above to a second process-layer failure class: AGENT_FAILED. The
+// eligibility class is derived only from persisted structure (error code +
+// last attempt outcome), never from provider stderr/error prose.
+
+test('AGENT_FAILED + dirty diff fully inside ownership: successful salvage authorizes, verifies, and commits, and the task becomes SUCCEEDED', async () => {
+  const scenario = await createTimeoutScenario({ verifyCommand: 'true', failureMode: 'failed' });
+  try {
+    const result = await AgentOrchestrator.salvageTask(scenario.runId, 'timed-out-task', {
+      repositoryPath: scenario.fixture.repository,
+      runsRoot: scenario.runsRoot,
+      agents: { codex: new UnusedAgent('codex'), claude: new UnusedAgent('claude') },
+    });
+    const after = result.orchestrator.snapshot();
+    assert.equal(after.tasks['timed-out-task']?.status, 'SUCCEEDED');
+    assert.equal(after.tasks['timed-out-task']?.commit?.sha, result.commitSha);
+    assert.deepEqual(after.tasks['timed-out-task']?.commit?.changedFiles, ['feature.txt']);
+    assert.equal(after.tasks['timed-out-task']?.salvage?.verification?.result, 'passed');
+  } finally {
+    await scenario.fixture.dispose();
+  }
+});
+
+test('a clean AGENT_FAILED worktree is not salvage work (it remains retry-agent\'s domain instead)', async () => {
+  const scenario = await createTimeoutScenario({ verifyCommand: 'true', leaveDirtyDiff: false, failureMode: 'failed' });
+  try {
+    await assert.rejects(
+      () => AgentOrchestrator.salvageTask(scenario.runId, 'timed-out-task', {
+        repositoryPath: scenario.fixture.repository,
+        runsRoot: scenario.runsRoot,
+        agents: { codex: new UnusedAgent('codex'), claude: new UnusedAgent('claude') },
+      }),
+      (error: unknown) => {
+        if (!isOrchestratorError(error, 'TASK_STATE_INVALID')) throw error;
+        assert.equal((error.details as unknown as { reasonCode?: string }).reasonCode, 'SALVAGE_WORKTREE_CLEAN');
+        return true;
+      },
+    );
+  } finally {
+    await scenario.fixture.dispose();
+  }
+});
+
+test('AGENT_FAILED with a dirty change outside task ownership refuses salvage', async () => {
+  const scenario = await createTimeoutScenario({ verifyCommand: 'true', outsideOwnershipEdit: true, failureMode: 'failed' });
+  try {
+    await assert.rejects(
+      () => AgentOrchestrator.salvageTask(scenario.runId, 'timed-out-task', {
+        repositoryPath: scenario.fixture.repository,
+        runsRoot: scenario.runsRoot,
+        agents: { codex: new UnusedAgent('codex'), claude: new UnusedAgent('claude') },
+      }),
+      (error: unknown) => {
+        if (!isOrchestratorError(error, 'TASK_STATE_INVALID')) throw error;
+        assert.equal((error.details as unknown as { reasonCode?: string }).reasonCode, 'SALVAGE_OWNERSHIP_VIOLATION');
+        return true;
+      },
+    );
+  } finally {
+    await scenario.fixture.dispose();
+  }
+});
+
+test('AGENT_FAILED with a foreign commit beyond the prepared SHA refuses salvage', async () => {
+  const scenario = await createTimeoutScenario({ verifyCommand: 'true', leaveDirtyDiff: false, foreignCommit: true, failureMode: 'failed' });
+  try {
+    await assert.rejects(
+      () => AgentOrchestrator.salvageTask(scenario.runId, 'timed-out-task', {
+        repositoryPath: scenario.fixture.repository,
+        runsRoot: scenario.runsRoot,
+        agents: { codex: new UnusedAgent('codex'), claude: new UnusedAgent('claude') },
+      }),
+      (error: unknown) => {
+        if (!isOrchestratorError(error, 'TASK_STATE_INVALID')) throw error;
+        assert.equal((error.details as unknown as { reasonCode?: string }).reasonCode, 'SALVAGE_WORKTREE_HEAD_MOVED');
+        return true;
+      },
+    );
+  } finally {
+    await scenario.fixture.dispose();
+  }
+});
+
+test('AGENT_FAILED with an unexpected untracked file outside ownership refuses salvage', async () => {
+  const scenario = await createTimeoutScenario({ verifyCommand: 'true', extraUntrackedFile: true, failureMode: 'failed' });
+  try {
+    await assert.rejects(
+      () => AgentOrchestrator.salvageTask(scenario.runId, 'timed-out-task', {
+        repositoryPath: scenario.fixture.repository,
+        runsRoot: scenario.runsRoot,
+        agents: { codex: new UnusedAgent('codex'), claude: new UnusedAgent('claude') },
+      }),
+      (error: unknown) => {
+        if (!isOrchestratorError(error, 'TASK_STATE_INVALID')) throw error;
+        assert.equal((error.details as unknown as { reasonCode?: string }).reasonCode, 'SALVAGE_UNEXPECTED_UNTRACKED_FILE');
+        return true;
+      },
+    );
+  } finally {
+    await scenario.fixture.dispose();
+  }
+});
+
+test('AGENT_FAILED with a git diff --check failure (e.g. trailing whitespace) refuses salvage', async () => {
+  const scenario = await createTimeoutScenario({ verifyCommand: 'true', leaveDirtyDiff: false, failureMode: 'failed' });
+  try {
+    await writeFile(join(scenario.worktreePath, 'feature.txt'), 'trailing whitespace   \n', 'utf8');
+    await assert.rejects(
+      () => AgentOrchestrator.salvageTask(scenario.runId, 'timed-out-task', {
+        repositoryPath: scenario.fixture.repository,
+        runsRoot: scenario.runsRoot,
+        agents: { codex: new UnusedAgent('codex'), claude: new UnusedAgent('claude') },
+      }),
+      (error: unknown) => {
+        if (!isOrchestratorError(error, 'TASK_STATE_INVALID')) throw error;
+        assert.equal((error.details as unknown as { reasonCode?: string }).reasonCode, 'SALVAGE_DIFF_CHECK_FAILED');
+        return true;
+      },
+    );
+  } finally {
+    await scenario.fixture.dispose();
+  }
+});
+
+test('AGENT_FAILED whose required salvage.verify command fails creates no commit and leaves the task unsalvaged', async () => {
+  const scenario = await createTimeoutScenario({ verifyCommand: 'false', failureMode: 'failed' });
+  try {
+    await assert.rejects(
+      () => AgentOrchestrator.salvageTask(scenario.runId, 'timed-out-task', {
+        repositoryPath: scenario.fixture.repository,
+        runsRoot: scenario.runsRoot,
+        agents: { codex: new UnusedAgent('codex'), claude: new UnusedAgent('claude') },
+      }),
+      (error: unknown) => {
+        if (!isOrchestratorError(error, 'SALVAGE_VERIFICATION_FAILED')) throw error;
+        assert.notEqual((error.details as unknown as { reason?: string }).reason, 'verify_mutated_tracked_source');
+        return true;
+      },
+    );
+    const after = await scenario.orchestrator.stateStore.load();
+    assert.equal(after.tasks['timed-out-task']?.commit, undefined);
+    assert.notEqual(after.tasks['timed-out-task']?.status, 'SUCCEEDED');
+    assert.match(await readFile(join(scenario.worktreePath, 'feature.txt'), 'utf8'), /salvageable work/);
+  } finally {
+    await scenario.fixture.dispose();
+  }
+});
+
+test('AGENT_FAILED verify command that mutates tracked source fails closed regardless of its own exit code', async () => {
+  const scenario = await createTimeoutScenario({ verifyCommand: 'sh -c "echo mutated >> feature.txt"', failureMode: 'failed' });
+  try {
+    await assert.rejects(
+      () => AgentOrchestrator.salvageTask(scenario.runId, 'timed-out-task', {
+        repositoryPath: scenario.fixture.repository,
+        runsRoot: scenario.runsRoot,
+        agents: { codex: new UnusedAgent('codex'), claude: new UnusedAgent('claude') },
+      }),
+      (error: unknown) => {
+        if (!isOrchestratorError(error, 'SALVAGE_VERIFICATION_FAILED')) throw error;
+        assert.equal((error.details as unknown as { reason?: string }).reason, 'verify_mutated_tracked_source');
+        return true;
+      },
+    );
+    const after = await scenario.orchestrator.stateStore.load();
+    assert.equal(after.tasks['timed-out-task']?.commit, undefined);
+  } finally {
+    await scenario.fixture.dispose();
+  }
+});
+
+test('a review-mode task with a dirty diff cannot be salvaged even when its failure is AGENT_FAILED', async () => {
+  const scenario = await createTimeoutScenario({ verifyCommand: 'true', failureMode: 'failed', taskMode: 'review' });
+  try {
+    await assert.rejects(
+      () => AgentOrchestrator.salvageTask(scenario.runId, 'timed-out-task', {
+        repositoryPath: scenario.fixture.repository,
+        runsRoot: scenario.runsRoot,
+        agents: { codex: new UnusedAgent('codex'), claude: new UnusedAgent('claude') },
+      }),
+      (error: unknown) => {
+        if (!isOrchestratorError(error, 'TASK_STATE_INVALID')) throw error;
+        // The task declares no ownership globs at all (a read-only review
+        // task owns nothing), so any tracked change is structurally a
+        // violation — the same ownership gate that already protects every
+        // other task, never a mode-specific special case.
+        assert.equal((error.details as unknown as { reasonCode?: string }).reasonCode, 'SALVAGE_OWNERSHIP_VIOLATION');
+        return true;
+      },
+    );
+  } finally {
+    await scenario.fixture.dispose();
+  }
+});
+
+test('AGENT_FAILED salvage invokes no provider, preserves original failed-attempt evidence, reopens attributable dependency-blocked descendants, and the run completes on resume', async () => {
+  const scenario = await createTimeoutScenario({ verifyCommand: 'true', failureMode: 'failed', withDependent: true });
+  try {
+    const before = await scenario.orchestrator.stateStore.load();
+    const originalAttempts = before.tasks['timed-out-task']!.agentAttempts;
+    assert.equal(before.tasks['dependent-task']?.status, 'BLOCKED');
+    assert.equal(before.tasks['dependent-task']?.error?.code, 'TASK_DEPENDENCY_FAILED');
+
+    const codexDuringSalvage = new UnusedAgent('codex');
+    const claudeDuringSalvage = new UnusedAgent('claude');
+    const result = await AgentOrchestrator.salvageTask(scenario.runId, 'timed-out-task', {
+      repositoryPath: scenario.fixture.repository,
+      runsRoot: scenario.runsRoot,
+      agents: { codex: codexDuringSalvage, claude: claudeDuringSalvage },
+    });
+    assert.equal(codexDuringSalvage.invocations.length, 0, 'salvage must never invoke the original writer agent');
+    assert.equal(claudeDuringSalvage.invocations.length, 0, 'salvage must never invoke a reviewer agent either');
+
+    const after = result.orchestrator.snapshot();
+    assert.equal(after.tasks['timed-out-task']?.status, 'SUCCEEDED');
+    assert.ok(after.tasks['timed-out-task']?.commit?.sha);
+    assert.deepEqual(after.tasks['timed-out-task']?.agentAttempts, originalAttempts);
+    assert.equal(after.tasks['dependent-task']?.status, 'READY');
+    assert.equal(after.status, 'RUNNING');
+
+    const dependentAgent = new DependentTaskAgent('codex');
+    const resumed = await AgentOrchestrator.resume(scenario.runId, {
+      repositoryPath: scenario.fixture.repository,
+      runsRoot: scenario.runsRoot,
+      agents: { codex: dependentAgent, claude: new UnusedAgent('claude') },
+    });
+    const completed = await resumed.execute();
+    assert.equal(completed.status, 'COMPLETED');
+    assert.equal(completed.tasks['dependent-task']?.status, 'SUCCEEDED');
+    assert.deepEqual(dependentAgent.invocations, ['dependent-task']);
+    // The original salvaged task is never re-invoked on resume.
+    assert.deepEqual(completed.tasks['timed-out-task']?.agentAttempts, originalAttempts);
   } finally {
     await scenario.fixture.dispose();
   }
@@ -980,7 +1291,7 @@ test('a crash-resumed salvage reruns verify when salvage.verify config changed s
 
 // Duplicate-commit safety after a recorded commit is already proven by
 // 'a task with a recorded commit already cannot be salvaged again' above
-// (checkSalvageEligibility's SALVAGE_NOT_TIMED_OUT / SALVAGE_COMMIT_ALREADY_RECORDED
+// (checkSalvageEligibility's SALVAGE_ATTEMPT_NOT_ELIGIBLE / SALVAGE_COMMIT_ALREADY_RECORDED
 // checks) — not repeated here to avoid a redundant test.
 
 
