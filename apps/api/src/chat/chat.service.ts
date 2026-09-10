@@ -135,7 +135,10 @@ export class ChatService {
   async history(userId: string, roomId: string, input: unknown = {}): Promise<ChatMessagePage> {
     parseChat(chatIdentitySchema, { userId, roomId });
     const query = parseChat(historyChatSchema, input);
-    return this.withRoom(userId, roomId, async (manager, room) => {
+    // One snapshot keeps authorization, high-water and messages consistent
+    // without taking the room lock needed by sends and cursor mutations.
+    return this.dataSource.transaction('REPEATABLE READ', async (manager) => {
+      const room = await this.authorizedRoom(manager, userId, roomId);
       const highWaterSeq = toRoom(room).lastSeq;
       const catchingUp = query.afterSeq !== undefined;
       if (catchingUp && query.afterSeq! > highWaterSeq) {

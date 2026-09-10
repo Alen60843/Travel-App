@@ -87,6 +87,79 @@ describe('durable chat (real PostgreSQL)', () => {
     expect(row.last_seq).toBe('3');
   });
 
+  it('allows sends, cursor updates and concurrent history while a history transaction remains open', async () => {
+    const { a, b, room } = await fixture();
+    await chat.sendMessage(a, room, text('first'));
+    let release!: () => void;
+    let ready!: () => void;
+    const resume = new Promise<void>((resolve) => { release = resolve; });
+    const paused = new Promise<void>((resolve) => { ready = resolve; });
+    const slowHistory = new ChatService({
+      transaction: (isolation: 'READ COMMITTED' | 'REPEATABLE READ', action: (manager: EntityManager) => Promise<unknown>) =>
+        AppDataSource.transaction(isolation, async (manager) => {
+          const result = await action(manager);
+          ready();
+          await resume;
+          return result;
+        }),
+    } as unknown as DataSource);
+    const bounded = new ChatService({
+      transaction: (isolation: 'READ COMMITTED' | 'REPEATABLE READ', action: (manager: EntityManager) => Promise<unknown>) =>
+        AppDataSource.transaction(isolation, async (manager) => {
+          // Fail deterministically if any operation waits for the paused reader.
+          await manager.query(`SET LOCAL lock_timeout = '1s'`);
+          return action(manager);
+        }),
+    } as unknown as DataSource);
+    const pending = slowHistory.history(a, room, { afterSeq: 0, limit: 1 });
+    try {
+      await Promise.race([paused, pending]);
+      const results = await Promise.allSettled([
+        bounded.sendMessage(b, room, text('second')),
+        bounded.advanceReadCursor(a, room, { lastReadSeq: 1 }),
+        ...Array.from({ length: 8 }, () => bounded.history(b, room, { afterSeq: 0, limit: 1 })),
+      ]);
+      expect(results.every((result) => result.status === 'fulfilled')).toBe(true);
+    } finally {
+      release();
+      await pending;
+    }
+    await expect(pending).resolves.toMatchObject({ highWaterSeq: 1, nextAfterSeq: 1, hasMore: false });
+    const recovered = await chat.history(a, room, { afterSeq: 1 });
+    expect(recovered).toMatchObject({ highWaterSeq: 2, nextAfterSeq: 2, hasMore: false });
+    expect(recovered.messages.map((message) => message.seq)).toEqual([2]);
+  });
+
+  it('reads the committed high-water and page without waiting for an uncommitted send', async () => {
+    const { a, room } = await fixture();
+    await chat.sendMessage(a, room, text('first'));
+    const writer = AppDataSource.createQueryRunner();
+    await writer.connect();
+    await writer.startTransaction();
+    const bounded = new ChatService({
+      transaction: (isolation: 'READ COMMITTED' | 'REPEATABLE READ', action: (manager: EntityManager) => Promise<unknown>) =>
+        AppDataSource.transaction(isolation, async (manager) => {
+          await manager.query(`SET LOCAL lock_timeout = '1s'`);
+          return action(manager);
+        }),
+    } as unknown as DataSource);
+    try {
+      // Exercise the actual sequence trigger and its room lock before commit.
+      await writer.query(`INSERT INTO messages (room_id, sender_user_id, type, body, client_message_id)
+        VALUES ($1, $2, 'TEXT', 'second', 'second')`, [room, a]);
+      const page = await bounded.history(a, room, { afterSeq: 0, limit: 1 });
+      expect(page).toMatchObject({ highWaterSeq: 1, nextAfterSeq: 1, hasMore: false });
+      expect(page.messages.map((message) => message.seq)).toEqual([1]);
+      await writer.commitTransaction();
+      const next = await bounded.history(a, room, { afterSeq: page.nextAfterSeq, limit: 1 });
+      expect(next).toMatchObject({ highWaterSeq: 2, nextAfterSeq: 2, hasMore: false });
+      expect(next.messages.map((message) => message.seq)).toEqual([2]);
+    } finally {
+      if (writer.isTransactionActive) await writer.rollbackTransaction();
+      await writer.release();
+    }
+  });
+
   it('returns a stable conflict for changed-payload key reuse, including a race', async () => {
     const { a, room } = await fixture();
     const raced = await Promise.allSettled([
