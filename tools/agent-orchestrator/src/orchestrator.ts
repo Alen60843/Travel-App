@@ -37,7 +37,7 @@ import {
   type RequiredCanonicalFinding,
   type StructuredHandoff,
 } from './handoff';
-import { IntegrationGate, canReuseIntegrationPreparation } from './integration/integration-gate';
+import { IntegrationGate, canReuseIntegrationPreparation, type IntegrationCommandResult } from './integration/integration-gate';
 import {
   applyRecoveryPolicyOverlay,
   hashRecoveryPolicy,
@@ -167,6 +167,7 @@ type HandoffRecoveryEligibilityReasonCode =
 
 /** Stable, machine-readable eligibility-failure classification for salvage-task — same pattern as HandoffRecoveryEligibilityReasonCode. */
 type SalvageEligibilityReasonCode =
+  | 'BLOCKED_WRITER_INELIGIBLE'
   | 'SALVAGE_NOT_TIMED_OUT'
   | 'SALVAGE_COMMIT_ALREADY_RECORDED'
   | 'SALVAGE_WORKTREE_NOT_REGISTERED'
@@ -479,6 +480,7 @@ export class AgentOrchestrator {
   private static async loadRunForContinuation(
     runId: string,
     options: OrchestratorOptions,
+    allowAdaptive = true,
   ): Promise<AgentOrchestrator> {
     const git = options.git ?? new GitClient();
     const repositoryRoot = await git.repositoryRoot(resolve(options.repositoryPath));
@@ -487,6 +489,9 @@ export class AgentOrchestrator {
     );
     const stateStore = new StateStore(runsRoot, runId);
     const state = await stateStore.load();
+    if (!allowAdaptive && (state.strategy === 'adaptive' || state.adaptive !== undefined)) {
+      throw new OrchestratorError('TASK_STATE_INVALID', 'Blocked writer host verification does not support adaptive runs');
+    }
     if (state.repositoryRoot !== repositoryRoot) {
       throw new OrchestratorError('STATE_CORRUPT', 'Run belongs to a different repository', {
         details: { expected: state.repositoryRoot, actual: repositoryRoot },
@@ -1051,8 +1056,26 @@ export class AgentOrchestrator {
     taskId: string,
     options: OrchestratorOptions,
   ): Promise<SalvageResult> {
-    const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options);
-    const checked = await orchestrator.checkSalvageEligibility(taskId);
+    return AgentOrchestrator.recoverDirtyWriter(runId, taskId, options, false);
+  }
+
+  /** Explicit host verification of an accepted blocked writer; never invokes an agent. */
+  static async verifyBlockedTask(
+    runId: string,
+    taskId: string,
+    options: OrchestratorOptions,
+  ): Promise<SalvageResult> {
+    return AgentOrchestrator.recoverDirtyWriter(runId, taskId, options, true);
+  }
+
+  private static async recoverDirtyWriter(
+    runId: string,
+    taskId: string,
+    options: OrchestratorOptions,
+    blockedWriter: boolean,
+  ): Promise<SalvageResult> {
+    const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options, !blockedWriter);
+    const checked = await orchestrator.checkSalvageEligibility(taskId, blockedWriter);
     if (!checked.eligible) {
       throw new OrchestratorError(
         'TASK_STATE_INVALID',
@@ -1061,29 +1084,52 @@ export class AgentOrchestrator {
       );
     }
     const taskSpec = orchestrator.config.tasks.find((task) => task.id === taskId)!;
-    const preparedHeadSha = orchestrator.state.tasks[taskId]!.preparedHeadSha!;
+    const originalTask = orchestrator.state.tasks[taskId]!;
+    const preparedHeadSha = originalTask.preparedHeadSha!;
+    const originalSource = blockedWriter ? await readFile(originalTask.handoffPath!, 'utf8') : undefined;
+    const originalHandoff = originalSource === undefined ? undefined : parseHandoff(originalSource);
+    if (originalHandoff !== undefined) {
+      if (originalHandoff.status !== 'blocked') throw new OrchestratorError('TASK_STATE_INVALID', 'Expected blocked handoff');
+      validateCanonicalFindingResponses(originalHandoff, orchestrator.requiredCanonicalFindings(taskId));
+    }
+    const reopenedTasks = blockedWriter ? orchestrator.dependencyOnlyDescendantsToReopen(taskId) : undefined;
 
     if (orchestrator.state.tasks[taskId]?.salvage === undefined) {
       await orchestrator.mutate((state) => updateTask(state, taskId, (task) => ({
         ...task,
         salvage: { authorizedAt: orchestrator.clock().toISOString() },
       })));
-      await orchestrator.event('SALVAGE_AUTHORIZED', taskId, {});
+      await orchestrator.event('SALVAGE_AUTHORIZED', taskId, blockedWriter
+        ? { recoveryMode: 'blocked_writer_host_verification', originalHandoffPath: originalTask.handoffPath, error: originalTask.error, attempt: originalTask.agentAttempts.at(-1) }
+        : {});
     }
 
     const verifyConfigFingerprint = createHash('sha256')
-      .update(JSON.stringify(orchestrator.config.salvage.verify), 'utf8')
+      .update(JSON.stringify(blockedWriter ? {
+        verify: orchestrator.config.salvage.verify,
+        prepare: orchestrator.config.agentWorktree.prepare,
+        originalSource,
+        taskSpec,
+        dependencies: orchestrator.dependencyCommits(taskSpec),
+      } : orchestrator.config.salvage.verify), 'utf8')
       .digest('hex');
     const existingCheckpoint = orchestrator.state.tasks[taskId]?.salvage?.verification;
     const currentDiffFingerprint = await computeTrackedDiffFingerprint(
       orchestrator.git, checked.worktree.path, preparedHeadSha,
     );
-    const checkpointValid = existingCheckpoint !== undefined
+    const checkpointValid = (!blockedWriter || existingCheckpoint?.recoveredHandoffPath !== undefined)
+      && existingCheckpoint !== undefined
       && existingCheckpoint.worktreeHeadSha === preparedHeadSha
       && existingCheckpoint.trackedDiffFingerprint === currentDiffFingerprint
       && existingCheckpoint.verifyConfigFingerprint === verifyConfigFingerprint;
 
     if (!checkpointValid) {
+      // Unique attempt directories preserve command logs and evidence across retries.
+      const logsDirectory = join(orchestrator.stateStore.runDirectory, 'logs', taskId,
+        `salvage-${randomBytes(12).toString('hex')}`);
+      const recordCommand = async (command: IntegrationCommandResult, index: number) => {
+        await orchestrator.event('SALVAGE_COMMAND_FINISHED', taskId, { ...command, index, hostVerification: blockedWriter });
+      };
       if (orchestrator.config.agentWorktree.prepare.length > 0) {
         // Preparation may make ignored/generated artifacts available, but it
         // must never rewrite the timed-out writer's salvage candidate. Bind
@@ -1096,7 +1142,8 @@ export class AgentOrchestrator {
         );
         const prepared = await new IntegrationGate().run({
           cwd: checked.worktree.path,
-          logsDirectory: join(orchestrator.stateStore.runDirectory, 'logs', taskId, 'salvage-prepare'),
+          logsDirectory: join(logsDirectory, 'prepare'),
+          onCommandFinished: recordCommand,
           commands: orchestrator.config.agentWorktree.prepare,
           ...(orchestrator.signal === undefined ? {} : { signal: orchestrator.signal }),
         });
@@ -1149,7 +1196,8 @@ export class AgentOrchestrator {
       );
       const verified = await new IntegrationGate().run({
         cwd: checked.worktree.path,
-        logsDirectory: join(orchestrator.stateStore.runDirectory, 'logs', taskId, 'salvage-verify'),
+        logsDirectory: join(logsDirectory, 'verify'),
+        onCommandFinished: recordCommand,
         commands: orchestrator.config.salvage.verify,
         ...(orchestrator.signal === undefined ? {} : { signal: orchestrator.signal }),
       });
@@ -1159,7 +1207,8 @@ export class AgentOrchestrator {
       // Mutation detection takes priority over the commands' own exit
       // codes: a verify command must never silently become another writer,
       // even one that happens to also report success.
-      if (postFingerprint !== preFingerprint) {
+      if (postFingerprint !== preFingerprint
+        || await orchestrator.git.resolveCommit(checked.worktree.path, 'HEAD') !== preparedHeadSha) {
         await orchestrator.event('SALVAGE_VERIFICATION_FAILED', taskId, { reason: 'verify_mutated_tracked_source' });
         throw new OrchestratorError(
           'SALVAGE_VERIFICATION_FAILED',
@@ -1175,6 +1224,30 @@ export class AgentOrchestrator {
           { details: { runId, taskId, reason: 'verify_command_failed' } },
         );
       }
+      let recoveredHandoffPath: string | undefined;
+      if (originalHandoff !== undefined) {
+        const evidencePath = join(logsDirectory, 'host-verification.json');
+        await atomicArtifactWrite(evidencePath, {
+          recoveryMode: 'blocked_writer_host_verification',
+          originalHandoffPath: originalTask.handoffPath,
+          originalHandoffSha256: createHash('sha256').update(originalSource!).digest('hex'),
+          error: originalTask.error, attempt: originalTask.agentAttempts.at(-1),
+          worktreePath: checked.worktree.path, worktreeHeadSha: preparedHeadSha,
+          trackedDiffFingerprint: postFingerprint, verifyConfigFingerprint, verified,
+        });
+        recoveredHandoffPath = await writeHandoff(logsDirectory, taskId, {
+          ...originalHandoff,
+          status: 'complete',
+          summary: `${originalHandoff.summary} Recovered by deterministic host verification; original provider evidence is preserved at ${originalTask.handoffPath}.`,
+          filesChanged: [...checked.changedFiles],
+          decisions: [...originalHandoff.decisions, `Host CLI ran authorized salvage.verify; evidence: ${evidencePath}`],
+          tests: [...originalHandoff.tests, ...verified.commands.map((command) => ({
+            command: command.command,
+            result: command.exitCode === 0 && command.termination === null ? 'pass' as const : 'fail' as const,
+            details: `Deterministic host verification: ${JSON.stringify(command)}`,
+          }))],
+        });
+      }
       await orchestrator.mutate((state) => updateTask(state, taskId, (task) => ({
         ...task,
         salvage: {
@@ -1183,6 +1256,7 @@ export class AgentOrchestrator {
             worktreeHeadSha: preparedHeadSha,
             trackedDiffFingerprint: postFingerprint,
             verifyConfigFingerprint,
+            ...(recoveredHandoffPath === undefined ? {} : { recoveredHandoffPath }),
             result: 'passed',
           },
         },
@@ -1227,9 +1301,16 @@ export class AgentOrchestrator {
       openQuestions: [],
       reviewRequested: [],
     };
-    const parsed = await orchestrator.parseOrRepairHandoff(
-      taskSpec, synthesizedHandoff, null, requiredCanonicalFindings, finalDiff,
-    );
+    const recoveredHandoffPath = orchestrator.state.tasks[taskId]?.salvage?.verification?.recoveredHandoffPath;
+    const parsed = blockedWriter
+      ? { handoff: parseHandoff(await readFile(recoveredHandoffPath!, 'utf8')), outcome: { outcome: 'valid' as const, repairAttempted: false } }
+      : await orchestrator.parseOrRepairHandoff(
+        taskSpec, synthesizedHandoff, null, requiredCanonicalFindings, finalDiff,
+      );
+    if (blockedWriter && parsed.handoff?.status !== 'complete') {
+      throw new OrchestratorError('HANDOFF_INVALID', 'Recovered completion artifact is not complete');
+    }
+    if (parsed.handoff !== null) validateCanonicalFindingResponses(parsed.handoff, requiredCanonicalFindings);
     await orchestrator.recordHandoffOutcome(taskId, parsed.outcome);
     if (parsed.handoff === null) {
       // The worktree is untouched (still dirty, HEAD unmoved) — a later
@@ -1242,12 +1323,18 @@ export class AgentOrchestrator {
     // hand, does the Orchestrator (never salvage code calling git itself)
     // create the commit — the same ensureTaskCommit/assertChangedFileOwnership
     // path applyIntegrationFix already uses.
+    // Recheck candidate immediately before crossing the commit boundary.
+    const checkpoint = orchestrator.state.tasks[taskId]!.salvage!.verification!;
+    if (await orchestrator.git.resolveCommit(checked.worktree.path, 'HEAD') !== preparedHeadSha
+      || await computeTrackedDiffFingerprint(orchestrator.git, checked.worktree.path, preparedHeadSha) !== checkpoint.trackedDiffFingerprint) {
+      throw new OrchestratorError('SALVAGE_VERIFICATION_FAILED', 'Recovery candidate changed after verification');
+    }
     const ensured = await ensureTaskCommit(orchestrator.git, {
       worktreePath: checked.worktree.path,
       baseSha: preparedHeadSha,
       agent: taskSpec.owner,
       taskId,
-      summary: `Salvaged timed-out writer work for ${taskId}`,
+      summary: blockedWriter ? `Recovered blocked writer after host verification for ${taskId}` : `Salvaged timed-out writer work for ${taskId}`,
     });
     assertChangedFileOwnership(taskId, ensured.changedFiles, taskSpec.files);
     if (JSON.stringify([...ensured.changedFiles].sort()) !== JSON.stringify([...checked.changedFiles].sort())) {
@@ -1258,12 +1345,13 @@ export class AgentOrchestrator {
       );
     }
 
-    const handoffPath = await writeHandoff(join(orchestrator.stateStore.runDirectory, 'handoffs'), taskId, parsed.handoff);
+    const handoffPath = blockedWriter ? recoveredHandoffPath!
+      : await writeHandoff(join(orchestrator.stateStore.runDirectory, 'handoffs'), taskId, parsed.handoff);
     await orchestrator.succeedTask(taskId, handoffPath, {
       sha: ensured.commitSha,
       parentSha: preparedHeadSha,
       changedFiles: [...ensured.changedFiles],
-    });
+    }, reopenedTasks);
     // §12: same post-recovery adaptive completion lifecycle as handoff
     // repair — no salvage.verify rerun, no second commit, no repeat repair;
     // this only mirrors the already-accepted success into the adaptive layer.
@@ -3292,18 +3380,34 @@ export class AgentOrchestrator {
     taskId: string,
     handoffPath: string,
     commit?: TaskCommitState,
+    reopenedTasks?: readonly string[],
   ): Promise<void> {
-    await this.mutate((state) => updateTask(state, taskId, (task) => {
-      const { error: _previousError, ...withoutError } = task;
-      return {
-        ...withoutError,
-        status: 'SUCCEEDED',
-        handoffPath,
-        ...(commit === undefined ? {} : { commit }),
-        finishedAt: this.clock().toISOString(),
-      };
-    }));
-    await this.event('TASK_SUCCEEDED', taskId);
+    await this.mutate((state) => {
+      const succeeded = updateTask(state, taskId, (task) => {
+        const { error: _previousError, ...withoutError } = task;
+        return {
+          ...withoutError,
+          status: 'SUCCEEDED',
+          handoffPath,
+          ...(commit === undefined ? {} : { commit }),
+          finishedAt: this.clock().toISOString(),
+        };
+      });
+      if (reopenedTasks === undefined) return succeeded;
+      const tasks = { ...succeeded.tasks };
+      for (const id of reopenedTasks) {
+        const { error: _error, finishedAt: _finishedAt, ...waiting } = tasks[id]!;
+        tasks[id] = { ...waiting, status: 'PENDING' };
+      }
+      const statuses = new TaskScheduler(this.config.tasks, this.config.concurrency,
+        taskStatusRecord({ ...succeeded, tasks })).snapshot();
+      for (const id of reopenedTasks) tasks[id] = { ...tasks[id]!, status: statuses[id]! };
+      return { ...succeeded, status: 'RUNNING', tasks };
+    });
+    await this.event('TASK_SUCCEEDED', taskId, reopenedTasks === undefined ? undefined : {
+      recoveryMode: 'blocked_writer_host_verification', commitSha: commit?.sha,
+      handoffPath, reopenedTaskIds: reopenedTasks,
+    });
     await this.finishAdaptiveUnit(taskId, 'SUCCEEDED');
   }
 
@@ -3481,7 +3585,7 @@ export class AgentOrchestrator {
    * qualifies; a crashed process is a different failure shape and folding it
    * in without a real example to validate against would be scope creep.
    */
-  private async checkSalvageEligibility(taskId: string): Promise<
+  private async checkSalvageEligibility(taskId: string, blockedWriter = false): Promise<
     | {
         readonly eligible: true;
         readonly worktree: OwnedWorktree;
@@ -3498,7 +3602,18 @@ export class AgentOrchestrator {
     }
     const lastAttempt = taskState.agentAttempts.at(-1);
     const timedOut = taskState.error?.code === 'AGENT_TIMEOUT' && lastAttempt?.outcome === 'timed_out';
-    if ((taskState.status !== 'FAILED' && taskState.status !== 'BLOCKED') || !timedOut) {
+    if (blockedWriter && (
+      this.state.strategy === 'adaptive' || this.state.adaptive !== undefined
+      || this.state.status !== 'BLOCKED' || taskState.status !== 'BLOCKED'
+      || !taskSpec.writer || !['implementation', 'correction', 'testing', 'integration'].includes(taskSpec.mode)
+      || taskState.error?.code !== 'REVIEW_BLOCKED' || lastAttempt?.outcome !== 'succeeded'
+      || lastAttempt.finishedAt === undefined || taskState.handoffOutcome !== 'valid'
+      || taskState.handoffPath === undefined
+      || !this.config.salvage.verify.some((command) => command.required !== false)
+    )) {
+      return { eligible: false, reason: 'requires a static blocked writer with a succeeded process, accepted blocked handoff, and required salvage.verify commands', reasonCode: 'BLOCKED_WRITER_INELIGIBLE' };
+    }
+    if (!blockedWriter && ((taskState.status !== 'FAILED' && taskState.status !== 'BLOCKED') || !timedOut)) {
       return {
         eligible: false,
         reason: 'task did not end in a completed AGENT_TIMEOUT agent attempt',
@@ -3515,6 +3630,8 @@ export class AgentOrchestrator {
     if (
       this.state.integration.integratedTaskCommits.length > 0
       || (this.state.integration.integrationFixCommits?.length ?? 0) > 0
+      || (blockedWriter && (this.state.integration.status !== 'PENDING'
+        || this.state.integration.worktreePath !== undefined))
     ) {
       return {
         eligible: false,
@@ -3522,7 +3639,10 @@ export class AgentOrchestrator {
         reasonCode: 'SALVAGE_ALREADY_INTEGRATED',
       };
     }
-    const unsatisfiedDependencies = taskSpec.dependsOn.filter((dependencyId) => {
+    const dependencyIds = blockedWriter
+      ? ancestorTasks(taskSpec, new TaskGraph(this.config.tasks)).map((task) => task.id)
+      : taskSpec.dependsOn;
+    const unsatisfiedDependencies = dependencyIds.filter((dependencyId) => {
       const status = this.state.tasks[dependencyId]?.status;
       return status !== 'SUCCEEDED' && status !== 'SKIPPED';
     });
@@ -3553,6 +3673,32 @@ export class AgentOrchestrator {
         reason: `preserved worktree is not registered/present: ${errorText(error)}`,
         reasonCode: 'SALVAGE_WORKTREE_NOT_REGISTERED',
       };
+    }
+    if (blockedWriter) {
+      const listed = (await this.worktrees.listGitWorktrees()).find((entry) => entry.path === worktree.path);
+      if (worktree.kind !== 'task' || worktree.runId !== this.state.runId || worktree.taskId !== taskId
+        || worktree.branch !== taskState.branch || worktree.baseSha !== this.state.baseSha
+        || listed?.branch !== `refs/heads/${worktree.branch}`) {
+        return { eligible: false, reason: 'worktree registration does not match this task', reasonCode: 'SALVAGE_WORKTREE_NOT_REGISTERED' };
+      }
+      // prepareTask cherry-picks every ancestor commit with -x. Verify that
+      // the prepared history still represents exactly those persisted inputs.
+      const expected = this.dependencyCommits(taskSpec);
+      await inspectTaskCommits(this.git, worktree.path, this.state.baseSha);
+      const preparedCommits = (await this.git.run(worktree.path,
+        ['rev-list', '--reverse', `${this.state.baseSha}..${taskState.preparedHeadSha}`])).stdout.trim().split(/\r?\n/).filter(Boolean);
+      let dependenciesMatch = preparedCommits.length === expected.length;
+      for (const [index, sha] of preparedCommits.entries()) {
+        const source = expected[index]?.commitSha;
+        if (source === undefined) break;
+        const message = (await this.git.run(worktree.path, ['show', '-s', '--format=%B', sha])).stdout;
+        const patch = async (commit: string) => (await this.git.run(worktree.path,
+          ['diff', '--binary', '--full-index', '--no-ext-diff', '--no-color', '--no-renames', `${commit}^`, commit])).stdout;
+        if (!message.includes(`(cherry picked from commit ${source})`) || await patch(sha) !== await patch(source)) dependenciesMatch = false;
+      }
+      if (!dependenciesMatch || (expected.length === 0 && taskState.preparedHeadSha !== this.state.baseSha)) {
+        return { eligible: false, reason: 'prepared dependency history differs from current dependency commits', reasonCode: 'SALVAGE_DEPENDENCY_UNSATISFIED' };
+      }
     }
     let headSha: string;
     try {

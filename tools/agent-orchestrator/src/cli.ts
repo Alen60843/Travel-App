@@ -23,6 +23,7 @@ Usage:
   pnpm agents:recover-handoffs <run-id>
   pnpm agents:retry-agent <run-id> <task-id>
   pnpm agents:salvage-task <run-id> <task-id>
+  pnpm agents:verify-blocked-task <run-id> <task-id>
   pnpm agents:authorize-recovery-policy <run-id> <policy-file>
   pnpm agents:retry-integration <run-id>
   pnpm agents:apply-integration-fix <run-id> <summary> <ownership-glob> [more-globs...]
@@ -40,6 +41,10 @@ retry-agent authorizes one additional attempt only for a FAILED agent/process-la
 with no commit, accepted structured artifact, dirty work, or unsatisfied dependency. It
 archives the failure and reopens only dependency-blocked descendants attributable to that
 task. It never invokes an agent itself; run agents:resume afterward.
+verify-blocked-task explicitly verifies a valid blocked writer from the host CLI using
+salvage.verify in its preserved worktree, retaining the original blocked handoff. It
+invokes no agent, rejects adaptive runs, and requires agents:resume afterward.
+
 salvage-task recovers useful work left behind by a task whose process timed out
 (AGENT_TIMEOUT) with a dirty, evidence-backed worktree diff -- the inverse case from
 retry-agent, which requires a CLEAN worktree. It refuses unless every changed tracked file is
@@ -118,14 +123,15 @@ async function main(argv: readonly string[]): Promise<number> {
     }, null, 2)}\n`);
     return 0;
   }
-  if (command === 'salvage-task') {
+  if (command === 'salvage-task' || command === 'verify-blocked-task') {
     const [taskId] = extra;
     if (argument === undefined || taskId === undefined || extra.length !== 1) {
       process.stderr.write(`${USAGE}\n`);
       return 1;
     }
     const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
-    const result = await AgentOrchestrator.salvageTask(argument, taskId, {
+    const recover = command === 'verify-blocked-task' ? AgentOrchestrator.verifyBlockedTask : AgentOrchestrator.salvageTask;
+    const result = await recover(argument, taskId, {
       repositoryPath,
     });
     process.stdout.write(`${JSON.stringify({
@@ -133,7 +139,7 @@ async function main(argv: readonly string[]): Promise<number> {
       runStatus: result.orchestrator.snapshot().status,
       taskId: result.taskId,
       commitSha: result.commitSha,
-      manualNextStep: 'Inspect the salvaged commit above, then run `pnpm agents:resume <run-id>` to continue the run.',
+      manualNextStep: 'Inspect the recovered commit above, then run `pnpm agents:resume <run-id>` to continue the run.',
     }, null, 2)}\n`);
     return 0;
   }
