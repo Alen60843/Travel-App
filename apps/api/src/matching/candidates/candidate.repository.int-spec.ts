@@ -156,7 +156,9 @@ describe('CandidateRepository (live PostgreSQL/PostGIS)', () => {
     // stay in parity, rather than only exercising the identity point.
     await addSegment(weaker, 'weaker', 170.1, 84);
 
-    const ghosted = await createUser('ghosted', { ghostUntil: '2026-09-01T00:00:00Z' });
+    const ghosted = await createUser('ghosted', {
+      ghostUntil: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+    });
     const blocked = await createUser('blocked');
     const blockedOutgoing = await createUser('blocked-outgoing');
     const swiped = await createUser('swiped');

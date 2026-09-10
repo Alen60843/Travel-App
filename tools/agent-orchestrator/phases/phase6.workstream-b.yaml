@@ -1,0 +1,342 @@
+# Phase 6 — Events & Join Requests
+# Workstream B: authenticated join requests, host approval/rejection, participant
+# creation, and API-level capacity/concurrency correctness.
+#
+# Workstream A already shipped the USER-hosted Event lifecycle. The canonical
+# schema already owns join-request/participant uniqueness, paid-approval safety,
+# participant_count projection, and the concurrent-last-seat capacity invariant.
+# This workstream must use those guarantees rather than duplicate them in app code.
+#
+# Intentionally out of scope here: payment-provider authorization/capture,
+# participant attendance/cancellation after approval, event chat, reviews,
+# provider-hosted event creation, and background expiry workers. Persist and
+# enforce expires_at correctly; do not pretend an expiry worker exists if the
+# repository does not already provide one.
+
+phase: 6
+name: Events & Join Requests — Workstream B (join requests and participant approval)
+baseBranch: phase6/workstream-b
+canonicalDesignDocument: docs/superpowers/specs/2026-08-20-tripwith-phase-1-design.md
+concurrency: 1
+agentRetries: 1
+maxReviewRounds: 2
+maxHandoffRepairAttempts: 2
+agentTimeoutMs: 3600000
+
+# Make every task worktree capable of compiling the API without relying on
+# generated artifacts from another checkout. dist/ is ignored and therefore
+# safe preparation output.
+agentWorktree:
+  prepare:
+    - command: pnpm install --frozen-lockfile
+      required: true
+      timeoutMs: 900000
+    - command: pnpm --filter @tripwith/shared build
+      required: true
+      timeoutMs: 300000
+
+# If a writer times out with a valid owned diff, salvage must prove the API still
+# typechecks and the Events-focused tests pass before a canonical commit exists.
+salvage:
+  verify:
+    - command: pnpm --filter @tripwith/api typecheck
+      required: true
+      timeoutMs: 600000
+    - command: >-
+        pnpm --filter @tripwith/api exec jest --config jest.config.js
+        --runInBand src/events
+      required: true
+      timeoutMs: 900000
+
+tasks:
+  - id: event-join-api
+    title: Join-request and participant-approval API
+    owner: codex
+    effort: high
+    mode: implementation
+    files:
+      - apps/api/src/events/**
+    dependsOn: []
+    instructions: |
+      Implement ONLY Phase 6 Workstream B: authenticated join requests for the
+      already-shipped USER-hosted Event lifecycle, plus host approval/rejection
+      and participant creation. Keep the implementation inside
+      apps/api/src/events/** and make the smallest coherent extension of the
+      existing EventsModule. Do not modify canonical migrations merely to make
+      application code easier.
+
+      FIRST inspect the current repository and verify the actual contracts. At
+      minimum inspect:
+        - apps/api/src/events/** from Workstream A
+        - apps/api/src/database/entities/events.entity.ts
+        - the EVENT PARTICIPATION section of
+          apps/api/src/database/migrations/sql/1787184000000-InitialSchema.up.sql
+        - packages/shared/src/enums.ts
+        - apps/api/src/auth/**
+        - apps/api/src/common/errors/**
+        - apps/api/src/database/scripts/verify-concurrency.sh
+        - apps/api/src/outbox/** and apps/api/src/queue/** before claiming that
+          delayed expiry delivery already exists
+
+      EXISTING DATABASE GUARANTEES — REUSE, DO NOT REIMPLEMENT:
+        - event_join_requests_active_uk: at most one live PENDING/APPROVED
+          request for the same (event,user), while rejected/expired/cancelled/
+          payment-failed history permits a later request.
+        - event_participants_active_uk: at most one active participation for the
+          same (event,user).
+        - event_participants_join_request_uk: one participant row per request.
+        - tw_guard_join_approval: paid-event approval requires an AUTHORIZED or
+          CAPTURED linked payment.
+        - tw_sync_participant_count: participant_count is trigger-maintained.
+        - events_capacity_not_exceeded_chk plus the trigger's row-level UPDATE
+          on events serializes concurrent last-seat inserts. Never add an
+          application counter or optimistic shadow capacity.
+
+      API SURFACE:
+      Follow existing versioned/authenticated conventions. Prefer the following
+      shape unless current repository conventions provide a stronger reason:
+        POST /api/v1/events/:eventId/join-requests
+          authenticated traveller creates a request for that Event
+        GET  /api/v1/me/join-requests
+          authenticated traveller lists only their own requests
+        POST /api/v1/me/join-requests/:requestId/cancel
+          requester cancels only a still-PENDING request
+        GET  /api/v1/me/events/:eventId/join-requests
+          owning USER host lists requests for their Event
+        POST /api/v1/me/events/:eventId/join-requests/:requestId/approve
+        POST /api/v1/me/events/:eventId/join-requests/:requestId/reject
+          explicit host commands; never generic PATCH status
+        GET  /api/v1/me/events/:eventId/participants
+          optional if needed for a coherent host management view; keep output
+          minimal and do not serialize ORM entities blindly.
+
+      REQUEST CREATION / TRAVELLER AUTHORITY:
+        - The authenticated user id comes only from TripWithAuthGuard. Never
+          accept userId, status, paymentId, requestedAt, expiresAt, decision
+          timestamps, decidedByUserId, participantCount, or isHost from the
+          client.
+        - Body may contain only a bounded optional message consistent with the
+          schema's <=500-character invariant. Reject unknown/protected fields.
+        - Reject self-join to an Event hosted by the same USER.
+        - Join only an Event state that is currently joinable under the shipped
+          lifecycle; do not accept DRAFT/CANCELLED/COMPLETED/IN_PROGRESS or an
+          already-started Event. Treat a full Event as unavailable rather than
+          creating an unfulfillable active request unless the canonical design
+          explicitly proves otherwise.
+        - Re-read current event/user state in the transaction. Enforce the
+          Event's min_trust_score against the actual current user record.
+        - Server owns request expiry. Persist a deterministic 24-hour PENDING
+          expiry according to the canonical design. An overdue PENDING request
+          must never be approved. If an overdue row is encountered on a command
+          path, transition it to EXPIRED with expired_at in the same transaction
+          before returning the appropriate domain result; do not claim that
+          proactive background expiry exists unless a real worker is present.
+        - Translate duplicate-live-request database conflicts into a stable
+          domain/AppError response. Do not leak raw PostgreSQL errors.
+        - A REJECTED, EXPIRED, CANCELLED, or PAYMENT_FAILED historical request
+          must not permanently prevent a later valid request.
+
+      APPROVAL POLICY:
+        - If join_approval_required=true, create PENDING and require the owning
+          USER host to approve or reject explicitly.
+        - If join_approval_required=false for a free/deposit-free Event,
+          auto-approval must be atomic: create the request with the correct
+          approval timestamp semantics and create the participant in the same
+          transaction. Do not fabricate a host decision if none occurred.
+        - For this workstream, do NOT implement external payment authorization,
+          capture, provider callbacks, or client-supplied payment ids. If
+          deposit_minor > 0 and no already-shipped internal payment workflow can
+          be reused without broadening scope, fail closed with an explicit
+          domain error that paid joining is not available in this workstream.
+          Never weaken or bypass tw_guard_join_approval.
+
+      HOST APPROVE / REJECT:
+        - Only the owning USER host may list or decide requests for the Event.
+          Missing Event and cross-owner access should share a non-leaking
+          boundary consistent with Workstream A.
+        - Approval/rejection applies only to the request belonging to that exact
+          Event; never trust an eventId/requestId pair without checking both.
+        - Lock/re-read the Event and request in one transaction before deciding.
+          Use a consistent lock order so concurrent approval/cancel/event
+          lifecycle operations do not introduce avoidable deadlocks.
+        - APPROVE only a still-PENDING, unexpired request for a joinable Event.
+          Set APPROVED, approved_at, and decided_by_user_id consistently and
+          create exactly one EventParticipant in the same transaction.
+        - REJECT only a still-PENDING, unexpired request. Set REJECTED,
+          rejected_at, and decided_by_user_id consistently. Create no
+          participant.
+        - If participant insertion loses the last-seat race, the whole approval
+          transaction must roll back so the losing request does NOT remain
+          APPROVED. Return a stable capacity/conflict error rather than a 500.
+        - participant_count is database-owned. Never assign, increment, or
+          decrement it in TypeScript.
+        - If current lifecycle semantics require ACTIVE -> FULL exactly when the
+          successful participant reaches capacity, perform that transition only
+          through the existing Event state machine/audit context after re-reading
+          the trigger-maintained count; do not create a parallel status rule.
+
+      CANCELLATION / STATUS BOUNDARIES:
+        - Traveller cancellation in this workstream is PENDING -> CANCELLED only,
+          with cancelled_at. Cancellation of an already-approved participant is
+          a separate lifecycle/payment-compensation concern and is out of scope.
+        - Do not implement PAYMENT_FAILED, attendance/check-in, capture/refund,
+          or participant removal here.
+        - Do not implement a generic request-status endpoint.
+
+      READ MODELS / PRIVACY:
+        - Traveller views expose only that traveller's own requests.
+        - Host views expose only requests/participants for Events owned by that
+          host. Return explicit DTO/view shapes; never serialize complete User,
+          EventJoinRequestEntity, or EventParticipantEntity objects blindly.
+        - Do not duplicate Explorer's public event discovery surface.
+
+      TESTS ARE MANDATORY under apps/api/src/events/**. Add focused unit/controller
+      coverage plus live PostgreSQL integration coverage. Prove at minimum:
+        - authenticated identity cannot be spoofed through request fields
+        - self-join, non-joinable/started Event, low trust, oversized message,
+          and protected fields are rejected
+        - one valid manual-approval request becomes PENDING with server-owned
+          expiry; a duplicate live request is rejected cleanly
+        - rejected/cancelled/expired history permits a later request
+        - requester can cancel only their own PENDING request
+        - non-owner host cannot list/approve/reject another host's requests
+        - wrong eventId/requestId pairing cannot be used as an IDOR
+        - approval atomically yields APPROVED + exactly one participant and the
+          trigger-maintained participantCount changes exactly once
+        - rejection yields REJECTED and no participant
+        - repeated/concurrent approval cannot create duplicate participants
+        - an expired request cannot be approved
+        - auto-approval for joinApprovalRequired=false is atomic for a free Event
+        - paid/deposit Event cannot bypass the database payment-safety gate or
+          accept an arbitrary client paymentId
+        - CONCURRENCY: with exactly one remaining seat and two distinct PENDING
+          requests approved concurrently through the real service/repository
+          path, exactly one transaction succeeds, exactly one active participant
+          is added, participant_count never exceeds capacity, and the losing
+          request is not left APPROVED. This must use independent real PostgreSQL
+          transactions/connections, not a mocked lock.
+        - no application code writes participant_count directly
+
+      Preserve Workstream A behavior and tests. Do not weaken existing DB
+      invariant tests or the standalone 24-worker capacity proof.
+
+  - id: event-join-review
+    title: Independent adversarial review of join and approval Workstream B
+    owner: claude
+    model: sonnet
+    effort: high
+    mode: review
+    files: []
+    dependsOn:
+      - event-join-api
+    instructions: |
+      Adversarially review Workstream B from the actual dependency diff and
+      current schema. Attempt to falsify authorization, transactionality,
+      capacity correctness, request-state semantics, expiry, and privacy.
+
+      Focus especially on:
+        - userId/paymentId/status/timestamp spoofing
+        - self-join and min-trust bypass
+        - eventId/requestId IDOR and cross-host decisions
+        - stale pre-lock state, inconsistent lock order, or race windows
+        - request marked APPROVED before a failed participant insert commits
+        - last-seat overbooking, duplicate participant creation, counter writes
+        - raw unique/check constraint errors escaping as 500s
+        - approving expired/non-PENDING requests or repeated decisions
+        - incorrect auto-approval when joinApprovalRequired=false
+        - paid join/payment-gate bypass or accidental payment-provider scope
+        - stale request expiry being falsely presented as a working background job
+        - ORM entity/user overexposure in host/traveller read models
+        - regressions to Workstream A Event lifecycle or Explorer
+        - unnecessary abstractions/dependencies that violate the Agent Kernel's
+          minimal-change discipline
+
+      Report only material findings with concrete file/line or reproducible
+      evidence. Do not redesign unrelated Phase 7+ systems.
+
+  - id: event-join-correction
+    title: Verify and correct join/approval findings
+    owner: codex
+    effort: high
+    mode: correction
+    files:
+      - apps/api/src/events/**
+    dependsOn:
+      - event-join-review
+    condition:
+      reviewOf: event-join-review
+      skipIfStatus:
+        - approved
+    instructions: |
+      Classify every material review finding CONFIRMED or REJECTED with current
+      repository evidence. Correct confirmed defects inside apps/api/src/events/**
+      only. Preserve the database as the authority for uniqueness, payment-safe
+      approval, participant_count, and capacity. Do not broaden into payments,
+      chat, attendance, reviews, provider events, or migrations.
+
+  - id: event-join-final-review
+    title: Final independent review of Workstream B corrections
+    owner: claude
+    model: sonnet
+    effort: high
+    mode: final_review
+    files: []
+    dependsOn:
+      - event-join-correction
+    condition:
+      reviewOf: event-join-review
+      skipIfStatus:
+        - approved
+    instructions: |
+      Re-check the original findings against the correction diff, current DB
+      contracts, and test evidence. Approve only if all material confirmed
+      findings are genuinely resolved and the last-seat race remains correct.
+
+  - id: event-join-judge
+    title: Escalation arbitration for unresolved high/critical join finding
+    owner: claude
+    model: opus
+    effort: extra_high
+    mode: escalation
+    files: []
+    dependsOn:
+      - event-join-final-review
+    condition:
+      reviewOf: event-join-final-review
+      skipIfStatus:
+        - approved
+      minimumSeverity: high
+    instructions: |
+      Read-only arbitration of one unresolved high/critical disagreement using
+      only concrete supplied evidence. Do not modify code and do not start a new
+      broad review. Block for human review if the dispute remains unresolved.
+
+integration:
+  prepare:
+    - command: pnpm install --frozen-lockfile
+      required: true
+      timeoutMs: 900000
+    - command: pnpm --filter @tripwith/shared build
+      required: true
+      timeoutMs: 300000
+  commands:
+    - pnpm --filter @tripwith/shared typecheck
+    - pnpm --filter @tripwith/api typecheck
+    - pnpm --filter @tripwith/api build
+    - pnpm --filter @tripwith/shared test
+    - command: >-
+        pnpm --filter @tripwith/api test -- --runInBand --detectOpenHandles
+      required: true
+      timeoutMs: 1800000
+    - pnpm run check:enums
+    - command: pnpm --filter @tripwith/api db:verify
+      required: true
+      timeoutMs: 1800000
+  diagnostics:
+    - pnpm audit --prod
+
+# Execution rule: plan and inspect this workstream before running it. After a
+# COMPLETED run, inspect the generated diff and database-backed concurrency
+# evidence before merging. Paid provider flows and proactive expiry processing
+# remain explicit follow-up work unless the current repository already contains
+# a reusable implementation that makes them in-scope without architecture creep.

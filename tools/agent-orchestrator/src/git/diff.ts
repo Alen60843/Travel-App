@@ -1,4 +1,78 @@
+import { createHash } from 'node:crypto';
+import { lstat, readFile, readlink } from 'node:fs/promises';
+import { join } from 'node:path';
+
 import { GitClient, assertRevision, assertSha } from './git';
+
+/**
+ * A content fingerprint of the complete, commit-eligible dirty worktree state
+ * relative to baseSha. Despite the historical function name, this deliberately
+ * binds more than ordinary tracked text diffs:
+ *
+ * - tracked changes use `git diff --binary --full-index`, so binary contents are
+ *   represented rather than collapsing to the same "Binary files differ" text;
+ * - porcelain status is included, binding path/status changes;
+ * - non-ignored untracked paths bind raw bytes, executable modes, symlink
+ *   targets, and (for regular files) the Git blob after attributes/filters.
+ *
+ * This is used both to detect a salvage.verify command silently mutating source
+ * and to bind a SALVAGE_VERIFIED checkpoint to the exact dirty state it
+ * validated. Ignored/generated artifacts remain intentionally outside the
+ * fingerprint because `git status --untracked-files=all` does not report them.
+ *
+ * Existing checkpoints produced by the older tracked-text-only algorithm fail
+ * closed after this change: their stored digest simply will not match and the
+ * verification is safely re-run.
+ */
+export async function computeTrackedDiffFingerprint(
+  git: GitClient,
+  worktreePath: string,
+  baseSha: string,
+): Promise<string> {
+  assertRevision(baseSha);
+  const [trackedDiff, status] = await Promise.all([
+    git.run(worktreePath, [
+      'diff',
+      '--binary',
+      '--full-index',
+      '--no-ext-diff',
+      '--no-textconv',
+      '--no-color',
+      baseSha,
+    ]),
+    git.run(worktreePath, [
+      'status',
+      '--porcelain=v1',
+      '-z',
+      '--untracked-files=all',
+    ]),
+  ]);
+
+  const untrackedPaths = [...parseUntrackedPaths(status.stdout)].sort();
+  const untrackedObjects: string[] = [];
+  for (const path of untrackedPaths) {
+    // Bind bytes and mode as well as the Git blob. Following a symlink
+    // would hash its destination instead of the link Git actually commits.
+    const absolutePath = join(worktreePath, path);
+    const metadata = await lstat(absolutePath);
+    const bytes = metadata.isSymbolicLink() ? await readlink(absolutePath) : await readFile(absolutePath);
+    const rawDigest = createHash('sha256').update(bytes).digest('hex');
+    const mode = metadata.isSymbolicLink() ? '120000' : (metadata.mode & 0o111) !== 0 ? '100755' : '100644';
+    const object = metadata.isSymbolicLink() ? rawDigest : (await git.run(worktreePath, [
+      'hash-object', `--path=${path}`, '--', path,
+    ])).stdout.trim();
+    untrackedObjects.push(`${path}\0${mode}\0${rawDigest}\0${object}`);
+  }
+
+  return createHash('sha256')
+    .update('tracked-diff\0', 'utf8')
+    .update(trackedDiff.stdout, 'utf8')
+    .update('\0porcelain-status\0', 'utf8')
+    .update(status.stdout, 'utf8')
+    .update('\0untracked-objects\0', 'utf8')
+    .update(untrackedObjects.join('\0'), 'utf8')
+    .digest('hex');
+}
 
 export interface FileDiffStat {
   readonly path: string;
@@ -223,6 +297,25 @@ function parsePorcelainPaths(output: string): readonly string[] {
     }
   }
   return [...paths];
+}
+
+function parseUntrackedPaths(output: string): readonly string[] {
+  const tokens = splitNul(output);
+  const paths: string[] = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    const record = tokens[index];
+    if (record === undefined || record.length < 4 || record[2] !== ' ') {
+      throw new Error('Malformed git porcelain output');
+    }
+    const status = record.slice(0, 2);
+    if (status === '??') paths.push(record.slice(3));
+    if (status.includes('R') || status.includes('C')) {
+      const source = tokens[index + 1];
+      if (source === undefined) throw new Error('Malformed rename/copy porcelain output');
+      index += 1;
+    }
+  }
+  return paths;
 }
 
 function parseCount(value: string): number {

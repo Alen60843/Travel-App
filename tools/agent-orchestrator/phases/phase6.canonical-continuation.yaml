@@ -1,0 +1,113 @@
+mode: adaptive
+
+phase: phase6-canonical-continuation
+name: Phase 6 Events — Canonical Finding Continuation
+baseBranch: agent/run-20260903203914-cc2b57d4/events-core-api
+canonicalDesignDocument: docs/superpowers/specs/2026-08-20-tripwith-phase-1-design.md
+
+goal: >
+  Correct and independently re-verify the canonical F001, F002, and F003
+  findings already synthesized for the Phase 6 Events implementation. Reuse
+  that immutable evidence without rerunning review shards or synthesis.
+
+constraints:
+  - Do not rerun the original implementation or prior review shards.
+  - Corrections may write only inside apps/api/src/events/**.
+  - Every correction must remain traceable to imported canonical evidence.
+  - Re-verification is targeted and read-only.
+  - Do not merge or push.
+
+continuation:
+  sourceRunId: run-20260904101940-9fdd27c5
+  sourceWorkUnitId: work-000005
+  sourceArtifactType: review
+  expectedBaseSha: b4bc2c56962754e9dad6118db00b28a885d0ceea
+  expectedArtifactSha256: 803b8397b80d19bb0a1f0f15841f4a593541496bdd6d434dd7afabababa944e2
+  mode: canonical_findings
+
+policy:
+  allowedConcerns:
+    - api_validation
+    - testing
+
+  allowedOwnership:
+    - apps/api/src/events/**
+
+  allowedResources:
+    - kind: database
+      key: tripwith-test-postgres
+      mode: write
+  requireEvidenceForExpansion: true
+
+  correctionPolicy:
+    allowedOwnership:
+      - apps/api/src/events/**
+    allowedRoles:
+      - correction
+      - testing
+    requireCanonicalFinding: true
+    maxRounds: 2
+
+  agingIntervalMs: 30000
+  agingStep: 5
+  humanApprovalRisks: []
+
+  limits:
+    maxConcurrentAgents: 3
+    maxAgentInvocations: 10
+    maxTotalWorkUnits: 10
+    maxDecompositionDepth: 2
+    maxFanOutPerWorkUnit: 3
+    maxSynthesisInputs: 4
+    maxWallClockMs: 3600000
+    maxEstimatedCostUnits: 100
+
+executors:
+  - id: correction-writer
+    adapter: codex
+    roles:
+      - correction
+      - testing
+    capabilities:
+      - capability: typescript_backend_editing
+        minimumLevel: 1
+      - capability: testing
+        minimumLevel: 1
+      - capability: postgresql_integration_testing
+        minimumLevel: 1
+    effort: high
+    available: true
+
+  - id: independent-reverifier
+    adapter: claude
+    roles:
+      - review
+    capabilities:
+      - capability: review
+        minimumLevel: 1
+    effort: high
+    model: sonnet
+    available: true
+
+agentRetries: 1
+agentTimeoutMs: 1200000
+
+agentWorktree:
+  prepare:
+    - command: pnpm install --frozen-lockfile
+      required: true
+      timeoutMs: 900000
+
+integration:
+  prepare:
+    - command: pnpm install --frozen-lockfile
+      required: true
+      timeoutMs: 900000
+
+  commands:
+    - command: pnpm --filter @tripwith/api typecheck
+      required: true
+    - command: pnpm --filter @tripwith/api build
+      required: true
+
+  diagnostics: []
