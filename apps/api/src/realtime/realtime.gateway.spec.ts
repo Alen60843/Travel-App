@@ -132,9 +132,9 @@ describe('RealtimeGateway (real Nest app, real WebSocket wire protocol)', () => 
       const ws = await openEngineIoSocket(port);
       ws.send('40{"token":"not-a-real-token"}');
 
-      const closeEvent = await waitForClose(ws);
-
-      expect(closeEvent).toBeDefined();
+      const rejection = await waitForFrame(ws, (f) => f.startsWith('44'));
+      expect(rejection).toContain('UNAUTHENTICATED');
+      ws.close();
       expect(connectionTracker.activeConnections).toBe(0);
     });
   });
@@ -149,9 +149,9 @@ describe('RealtimeGateway (real Nest app, real WebSocket wire protocol)', () => 
       // Even a token that would pass a real authenticator must still be rejected.
       ws.send('40{"token":"good-token"}');
 
-      const closeEvent = await waitForClose(ws);
-
-      expect(closeEvent).toBeDefined();
+      const rejection = await waitForFrame(ws, (f) => f.startsWith('44'));
+      expect(rejection).toContain('UNAUTHENTICATED');
+      ws.close();
       expect(connectionTracker.activeConnections).toBe(0);
     });
   });

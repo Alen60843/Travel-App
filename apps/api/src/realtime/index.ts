@@ -9,7 +9,7 @@ export type { RealtimeSocket, RealtimeSocketData } from './realtime-socket.types
 export { RealtimeModule } from './realtime.module';
 export type { RealtimeModuleOptions } from './realtime.module';
 export { RedisIoAdapter } from './redis-io.adapter';
-export { userRoom } from './rooms';
+export { chatRoom, userRoom } from './rooms';
 export { extractHandshakeToken } from './socket-auth.util';
 export { RejectingSocketAuthenticator, SOCKET_AUTHENTICATOR } from './socket-authenticator';
 export type { AuthenticatedPrincipal, SocketAuthenticator } from './socket-authenticator';

@@ -1,5 +1,5 @@
 import { Inject, Logger } from '@nestjs/common';
-import { OnGatewayConnection, OnGatewayDisconnect, WebSocketGateway, WebSocketServer } from '@nestjs/websockets';
+import { OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect, WebSocketGateway, WebSocketServer } from '@nestjs/websockets';
 import type { Server } from 'socket.io';
 
 import { ConnectionTracker } from './connection-tracker.service';
@@ -41,7 +41,7 @@ const MAX_HTTP_BUFFER_SIZE_BYTES = 1_000_000;
     origin: false,
   },
 })
-export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect {
+export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
   server!: Server;
 
@@ -52,7 +52,17 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     private readonly connectionTracker: ConnectionTracker,
   ) {}
 
-  async handleConnection(client: RealtimeSocket): Promise<void> {
+  afterInit(server: Server): void {
+    // Nest does not await handleConnection. Middleware completes before the
+    // CONNECT ack or any event handlers can run, including other gateways.
+    server.use((client: RealtimeSocket, next) => {
+      void this.authenticate(client).then((accepted) => {
+        next(accepted ? undefined : new Error('UNAUTHENTICATED'));
+      });
+    });
+  }
+
+  private async authenticate(client: RealtimeSocket): Promise<boolean> {
     try {
       const token = extractHandshakeToken(client.handshake);
       const principal = await this.authenticator.authenticate(token);
@@ -60,22 +70,28 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
       if (!principal) {
         // Never log the token itself — only that a socket was rejected.
         this.logger.warn(`Socket ${client.id} rejected: authentication failed`);
-        client.disconnect(true);
-        return;
+        return false;
       }
 
+      if (client.conn.readyState !== 'open') return false;
       client.data.userId = principal.userId;
-      await client.join(userRoom(principal.userId));
-      this.connectionTracker.increment();
-      this.logger.log(`Socket ${client.id} connected (user ${principal.userId})`);
+      return true;
     } catch (error) {
       // An authentication error is a rejected connection, never a crashed
       // gateway — one bad token or a transient verifier failure must not
       // take down every other socket on this process.
-      const message = error instanceof Error ? error.message : 'unknown error';
-      this.logger.error(`Socket ${client.id} authentication error: ${message}`);
-      client.disconnect(true);
+      this.logger.error(`Socket ${client.id} authentication failed`);
+      return false;
     }
+  }
+
+  handleConnection(client: RealtimeSocket): void {
+    if (!client.data.userId) {
+      client.disconnect(true);
+      return;
+    }
+    this.connectionTracker.increment();
+    void Promise.resolve(client.join(userRoom(client.data.userId))).catch(() => client.disconnect(true));
   }
 
   handleDisconnect(client: RealtimeSocket): void {

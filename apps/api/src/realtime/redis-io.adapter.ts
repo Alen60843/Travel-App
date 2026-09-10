@@ -74,7 +74,9 @@ export class RedisIoAdapter extends IoAdapter {
 
     this.pubClient = pubClient;
     this.subClient = subClient;
-    this.adapterConstructor = createAdapter(pubClient, subClient);
+    this.adapterConstructor = createAdapter(bestEffortPublisher(pubClient, () => {
+      this.logger.warn('Socket.IO Redis publication failed; clients must recover through durable catch-up.');
+    }), subClient);
     this.logger.log('Socket.IO Redis adapter connected');
   }
 
@@ -128,6 +130,25 @@ export class RedisIoAdapter extends IoAdapter {
     // that actually connected (connectToRedis may never have succeeded).
     await Promise.all([this.pubClient?.quit(), this.subClient?.quit()]);
   }
+}
+
+/** The Redis adapter discards publish promises. Observe failures so a lost
+ * notification cannot become an unhandled rejection after a durable commit.
+ * Keep the real client for lifecycle operations and bind other methods to it.
+ */
+export function bestEffortPublisher(client: Redis, onFailure: () => void): Redis {
+  return new Proxy(client, {
+    get(target, property) {
+      if (property === 'publish') {
+        return (...args: Parameters<Redis['publish']>) => target.publish(...args).catch(() => {
+          onFailure();
+          return 0;
+        });
+      }
+      const value: unknown = Reflect.get(target, property, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
 }
 
 /** Never let a credential embedded in a Redis URL reach a log or error message. */

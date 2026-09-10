@@ -1,6 +1,7 @@
 import { Global, Module } from '@nestjs/common';
 
 import { AuthModule, FirebaseSocketAuthenticator } from './auth';
+import { ChatTransportModule } from './chat/transport/chat-transport.module';
 import { ConfigModule } from './config/config.module';
 import { ConsentModule } from './consent';
 import { DatabaseModule } from './database/database.module';
@@ -57,7 +58,7 @@ export class ReadinessRegistryModule {}
  * Root module — the composition root, owned by the Lead.
  *
  * Phase 2 wires infrastructure; Phases 3–5 add their approved domain modules.
- * Phase 6 Workstream A adds the USER-hosted Events lifecycle. Chat,
+ * Phase 6 Workstream A adds the USER-hosted Events lifecycle. Phase 7 adds Chat.
  * Marketplace, Payments, Trust and Safety remain intentionally absent until
  * their approved phases.
  *
@@ -101,6 +102,7 @@ export class ReadinessRegistryModule {}
         useExisting: FirebaseSocketAuthenticator,
       },
     }),
+    ChatTransportModule,
 
     ReadinessRegistryModule,
     HealthModule,
