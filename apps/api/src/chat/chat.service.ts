@@ -17,6 +17,7 @@ interface RoomRow {
   last_seq: string;
   last_read_seq: string;
   last_message_at: Date | null;
+  event_status: string | null;
 }
 interface MessageRow {
   id: string;
@@ -47,7 +48,15 @@ const authorizedRooms = `
   FROM chat_rooms r
   JOIN chat_members cm ON cm.room_id = r.id AND cm.user_id = $1 AND cm.left_at IS NULL
   JOIN users u ON u.id = cm.user_id
+  LEFT JOIN events e ON r.type = 'EVENT' AND e.id = r.event_id
   WHERE ${usableAccount('u')}
+    AND (r.type <> 'EVENT' OR (
+      e.host_type = 'USER' AND e.status IN ('ACTIVE', 'FULL', 'IN_PROGRESS', 'COMPLETED')
+      AND (e.host_user_id = $1 OR EXISTS (
+        SELECT 1 FROM event_participants p
+        WHERE p.event_id = e.id AND p.user_id = $1 AND p.cancelled_at IS NULL
+      ))
+    ))
     AND (r.type <> 'MATCH' OR EXISTS (
       SELECT 1 FROM matches m
       JOIN users peer ON peer.id = CASE WHEN m.user_a_id = $1 THEN m.user_b_id ELSE m.user_a_id END
@@ -59,7 +68,7 @@ const authorizedRooms = `
         AND NOT EXISTS (SELECT 1 FROM user_blocks b
           WHERE b.blocker_user_id = peer.id AND b.blocked_user_id = $1)
     ))`;
-const roomColumns = 'r.id, r.type, r.last_seq, r.last_message_at, cm.last_read_seq';
+const roomColumns = 'r.id, r.type, r.last_seq, r.last_message_at, cm.last_read_seq, e.status AS event_status';
 const messageColumns = 'id, room_id, seq, sender_user_id, type, body, client_message_id, created_at, deleted_at';
 
 function toRoom(row: RoomRow): ChatRoomView {
@@ -107,7 +116,9 @@ export class ChatService {
   async sendMessage(userId: string, roomId: string, input: unknown): Promise<ChatMessageView> {
     parseChat(chatIdentitySchema, { userId, roomId });
     const message = parseChat(sendChatMessageSchema, input);
-    return this.withRoom(userId, roomId, async (manager) => {
+    return this.withRoom(userId, roomId, async (manager, room) => {
+      // Completion is read-only, including retries of previously sent messages.
+      if (room.type === 'EVENT' && room.event_status === 'COMPLETED') throw new ChatRoomForbiddenError();
       // Acquire the trigger's room lock BEFORE looking up the dedupe key.
       // A losing concurrent retry sees the committed row in this new statement.
       const [existing]: MessageRow[] = await manager.query(
@@ -191,6 +202,14 @@ export class ChatService {
     action: (manager: EntityManager, room: RoomRow) => Promise<T>,
   ): Promise<T> {
     return this.dataSource.transaction('READ COMMITTED', async (manager) => {
+      // Event lifecycle and participant-count writers lock the event. Use the
+      // same event-before-room order as provisioning, and hold it through commit.
+      await manager.query(
+        `SELECT e.id FROM events e JOIN chat_rooms r ON r.event_id = e.id AND r.type = 'EVENT'
+         JOIN chat_members cm ON cm.room_id = r.id
+         WHERE r.id = $1 AND cm.user_id = $2 AND cm.left_at IS NULL FOR UPDATE OF e`,
+        [roomId, userId],
+      );
       // Avoid allowing nonmembers to lock arbitrary rooms. Recheck all policy
       // in a separate statement AFTER any lock wait, with a fresh snapshot.
       const locked = await manager.query(
