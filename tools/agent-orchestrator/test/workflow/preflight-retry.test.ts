@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
-import { mkdir, readFile, writeFile, unlink } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, unlink, mkdtemp, readdir, rename, rmdir, rm, utimes } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import test from 'node:test';
 
 import type { Agent, AgentName, AgentRequest, AgentResult } from '../../src/agents';
@@ -373,9 +374,173 @@ test('concurrent preflight retries authorize once and a dead-owner lock is recov
     const calls = invocations(f);
     const results = await Promise.allSettled([retry(f), retry(f)]);
     assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
+    for (const result of results) {
+      if (result.status === 'rejected') assert.ok(isOrchestratorError(result.reason, 'TASK_STATE_INVALID'));
+    }
     assert.equal((await events(f)).filter((event) => event.name === 'PREFLIGHT_RETRY_AUTHORIZED').length, 1);
     assert.deepEqual(invocations(f), calls);
   } finally { await f.repository.dispose(); }
+});
+
+// Runs in an independent process. Synchronize at the actual filesystem call,
+// without adding hooks or mutable globals to the production StateStore.
+function lockContender(): void {
+  const fs = require('node:fs/promises') as typeof import('node:fs/promises');
+  const { join } = require('node:path') as typeof import('node:path');
+  const { StateStore } = require(process.argv[1]!) as typeof import('../../src/state');
+  const { OrchestratorError } = require(process.argv[2]!) as typeof import('../../src/errors');
+  const store = new StateStore(process.argv[3]!, 'run-race');
+  const mode = process.argv[4]!;
+  const lockPath = join(store.runDirectory, 'retry-preflight.lock');
+  const staleOwner = process.argv[5]!;
+  const wait = (phase: string) => new Promise<void>((resolve) => {
+    process.once('message', () => resolve());
+    process.send!({ phase });
+  });
+  const unlink = fs.unlink;
+  const rmdir = fs.rmdir;
+  const readdir = fs.readdir;
+  if (mode === 'unlink' || mode === 'permission') {
+    fs.unlink = async (path) => {
+      if (path === join(lockPath, staleOwner)) {
+        await wait('retiring');
+        if (mode === 'permission') throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+      }
+      return unlink(path);
+    };
+  } else if (mode === 'rmdir') {
+    fs.rmdir = async (path, options) => {
+      if (path === lockPath) await wait('retiring');
+      return rmdir(path, options);
+    };
+  } else if (mode === 'inspect') {
+    fs.readdir = (async (path: string) => {
+      const owners = await readdir(path);
+      if (path === lockPath) await wait('retiring');
+      return owners;
+    }) as typeof fs.readdir;
+  }
+  void store.withPreflightRetryLock(async () => {
+    await wait('acquired');
+  }).then(
+    () => { process.send!({ phase: 'done', success: true }); process.disconnect!(); },
+    (error: NodeJS.ErrnoException) => {
+      process.send!({ phase: 'done', success: false, code: error.code, typed: error instanceof OrchestratorError });
+      process.disconnect!();
+    },
+  );
+}
+
+interface ContenderResult { success: boolean; code?: string; typed?: boolean }
+function startContender(runsRoot: string, mode: string, staleOwner: string) {
+  const child = spawn(process.execPath, ['-e', `(${lockContender.toString()})()`,
+    resolve(__dirname, '../../src/state/state-store.js'), resolve(__dirname, '../../src/errors.js'),
+    runsRoot, mode, staleOwner,
+  ], { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] });
+  const phase = <T>(name: string) => new Promise<T>((resolve) => {
+    child.on('message', (message) => {
+      const value = message as { phase: string } & T;
+      if (value.phase === name) resolve(value);
+    });
+  });
+  return { child, retiring: phase<void>('retiring'), acquired: phase<void>('acquired'), done: phase<ContenderResult>('done') };
+}
+
+test('20 synchronized stale-owner races produce one acquisition, typed contention, and a reusable lock', { timeout: 30_000 }, async (t) => {
+  const runsRoot = await mkdtemp(join(tmpdir(), 'tripwith-lock-race-'));
+  t.after(() => rm(runsRoot, { recursive: true, force: true }));
+  const store = new StateStore(runsRoot, 'run-race');
+  await mkdir(store.runDirectory);
+  const lockPath = join(store.runDirectory, 'retry-preflight.lock');
+  const exited = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' });
+  assert.equal(exited.status, 0);
+  for (let iteration = 0; iteration < 20; iteration += 1) {
+    await mkdir(lockPath);
+    await writeFile(join(lockPath, exited.stdout), '');
+    const first = startContender(runsRoot, 'unlink', exited.stdout);
+    const second = startContender(runsRoot, 'unlink', exited.stdout);
+    t.after(() => { first.child.kill(); second.child.kill(); });
+    // Both processes have inspected the SAME dead owner and reached unlink.
+    await Promise.all([first.retiring, second.retiring]);
+    first.child.send('retire');
+    await first.acquired;
+    assert.deepEqual(await readdir(lockPath), [String(first.child.pid)]);
+    // The loser resumes cleanup only AFTER the winner has installed its PID.
+    second.child.send('retire');
+    assert.deepEqual(await second.done, { phase: 'done', success: false, code: 'TASK_STATE_INVALID', typed: true });
+    assert.deepEqual(await readdir(lockPath), [String(first.child.pid)], 'replacement owner must remain untouched');
+    first.child.send('complete');
+    assert.deepEqual(await first.done, { phase: 'done', success: true });
+    assert.deepEqual(await readdir(store.runDirectory), []);
+    let thirdAcquisitions = 0;
+    await store.withPreflightRetryLock(async () => { thirdAcquisitions += 1; });
+    assert.equal(thirdAcquisitions, 1);
+    assert.deepEqual(await readdir(store.runDirectory), []);
+  }
+});
+
+for (const scenario of ['missing-directory', 'replacement-before-rmdir', 'replacement-before-unlink', 'permission'] as const) {
+  test(`stale-lock cleanup handles ${scenario} without deleting replacement contents`, { timeout: 10_000 }, async (t) => {
+    const runsRoot = await mkdtemp(join(tmpdir(), 'tripwith-lock-check-'));
+    t.after(() => rm(runsRoot, { recursive: true, force: true }));
+    const store = new StateStore(runsRoot, 'run-race');
+    await mkdir(store.runDirectory);
+    const lockPath = join(store.runDirectory, 'retry-preflight.lock');
+    await mkdir(lockPath);
+    const exited = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' });
+    assert.equal(exited.status, 0);
+    if (scenario === 'replacement-before-unlink' || scenario === 'permission') {
+      await writeFile(join(lockPath, exited.stdout), '');
+    } else {
+      const old = new Date(Date.now() - 60_000);
+      await utimes(lockPath, old, old);
+    }
+    const contender = startContender(runsRoot,
+      scenario === 'replacement-before-unlink' ? 'inspect' : scenario === 'permission' ? 'permission' : 'rmdir', exited.stdout);
+    t.after(() => contender.child.kill());
+    await contender.retiring;
+    if (scenario === 'replacement-before-unlink') {
+      await rename(lockPath, join(store.runDirectory, 'retired'));
+      await mkdir(lockPath);
+      // Even the same PID filename in a different directory must be retained.
+      await writeFile(join(lockPath, exited.stdout), 'replacement');
+    } else if (scenario !== 'permission') {
+      await rmdir(lockPath);
+      if (scenario === 'replacement-before-rmdir') {
+        await mkdir(lockPath);
+        await writeFile(join(lockPath, String(process.pid)), 'replacement');
+      }
+    }
+    contender.child.send('continue');
+    const result = await contender.done;
+    assert.equal(result.success, false);
+    assert.equal(result.code, scenario === 'permission' ? 'EACCES' : 'TASK_STATE_INVALID');
+    assert.equal(result.typed, scenario !== 'permission');
+    if (scenario === 'replacement-before-unlink') {
+      assert.equal(await readFile(join(lockPath, exited.stdout), 'utf8'), 'replacement');
+      await unlink(join(lockPath, exited.stdout));
+      await rmdir(lockPath);
+    } else if (scenario === 'replacement-before-rmdir') {
+      assert.equal(await readFile(join(lockPath, String(process.pid)), 'utf8'), 'replacement');
+      await unlink(join(lockPath, String(process.pid)));
+      await rmdir(lockPath);
+    } else if (scenario === 'permission') {
+      assert.deepEqual(await readdir(lockPath), [exited.stdout]);
+    }
+    await store.withPreflightRetryLock(async () => {});
+  });
+}
+
+test('unexpected lock contents fail closed with typed error and are preserved', async (t) => {
+  const runsRoot = await mkdtemp(join(tmpdir(), 'tripwith-lock-shape-'));
+  t.after(() => rm(runsRoot, { recursive: true, force: true }));
+  const store = new StateStore(runsRoot, 'run-race');
+  const lockPath = join(store.runDirectory, 'retry-preflight.lock');
+  await mkdir(lockPath, { recursive: true });
+  await writeFile(join(lockPath, 'unknown'), 'keep');
+  await assert.rejects(store.withPreflightRetryLock(async () => assert.fail('must not acquire')),
+    (error) => isOrchestratorError(error, 'TASK_STATE_INVALID') && /unexpected contents/.test(error.message));
+  assert.equal(await readFile(join(lockPath, 'unknown'), 'utf8'), 'keep');
 });
 
 test('retry-preflight CLI returns scheduler eligibility and a manual resume step without providers', async () => {
