@@ -13,6 +13,7 @@ import {
 import type { CreateJoinRequestDto } from './dto/create-join-request.dto';
 import { EventNotFoundError } from './events.errors';
 import { EventsRepository } from './events.repository';
+import { reconcileEventChat } from './event-chat.service';
 import { joinError, translateJoinConflict } from './join-requests.errors';
 
 export interface JoinRequestView {
@@ -171,6 +172,7 @@ export class JoinRequestsService {
       eventId: event.id, userId: request.userId, joinRequestId: request.id,
       paymentId: null, isHost: false, attendanceStatus: AttendanceStatus.Unknown,
     });
+    await reconcileEventChat(manager, event.id, request.userId);
     // Re-read the trigger-maintained count; never calculate or write it here.
     const current = await manager.getRepository(EventEntity).findOneByOrFail({ id: event.id });
     if (current.participantCount === current.capacityMax && canTransition(current.status, EventStatus.Full)) {
