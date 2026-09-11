@@ -109,8 +109,13 @@ export class StaticReplanner {
     const graph = new TaskGraph(this.ctx.config.tasks);
     for (const dependency of request.dependencies ?? []) if (!graph.hasDependencyPath(taskId, dependency)) refuse('request dependencies must already be successful source ancestors');
     for (const evidence of request.evidence ?? []) {
-      if (evidence.kind === 'test' && artifact.handoff.tests.some((entry) => entry.command === evidence.reference)) continue;
-      if (!['file', 'test', 'diff', 'schema'].includes(evidence.kind)) refuse('v1 requires file or persisted test evidence');
+      if (evidence.kind === 'test') {
+        if (!artifact.handoff.tests.some((entry) => entry.command === evidence.reference && entry.result === 'pass')) {
+          refuse('test evidence must reference an exactly matching passing handoff test');
+        }
+        continue;
+      }
+      if (!['file', 'diff', 'schema'].includes(evidence.kind)) refuse('v1 requires file or persisted test evidence');
       const path = normalizeRepositoryPath(evidence.reference);
       if (![...spec.files, ...request.resourceClaims.map((claim) => claim.key)].some((pattern) => matchesOwnershipPattern(path, pattern))) refuse('evidence is outside declared scope');
       const absolute = join(worktree.path, path);

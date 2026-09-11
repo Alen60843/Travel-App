@@ -21,17 +21,18 @@ const complete = (files: string[]) => ({ status: 'complete', summary: 'Completed
 const draft = { role: 'implementation', concern: 'authorization', objective: 'Enforce Event lifecycle in Chat', reason: 'Direct room operations bypass Event resolver policy',
   dependencies: [], capabilities: [{ capability: 'postgresql_testing', minimumLevel: 1 }],
   resourceClaims: [{ kind: 'repository_path', key: 'apps/api/src/chat/**', mode: 'write' }, { kind: 'repository_path', key: 'apps/api/src/events/**', mode: 'read' }],
-  evidence: [{ kind: 'file', reference: chatPath, summary: 'Missing Event policy' }, { kind: 'test', reference: eventPath, summary: 'Event-side contract' }], risk: 'high', priority: 90, estimatedCostUnits: 0 };
+  evidence: [{ kind: 'file', reference: chatPath, summary: 'Missing Event policy' }, { kind: 'test', reference: 'fixture', summary: 'Event-side contract' }], risk: 'high', priority: 90, estimatedCostUnits: 0 };
 
 class ReplanAgent implements Agent {
   readonly invocations: AgentRequest[] = [];
   changesRequested = false;
   escapeOwnership = false;
+  correctionEscapeOwnership = false;
   constructor(readonly name: 'codex' | 'claude') {}
   async run(request: AgentRequest): Promise<AgentResult> {
     this.invocations.push(request);
     const cwd = request.worktreePath;
-    assert.equal(await readFile(join(cwd, eventPath), 'utf8'), 'Event checkpoint\n');
+    assert.match(await readFile(join(cwd, eventPath), 'utf8'), /^Event (checkpoint|corrected)\n$/);
     let output: unknown;
     if (request.taskId.startsWith('replan-')) {
       assert.equal(await readFile(join(cwd, 'apps/api/src/chat/transport/feature.txt'), 'utf8'), 'realtime successful\n');
@@ -41,13 +42,22 @@ class ReplanAgent implements Agent {
       await writeFile(join(cwd, path), 'Chat authorized\n');
       output = complete([path]);
     } else if (request.taskId === 'correction') {
+      assert.equal(await readFile(join(cwd, eventPath), 'utf8'), 'Event checkpoint\n');
       assert.equal(await readFile(join(cwd, chatPath), 'utf8'), 'Chat authorized\n');
+      assert.ok(request.allowedFileOwnership.includes('apps/api/src/events/**'));
       assert.ok(request.allowedFileOwnership.includes('apps/api/src/chat/**'));
+      assert.deepEqual([...request.allowedFileOwnership].sort(), ['apps/api/src/chat/**', 'apps/api/src/events/**']);
+      await writeFile(join(cwd, eventPath), 'Event corrected\n');
       await writeFile(join(cwd, chatPath), 'Chat corrected\n');
-      output = { ...complete([chatPath]), findingResponses: [{ findingId: 'F001', decision: 'confirmed', resolution: 'resolved', evidence: 'Corrected Chat policy', fix: 'Chat corrected', verification: 'Fixture assertions' }] };
+      const files = [eventPath, chatPath];
+      if (this.correctionEscapeOwnership) {
+        await writeFile(join(cwd, 'design.md'), '# Unauthorized correction\n');
+        files.push('design.md');
+      }
+      output = { ...complete(files), findingResponses: [{ findingId: 'F001', decision: 'confirmed', resolution: 'resolved', evidence: 'Corrected Event and Chat policy', fix: 'Event and Chat corrected', verification: 'Fixture assertions' }] };
     } else if (['review', 'final-review', 'phase-final'].includes(request.taskId)) {
       assert.match(await readFile(join(cwd, chatPath), 'utf8'), /Chat (authorized|corrected)/);
-      assert.match((request.taskSpecification as { actualDependencyDiff: string }).actualDependencyDiff, /Event checkpoint/);
+      assert.match((request.taskSpecification as { actualDependencyDiff: string }).actualDependencyDiff, /Event (checkpoint|corrected)/);
       assert.match((request.taskSpecification as { actualDependencyDiff: string }).actualDependencyDiff, /Chat (authorized|corrected)/);
       output = request.taskId === 'review' && this.changesRequested
         ? { status: 'changes_requested', findings: [{ id: 'F001', severity: 'medium', category: 'security', file: chatPath, location: 'Chat policy', problem: 'Chat policy requires correction', evidence: 'Composed fixture', impact: 'Authorization defect', suggestedFix: 'Correct policy', verificationRequired: 'Fixture assertions' }] }
@@ -130,6 +140,28 @@ async function fixture(verify?: string | ((container: string) => string), conven
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 const noProviders = (f: Fixture) => { assert.equal(f.options.agents.codex.invocations.length, 0); assert.equal(f.options.agents.claude.invocations.length, 0); };
 
+async function replaceRequest(f: Fixture, update: (handoff: any) => void): Promise<void> {
+  const handoff = JSON.parse(await readFile(f.handoffPath, 'utf8'));
+  update(handoff);
+  await writeFile(f.handoffPath, `${JSON.stringify(handoff, null, 2)}\n`);
+}
+
+async function assertProposalRefusedWithoutMutation(f: Fixture): Promise<void> {
+  const beforeState = await readFile(f.store.statePath, 'utf8');
+  const beforeEvents = await readFile(f.store.eventsPath, 'utf8');
+  const beforeHead = await f.repository.git.resolveCommit(f.worktree.path, 'HEAD');
+  const beforeStatus = await f.repository.git.run(f.worktree.path, ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
+  const beforeSource = await readFile(join(f.worktree.path, eventPath));
+  await assert.rejects(f.propose(), (error) => isOrchestratorError(error, 'TASK_STATE_INVALID'));
+  assert.equal(await readFile(f.store.statePath, 'utf8'), beforeState);
+  assert.equal(await readFile(f.store.eventsPath, 'utf8'), beforeEvents);
+  assert.equal(await f.repository.git.resolveCommit(f.worktree.path, 'HEAD'), beforeHead);
+  assert.equal((await f.repository.git.run(f.worktree.path, ['status', '--porcelain=v1', '-z', '--untracked-files=all'])).stdout, beforeStatus.stdout);
+  assert.deepEqual(await readFile(join(f.worktree.path, eventPath)), beforeSource);
+  assert.equal((await f.store.load()).replanProposals, undefined);
+  noProviders(f);
+}
+
 for (const changesRequested of [false, true]) test(`Event + Chat end-to-end: review ${changesRequested ? 'requests Chat correction' : 'approves and skips correction'}`, async () => {
   const f = await fixture();
   try {
@@ -164,6 +196,9 @@ for (const changesRequested of [false, true]) test(`Event + Chat end-to-end: rev
     assert.deepEqual(completed.tasks[followup.id]!.commit!.changedFiles, [chatPath]);
     assert.equal(completed.tasks.event!.replan!.phase, 'RESOLVED');
     assert.equal(completed.tasks.correction!.status, changesRequested ? 'SUCCEEDED' : 'SKIPPED');
+    if (changesRequested) {
+      assert.deepEqual([...completed.tasks.correction!.commit!.changedFiles].sort(), [eventPath, chatPath].sort());
+    }
     assert.equal(completed.tasks['final-review']!.status, changesRequested ? 'SUCCEEDED' : 'SKIPPED');
     assert.equal(completed.tasks.composed!.status, 'SUCCEEDED');
     for (const id of ['durable', 'realtime', 'presence']) assert.deepEqual(completed.tasks[id], original.tasks[id]);
@@ -172,6 +207,73 @@ for (const changesRequested of [false, true]) test(`Event + Chat end-to-end: rev
     assert.ok([...f.options.agents.codex.invocations, ...f.options.agents.claude.invocations].every((request) => !['durable', 'realtime', 'presence', 'event'].includes(request.taskId)));
     const events = (await readFile(f.store.eventsPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line).name);
     for (const event of ['REPLAN_PROPOSED', 'REPLAN_AUTHORIZED', 'REPLAN_CHECKPOINT_PREPARING', 'REPLAN_CHECKPOINT_READY', 'REPLAN_COMPOSED_VERIFIED', 'REPLAN_RESOLVED']) assert.ok(events.includes(event));
+  } finally { await f.repository.dispose(); }
+});
+
+for (const testEvidence of [
+  { name: 'referenced passing test', result: 'pass', reference: 'target', accepted: true },
+  { name: 'referenced failed test', result: 'fail', reference: 'target', accepted: false },
+  { name: 'referenced not_run test', result: 'not_run', reference: 'target', accepted: false },
+  { name: 'missing command', result: 'pass', reference: 'missing', accepted: false },
+] as const) {
+  test(`test evidence validation: ${testEvidence.name}`, async () => {
+    const f = await fixture();
+    try {
+      await replaceRequest(f, (handoff) => {
+        handoff.tests = [{ command: 'target', result: testEvidence.result, details: 'Persisted result' }];
+        handoff.additionalWorkRequests[0].evidence = [{ kind: 'test', reference: testEvidence.reference, summary: 'Test evidence' }];
+      });
+      if (testEvidence.accepted) {
+        const proposal = await f.propose();
+        assert.equal(proposal.request.evidence![0]!.reference, 'target');
+        assert.equal((await f.store.load()).replanProposals?.length, 1);
+        noProviders(f);
+      } else {
+        await assertProposalRefusedWithoutMutation(f);
+      }
+    } finally { await f.repository.dispose(); }
+  });
+}
+
+test('an unrelated passing test does not validate the referenced failed command', async () => {
+  const f = await fixture();
+  try {
+    await replaceRequest(f, (handoff) => {
+      handoff.tests = [
+        { command: 'target', result: 'fail', details: 'The referenced test failed' },
+        { command: 'unrelated', result: 'pass', details: 'Another test passed' },
+      ];
+      handoff.additionalWorkRequests[0].evidence = [{ kind: 'test', reference: 'target', summary: 'Failed target' }];
+    });
+    await assertProposalRefusedWithoutMutation(f);
+  } finally { await f.repository.dispose(); }
+});
+
+for (const claim of ['apps/api/src/events/chat/**', 'apps/api/src/events/**']) {
+  test(`proposal refuses follow-up source ownership claim ${claim}`, async () => {
+    const f = await fixture();
+    try {
+      await replaceRequest(f, (handoff) => {
+        handoff.additionalWorkRequests[0].resourceClaims[0].key = claim;
+        handoff.additionalWorkRequests[0].evidence = [{ kind: 'test', reference: 'fixture', summary: 'Passing source test' }];
+      });
+      await assertProposalRefusedWithoutMutation(f);
+    } finally { await f.repository.dispose(); }
+  });
+}
+
+test('correction union ownership rejects a third unrelated path through production execution', async () => {
+  const f = await fixture();
+  try {
+    f.options.agents.claude.changesRequested = true;
+    f.options.agents.codex.correctionEscapeOwnership = true;
+    const proposal = await f.propose();
+    await f.authorize(proposal);
+    const state = await (await AgentOrchestrator.resume(f.runId, f.options)).execute();
+    assert.equal(state.tasks.correction!.status, 'FAILED');
+    assert.equal(state.tasks.correction!.error?.code, 'OWNERSHIP_VIOLATION');
+    assert.deepEqual(state.tasks.event!.commit!.changedFiles, [eventPath]);
+    assert.deepEqual(state.tasks[proposal.overlay.followup.id]!.commit!.changedFiles, [chatPath]);
   } finally { await f.repository.dispose(); }
 });
 
