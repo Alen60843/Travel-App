@@ -13,6 +13,9 @@ import {
   type AgentResult,
   type ExecutableSource,
 } from './agents';
+import { assertCodeInputHistory } from './replan/checkpoint';
+import { StaticReplanner, taskCodeInputs } from './replan/static-replanner';
+import { applyReplanOverlays, replanHash, type ReplanProposal } from './replan/model';
 import type { PhaseConfig } from './config';
 import { OrchestratorError, isOrchestratorError, type ErrorCode } from './errors';
 import {
@@ -52,6 +55,7 @@ import {
   StateStore,
   assertResumeBaseUnmoved,
   createRunState,
+  validateRunState,
   reconcileInterruptedTasks,
   withUpdatedTimestamp,
   type AgentAttemptState,
@@ -572,6 +576,7 @@ export class AgentOrchestrator {
     // behaves exactly as before — recoveryPolicyHistory is simply absent.
     const latestRecoveryPolicy = loadedState.recoveryPolicyHistory?.at(-1)?.policy;
     config = applyRecoveryPolicyOverlay(config, latestRecoveryPolicy);
+    if (loadedState.strategy !== 'adaptive') config = applyReplanOverlays(config, loadedState);
     const orchestrator = new AgentOrchestrator({
       config,
       repositoryRoot,
@@ -610,9 +615,48 @@ export class AgentOrchestrator {
     return orchestrator;
   }
 
+  private static async withRunMutation<T>(runId: string, options: OrchestratorOptions, operation: () => Promise<T>): Promise<T> {
+    const repositoryRoot = await (options.git ?? new GitClient()).repositoryRoot(resolve(options.repositoryPath));
+    const store = new StateStore(resolve(options.runsRoot ?? join(repositoryRoot, 'tools/agent-orchestrator/runs')), runId);
+    return store.withRunMutationLock(operation);
+  }
+
+  private replanner(): StaticReplanner {
+    return new StaticReplanner({ config: this.config, state: () => this.state, store: this.stateStore,
+      git: this.git, worktrees: this.worktrees, clock: this.clock,
+      ...(this.signal === undefined ? {} : { signal: this.signal }),
+      save: async (state) => { await this.mutate(() => state); },
+      event: (name, taskId, detail) => this.event(name, taskId, detail),
+    });
+  }
+
+  static async proposeReplan(runId: string, taskId: string, options: OrchestratorOptions): Promise<ReplanProposal> {
+    return AgentOrchestrator.withRunMutation(runId, options, async () => {
+      const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options, false);
+      return orchestrator.replanner().propose(taskId);
+    });
+  }
+
+  /** Calling this host API/CLI is the explicit human grant; no agent output enters this method. */
+  static async authorizeReplan(runId: string, proposalId: string, options: OrchestratorOptions): Promise<ReplanProposal> {
+    return AgentOrchestrator.withRunMutation(runId, options, async () => {
+      const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options, false);
+      return orchestrator.replanner().authorize(proposalId);
+    });
+  }
+
   static async resume(runId: string, options: OrchestratorOptions): Promise<AgentOrchestrator> {
+    return AgentOrchestrator.withRunMutation(runId, options, () => AgentOrchestrator.resumeLocked(runId, options));
+  }
+
+  private static async resumeLocked(runId: string, options: OrchestratorOptions): Promise<AgentOrchestrator> {
     const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options);
     await orchestrator.reconcile();
+    if (orchestrator.state.status === 'BLOCKED' && orchestrator.state.replanAuthorizations?.some((grant) => {
+      const proposal = orchestrator.state.replanProposals!.find((entry) => entry.id === grant.proposalId)!;
+      const source = orchestrator.state.tasks[proposal.sourceTaskId]!;
+      return source.replan?.phase !== 'RESOLVED' && orchestrator.state.tasks[proposal.overlay.followup.id]?.status === 'SUCCEEDED';
+    })) await orchestrator.mutate((state) => ({ ...state, status: 'RUNNING' }));
     await orchestrator.event('RUN_RESUMED');
     return orchestrator;
   }
@@ -625,6 +669,14 @@ export class AgentOrchestrator {
    * normal resume performs the actual agent invocation.
    */
   static async retryAgentFailure(
+    runId: string,
+    taskId: string,
+    options: OrchestratorOptions,
+  ): Promise<AgentFailureRetryResult> {
+    return AgentOrchestrator.withRunMutation(runId, options, () => AgentOrchestrator.retryAgentFailureLocked(runId, taskId, options));
+  }
+
+  private static async retryAgentFailureLocked(
     runId: string,
     taskId: string,
     options: OrchestratorOptions,
@@ -803,6 +855,14 @@ export class AgentOrchestrator {
     rawPolicy: unknown,
     options: OrchestratorOptions,
   ): Promise<RecoveryPolicyAuthorizationResult> {
+    return AgentOrchestrator.withRunMutation(runId, options, () => AgentOrchestrator.authorizeRecoveryPolicyLocked(runId, rawPolicy, options));
+  }
+
+  private static async authorizeRecoveryPolicyLocked(
+    runId: string,
+    rawPolicy: unknown,
+    options: OrchestratorOptions,
+  ): Promise<RecoveryPolicyAuthorizationResult> {
     const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options);
     const policy = parseRecoveryPolicyOverlay(rawPolicy);
     const policyHash = hashRecoveryPolicy(policy);
@@ -823,6 +883,13 @@ export class AgentOrchestrator {
   }
 
   static async recoverHandoffFailures(
+    runId: string,
+    options: OrchestratorOptions,
+  ): Promise<HandoffRecoveryResult> {
+    return AgentOrchestrator.withRunMutation(runId, options, () => AgentOrchestrator.recoverHandoffFailuresLocked(runId, options));
+  }
+
+  private static async recoverHandoffFailuresLocked(
     runId: string,
     options: OrchestratorOptions,
   ): Promise<HandoffRecoveryResult> {
@@ -941,6 +1008,13 @@ export class AgentOrchestrator {
     runId: string,
     options: OrchestratorOptions,
   ): Promise<AgentOrchestrator> {
+    return AgentOrchestrator.withRunMutation(runId, options, () => AgentOrchestrator.retryIntegrationGateLocked(runId, options));
+  }
+
+  private static async retryIntegrationGateLocked(
+    runId: string,
+    options: OrchestratorOptions,
+  ): Promise<AgentOrchestrator> {
     const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options);
     const state = orchestrator.state;
     if (state.status !== 'BLOCKED') {
@@ -1033,6 +1107,14 @@ export class AgentOrchestrator {
     options: OrchestratorOptions,
     fix: { readonly ownership: readonly string[]; readonly summary: string },
   ): Promise<AgentOrchestrator> {
+    return AgentOrchestrator.withRunMutation(runId, options, () => AgentOrchestrator.applyIntegrationFixLocked(runId, options, fix));
+  }
+
+  private static async applyIntegrationFixLocked(
+    runId: string,
+    options: OrchestratorOptions,
+    fix: { readonly ownership: readonly string[]; readonly summary: string },
+  ): Promise<AgentOrchestrator> {
     const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options);
     const state = orchestrator.state;
     if (state.status !== 'BLOCKED') {
@@ -1121,11 +1203,27 @@ export class AgentOrchestrator {
     taskId: string,
     options: OrchestratorOptions,
   ): Promise<SalvageResult> {
+    return AgentOrchestrator.withRunMutation(runId, options, () => AgentOrchestrator.salvageTaskLocked(runId, taskId, options));
+  }
+
+  private static async salvageTaskLocked(
+    runId: string,
+    taskId: string,
+    options: OrchestratorOptions,
+  ): Promise<SalvageResult> {
     return AgentOrchestrator.recoverDirtyWriter(runId, taskId, options, false);
   }
 
   /** Explicit host verification of an accepted blocked writer; never invokes an agent. */
   static async verifyBlockedTask(
+    runId: string,
+    taskId: string,
+    options: OrchestratorOptions,
+  ): Promise<SalvageResult> {
+    return AgentOrchestrator.withRunMutation(runId, options, () => AgentOrchestrator.verifyBlockedTaskLocked(runId, taskId, options));
+  }
+
+  private static async verifyBlockedTaskLocked(
     runId: string,
     taskId: string,
     options: OrchestratorOptions,
@@ -1435,6 +1533,19 @@ export class AgentOrchestrator {
   }
 
   async execute(): Promise<RunState> {
+    return this.stateStore.withRunMutationLock(async () => {
+      if (replanHash(await this.stateStore.load()) !== replanHash(validateRunState(this.state))) {
+        throw new OrchestratorError('TASK_STATE_INVALID', 'Run changed after loading; resume again before execution');
+      }
+      return this.executeLocked();
+    });
+  }
+
+  private async executeLocked(): Promise<RunState> {
+    if (Object.values(this.state.tasks).some((task) => task.replan !== undefined && task.replan.phase !== 'RESOLVED')) {
+      await assertBaseBranchUnmoved(this.git, this.repositoryRoot, this.state.baseBranch, this.state.baseSha);
+    }
+    if (!await this.replanner().advance()) return this.state;
     while (this.state.status === 'RUNNING' || this.state.status === 'CREATED') {
       if (this.signal?.aborted === true) {
         await this.cancelRun('Orchestrator execution was aborted');
@@ -1449,6 +1560,7 @@ export class AgentOrchestrator {
       await this.advanceAdaptiveScheduling();
       await this.reconcileAdaptiveCorrectionFlow();
       await this.advanceAdaptiveScheduling();
+      if (!await this.replanner().advance()) return this.state;
       const scheduler = new TaskScheduler(
         this.config.tasks,
         this.config.concurrency,
@@ -1583,6 +1695,13 @@ export class AgentOrchestrator {
   }
 
   async cleanup(): Promise<readonly string[]> {
+    return this.stateStore.withRunMutationLock(() => this.cleanupLocked());
+  }
+
+  private async cleanupLocked(): Promise<readonly string[]> {
+    if (replanHash(await this.stateStore.load()) !== replanHash(validateRunState(this.state))) {
+      throw new OrchestratorError('TASK_STATE_INVALID', 'Run changed after loading; reload before cleanup');
+    }
     if (this.state.status === 'RUNNING' || Object.values(this.state.tasks).some(
       (task) => task.status === 'RUNNING',
     )) {
@@ -2282,6 +2401,15 @@ export class AgentOrchestrator {
       }));
     }
 
+    if ((task.checkpointInputs?.length ?? 0) > 0) {
+      await assertCodeInputHistory(this.git, worktree.path, this.state.baseSha,
+        await this.git.resolveCommit(worktree.path, 'HEAD'), this.dependencyCommits(task));
+      for (const input of task.checkpointInputs!) {
+        await this.mutate((state) => updateTask(state, input.sourceTaskId, (source) => ({
+          ...source, replan: { ...source.replan!, phase: 'FOLLOWUP_RUNNING' },
+        })));
+      }
+    }
     let inspection = await inspectTaskCommits(this.git, worktree.path, this.state.baseSha);
     if (!inspection.clean) {
       throw new OrchestratorError(
@@ -2391,7 +2519,7 @@ export class AgentOrchestrator {
       worktree,
       preparedHeadSha: inspection.headSha,
       dependencyHandoffs: await readArtifacts(
-        ancestors.flatMap((ancestor) => {
+        [...ancestors, ...(task.checkpointInputs ?? []).map((input) => graph.get(input.sourceTaskId))].flatMap((ancestor) => {
           const state = this.state.tasks[ancestor.id];
           return state?.handoffPath === undefined ? [] : [state.handoffPath];
         }),
@@ -3176,14 +3304,13 @@ export class AgentOrchestrator {
   }
 
   private dependencyCommits(task: TaskSpec): IntegrationCommit[] {
-    const graph = new TaskGraph(this.config.tasks);
-    return ancestorTasks(task, graph).flatMap((ancestor) => {
-      const commit = this.state.tasks[ancestor.id]?.commit;
-      return commit === undefined ? [] : [{ taskId: ancestor.id, commitSha: commit.sha }];
-    });
+    return taskCodeInputs(this.config, this.state, task);
   }
 
   private async integrateAndVerify(): Promise<void> {
+    if (Object.values(this.state.tasks).some((task) => task.replan !== undefined && task.replan.phase !== 'RESOLVED')) {
+      throw new OrchestratorError('TASK_STATE_INVALID', 'Unresolved source checkpoints cannot enter whole-run integration');
+    }
     const commits = new TaskGraph(this.config.tasks).topologicalOrder().flatMap((task) => {
       const commit = this.state.tasks[task.id]?.commit;
       return commit === undefined ? [] : [{ taskId: task.id, commitSha: commit.sha }];
@@ -3791,6 +3918,9 @@ export class AgentOrchestrator {
     const taskState = this.state.tasks[taskId];
     if (taskSpec === undefined || taskState === undefined) {
       return { eligible: false, reason: 'task id does not exist in this run', reasonCode: 'SALVAGE_ATTEMPT_NOT_ELIGIBLE' };
+    }
+    if (taskState.replan !== undefined) {
+      return { eligible: false, reason: 'source is reserved by a replan', reasonCode: 'BLOCKED_WRITER_INELIGIBLE' };
     }
     const lastAttempt = taskState.agentAttempts.at(-1);
     const salvageableAttempt =

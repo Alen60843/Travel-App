@@ -23,7 +23,9 @@
     "verify-blocked-task": "pnpm --silent run build && node dist/cli.js verify-blocked-task",
     "authorize-recovery-policy": "pnpm --silent run build && node dist/cli.js authorize-recovery-policy",
     "retry-integration": "pnpm --silent run build && node dist/cli.js retry-integration",
-    "apply-integration-fix": "pnpm --silent run build && node dist/cli.js apply-integration-fix"
+    "apply-integration-fix": "pnpm --silent run build && node dist/cli.js apply-integration-fix",
+    "propose-replan": "pnpm --silent run build && node dist/cli.js propose-replan",
+    "authorize-replan": "pnpm --silent run build && node dist/cli.js authorize-replan"
   },
   "dependencies": {
     "yaml": "^2.8.1"

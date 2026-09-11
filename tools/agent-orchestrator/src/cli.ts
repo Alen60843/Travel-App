@@ -10,6 +10,8 @@ import { AgentOrchestrator, planOrchestrationPhase, type AnyPlanResult, type Pla
 import { StateStore, type RunState } from './state';
 import { loadAnyPhaseConfig } from './workflow/solver-verifier';
 import { loadAdaptivePhaseConfig, runtimePhaseConfig } from './adaptive';
+import { applyRecoveryPolicyOverlay } from './recovery/policy';
+import { applyReplanOverlays } from './replan/model';
 
 const USAGE = `TripWith local agent orchestrator
 
@@ -23,6 +25,8 @@ Usage:
   pnpm agents:recover-handoffs <run-id>
   pnpm agents:retry-agent <run-id> <task-id>
   pnpm agents:retry-preflight <run-id> <task-id>
+  pnpm agents:propose-replan <run-id> <task-id>
+  pnpm agents:authorize-replan <run-id> <proposal-id>
   pnpm agents:salvage-task <run-id> <task-id>
   pnpm agents:verify-blocked-task <run-id> <task-id>
   pnpm agents:authorize-recovery-policy <run-id> <policy-file>
@@ -33,6 +37,11 @@ Planning is read-only. Running or resuming may invoke locally authenticated paid
 No command merges into the phase branch or pushes to a remote.
 metrics is read-only: it recomputes a summary from persisted run artifacts and never
 touches agents, worktrees, or state.
+propose-replan validates one blocked static writer's persisted scope-gap request and
+persists a hash-pinned proposal without providers or worktree changes. Inspect the proposal
+before authorize-replan explicitly grants its follow-up and pristine downstream overlay.
+Authorization creates a noncanonical checkpoint but invokes no providers; agents:resume
+executes the follow-up and deterministic composed verification before source promotion.
 recover-handoffs recovers a run's persisted FAILED/HANDOFF_INVALID or FAILED/REVIEW_BLOCKED
 tasks whose agent process already succeeded, using a bounded, mostly local repair (never
 rerunning the original implementation/review); it refuses (all-or-nothing) if any targeted
@@ -91,6 +100,20 @@ async function main(argv: readonly string[]): Promise<number> {
   if (command === undefined || command === '--help' || command === '-h') {
     process.stdout.write(`${USAGE}\n`);
     return command === undefined ? 1 : 0;
+  }
+  if (command === 'propose-replan' || command === 'authorize-replan') {
+    if (argument === undefined || extra.length !== 1) {
+      process.stderr.write(`Usage: ${command} <run-id> <${command === 'propose-replan' ? 'task-id' : 'proposal-id'}>\n`);
+      return 1;
+    }
+    const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
+    const proposal = command === 'propose-replan'
+      ? await AgentOrchestrator.proposeReplan(argument, extra[0]!, { repositoryPath })
+      : await AgentOrchestrator.authorizeReplan(argument, extra[0]!, { repositoryPath });
+    process.stdout.write(`${JSON.stringify({ proposal, manualNextStep: command === 'propose-replan'
+      ? `Inspect the complete proposal, then explicitly authorize with pnpm agents:authorize-replan ${argument} ${proposal.id}`
+      : `Run pnpm agents:resume ${argument} to execute the authorized follow-up` }, null, 2)}\n`);
+    return 0;
   }
   if (command === 'apply-integration-fix') {
     const [summary, ...ownership] = extra;
@@ -264,27 +287,31 @@ async function main(argv: readonly string[]): Promise<number> {
   if (command === 'metrics') {
     const { store } = await locateRun(repositoryPath, argument);
     const state = await store.load();
-    const config = state.strategy === 'adaptive'
+    const baseConfig = state.strategy === 'adaptive'
       ? runtimePhaseConfig(await loadAdaptivePhaseConfig(join(store.runDirectory, 'phase.yaml')), state.adaptive!)
       : await loadAnyPhaseConfig(join(store.runDirectory, 'phase.yaml'));
+    const recoveredConfig = applyRecoveryPolicyOverlay(baseConfig, state.recoveryPolicyHistory?.at(-1)?.policy);
+    const config = state.strategy === 'adaptive' ? recoveredConfig : applyReplanOverlays(recoveredConfig, state);
     const metrics = await computeRunMetrics(store.runDirectory, state, config);
     process.stdout.write(`${JSON.stringify(metrics, null, 2)}\n`);
     return 0;
   }
   if (command === 'cleanup') {
     const { repositoryRoot, store } = await locateRun(repositoryPath, argument);
-    const state = await store.load();
-    if (state.status === 'RUNNING' || Object.values(state.tasks).some(
-      (task) => task.status === 'RUNNING',
-    )) {
-      throw new Error('Refusing cleanup while the run or a task is RUNNING');
-    }
-    const manager = await WorktreeManager.create({ repositoryPath: repositoryRoot });
-    const cleaned = await manager.cleanupRun(state.runId);
-    process.stdout.write(
-      `${JSON.stringify({ runId: state.runId, cleaned: cleaned.map(({ entry }) => entry.path) }, null, 2)}\n`,
-    );
-    return 0;
+    return store.withRunMutationLock(async () => {
+      const state = await store.load();
+      if (state.status === 'RUNNING' || Object.values(state.tasks).some(
+        (task) => task.status === 'RUNNING',
+      )) {
+        throw new Error('Refusing cleanup while the run or a task is RUNNING');
+      }
+      const manager = await WorktreeManager.create({ repositoryPath: repositoryRoot });
+      const cleaned = await manager.cleanupRun(state.runId);
+      process.stdout.write(
+        `${JSON.stringify({ runId: state.runId, cleaned: cleaned.map(({ entry }) => entry.path) }, null, 2)}\n`,
+      );
+      return 0;
+    });
   }
 
   process.stderr.write(`Unknown command: ${command}\n${USAGE}\n`);
@@ -436,6 +463,7 @@ export function renderStatus(state: RunState): string {
       })(),
       reviewRounds: task.reviewRounds,
       commitSha: task.commit?.sha ?? null,
+      ...(task.replan === undefined ? {} : { replan: task.replan }),
       error: task.error ?? null,
     }])),
     integration: state.integration,

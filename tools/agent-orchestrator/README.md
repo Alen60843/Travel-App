@@ -16,6 +16,8 @@ Codex implementation
 
 The orchestrator never implements Phase 5 merely because the example file exists. `agents:plan` is read-only. `agents:run` starts paid/local agent processes and must only be used after the phase itself is approved.
 
+For blocked static writers that request work outside their ownership, see [Static scope-gap replanning v1](STATIC_SCOPE_REPLANNING.md). `agents:propose-replan` persists an inspectable proposal, `agents:authorize-replan` explicitly grants the checkpoint/follow-up overlay, and normal `agents:resume` executes and verifies the composed result.
+
 ## Requirements
 
 - Node.js 20.11 or newer and pnpm 9

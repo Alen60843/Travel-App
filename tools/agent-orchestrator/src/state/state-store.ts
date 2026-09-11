@@ -93,7 +93,14 @@ export class StateStore {
     }
   }
 
-  /** Serialize explicit preflight retries, including independent CLI processes. */
+  /** Shared by host mutation commands and held throughout execution/integration.
+   * Keep the historical path so preflight callers also participate in exclusion.
+   */
+  async withRunMutationLock<T>(operation: () => Promise<T>): Promise<T> {
+    return this.withPreflightRetryLock(operation);
+  }
+
+  /** Serialize run mutations, including independent CLI processes. */
   async withPreflightRetryLock<T>(operation: () => Promise<T>): Promise<T> {
     const path = join(this.runDirectory, 'retry-preflight.lock');
     let acquired = false;

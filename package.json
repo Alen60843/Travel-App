@@ -33,7 +33,9 @@
     "db:revert": "pnpm --filter @tripwith/api migration:revert",
     "db:verify": "pnpm --filter @tripwith/api db:verify",
     "verify": "pnpm run check:enums && pnpm run test && pnpm run db:verify",
-    "test": "pnpm --filter @tripwith/shared test"
+    "test": "pnpm --filter @tripwith/shared test",
+    "agents:propose-replan": "pnpm --filter @tripwith/agent-orchestrator propose-replan",
+    "agents:authorize-replan": "pnpm --filter @tripwith/agent-orchestrator authorize-replan"
   },
   "devDependencies": {
     "turbo": "^2.1.3",

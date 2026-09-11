@@ -1,3 +1,4 @@
+import { assertReplanState, parseTaskReplan, parseReplanProposals, parseReplanAuthorizations } from '../replan/model';
 import { ERROR_CODES, OrchestratorError, type ErrorCode } from '../errors';
 import { parseAdaptiveRunState } from '../adaptive/state-validation';
 import type { AdaptiveRunState } from '../adaptive/types';
@@ -154,6 +155,7 @@ export interface TaskRunState {
     readonly authorizedAt: string;
     readonly verification?: SalvageVerificationCheckpoint;
   };
+  readonly replan?: import('../replan/model').TaskReplanState;
 }
 
 /**
@@ -273,6 +275,8 @@ export interface RunState {
    * before. The most recent entry is the one currently in effect.
    */
   readonly recoveryPolicyHistory?: readonly RecoveryPolicySnapshot[];
+  readonly replanProposals?: readonly import('../replan/model').ReplanProposal[];
+  readonly replanAuthorizations?: readonly import('../replan/model').ReplanAuthorization[];
 }
 
 /** One authorized, hashed recovery-policy overlay snapshot — see RunState.recoveryPolicyHistory. */
@@ -285,6 +289,12 @@ export interface RecoveryPolicySnapshot {
 }
 
 export const RUN_EVENT_NAMES = [
+  'REPLAN_PROPOSED',
+  'REPLAN_AUTHORIZED',
+  'REPLAN_CHECKPOINT_PREPARING',
+  'REPLAN_CHECKPOINT_READY',
+  'REPLAN_COMPOSED_VERIFIED',
+  'REPLAN_RESOLVED',
   'RUN_CREATED',
   'RUN_RESUMED',
   'TASK_READY',
@@ -914,6 +924,7 @@ function parseTask(value: unknown, key: string): TaskRunState {
     handoffRepairAttempts: normalizeHandoffRepairAttempts(value, path),
     ...(agentFailureRecoveries === undefined ? {} : { agentFailureRecoveries }),
     ...(value.salvage === undefined ? {} : { salvage: parseSalvageState(value.salvage, `${path}.salvage`) }),
+    ...(value.replan === undefined ? {} : { replan: parseTaskReplan(value.replan) }),
   };
 }
 
@@ -1058,6 +1069,12 @@ export function validateRunState(value: unknown): RunState {
       }
     }
   }
+  const replanProposals = value.replanProposals === undefined ? undefined : parseReplanProposals(value.replanProposals);
+  const replanAuthorizations = value.replanAuthorizations === undefined ? undefined : parseReplanAuthorizations(value.replanAuthorizations);
+  assertReplanState({ runId, tasks, ...(strategy === undefined ? {} : { strategy }),
+    ...(replanProposals === undefined ? {} : { replanProposals }),
+    ...(replanAuthorizations === undefined ? {} : { replanAuthorizations }),
+  });
   return {
     schemaVersion: 1,
     runId,
@@ -1073,6 +1090,8 @@ export function validateRunState(value: unknown): RunState {
     integration,
     ...(integrationAttempts === undefined ? {} : { integrationAttempts }),
     ...(recoveryPolicyHistory === undefined ? {} : { recoveryPolicyHistory }),
+    ...(replanProposals === undefined ? {} : { replanProposals }),
+    ...(replanAuthorizations === undefined ? {} : { replanAuthorizations }),
     errors: value.errors.map((error, index) => parseStoredError(error, `errors[${index}]`)),
     ...(agentExecutables === undefined ? {} : { agentExecutables }),
     ...(adaptive === undefined ? {} : { adaptive }),

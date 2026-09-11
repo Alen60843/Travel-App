@@ -75,6 +75,8 @@ export interface TaskSpec {
   readonly timeoutMs?: number;
   readonly instructions?: string;
   readonly condition?: TaskCondition;
+  /** Trusted RunState overlay only; intentionally not accepted in phase YAML. */
+  readonly checkpointInputs?: readonly { readonly proposalId: string; readonly sourceTaskId: string }[];
 }
 
 const TASK_KEYS = new Set([
