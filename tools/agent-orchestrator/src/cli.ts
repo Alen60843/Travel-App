@@ -27,6 +27,7 @@ Usage:
   pnpm agents:retry-preflight <run-id> <task-id>
   pnpm agents:propose-replan <run-id> <task-id>
   pnpm agents:authorize-replan <run-id> <proposal-id>
+  pnpm agents:normalize-replan-evidence <run-id> <task-id> <evidence-index> file
   pnpm agents:salvage-task <run-id> <task-id>
   pnpm agents:verify-blocked-task <run-id> <task-id>
   pnpm agents:authorize-recovery-policy <run-id> <policy-file>
@@ -37,6 +38,9 @@ Planning is read-only. Running or resuming may invoke locally authenticated paid
 No command merges into the phase branch or pushes to a remote.
 metrics is read-only: it recomputes a summary from persisted run artifacts and never
 touches agents, worktrees, or state.
+normalize-replan-evidence explicitly records one deterministic test-to-file interpretation
+for the exact persisted handoff entry and dirty source tree. It invokes no provider or task,
+creates no commit, and never rewrites the handoff. Inspect it, then propose-replan separately.
 propose-replan validates one blocked static writer's persisted scope-gap request and
 persists a hash-pinned proposal without providers or worktree changes. Inspect the proposal
 before authorize-replan explicitly grants its follow-up and pristine downstream overlay.
@@ -113,6 +117,20 @@ async function main(argv: readonly string[]): Promise<number> {
     process.stdout.write(`${JSON.stringify({ proposal, manualNextStep: command === 'propose-replan'
       ? `Inspect the complete proposal, then explicitly authorize with pnpm agents:authorize-replan ${argument} ${proposal.id}`
       : `Run pnpm agents:resume ${argument} to execute the authorized follow-up` }, null, 2)}\n`);
+    return 0;
+  }
+  if (command === 'normalize-replan-evidence') {
+    const [taskId, evidenceIndexText, normalizedKind] = extra;
+    if (argument === undefined || taskId === undefined || evidenceIndexText === undefined || normalizedKind === undefined
+      || extra.length !== 3 || !/^(0|[1-9][0-9]*)$/.test(evidenceIndexText) || !Number.isSafeInteger(Number(evidenceIndexText))) {
+      process.stderr.write('Usage: normalize-replan-evidence <run-id> <task-id> <evidence-index> file\n');
+      return 1;
+    }
+    const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
+    const normalization = await AgentOrchestrator.normalizeReplanEvidence(argument, taskId,
+      { requestIndex: 0, evidenceIndex: Number(evidenceIndexText), normalizedKind }, { repositoryPath });
+    process.stdout.write(`${JSON.stringify({ normalization,
+      manualNextStep: `Inspect the normalization, then run pnpm agents:propose-replan ${argument} ${taskId}` }, null, 2)}\n`);
     return 0;
   }
   if (command === 'apply-integration-fix') {

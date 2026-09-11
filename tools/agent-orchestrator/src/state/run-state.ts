@@ -1,4 +1,4 @@
-import { assertReplanState, parseTaskReplan, parseReplanProposals, parseReplanAuthorizations } from '../replan/model';
+import { assertReplanState, parseTaskReplan, parseReplanEvidenceNormalizations, parseReplanProposals, parseReplanAuthorizations } from '../replan/model';
 import { ERROR_CODES, OrchestratorError, type ErrorCode } from '../errors';
 import { parseAdaptiveRunState } from '../adaptive/state-validation';
 import type { AdaptiveRunState } from '../adaptive/types';
@@ -275,6 +275,8 @@ export interface RunState {
    * before. The most recent entry is the one currently in effect.
    */
   readonly recoveryPolicyHistory?: readonly RecoveryPolicySnapshot[];
+  /** Append-only explicit human semantic corrections for static replan evidence. */
+  readonly replanEvidenceNormalizations?: readonly import('../replan/model').ReplanEvidenceNormalization[];
   readonly replanProposals?: readonly import('../replan/model').ReplanProposal[];
   readonly replanAuthorizations?: readonly import('../replan/model').ReplanAuthorization[];
 }
@@ -289,6 +291,7 @@ export interface RecoveryPolicySnapshot {
 }
 
 export const RUN_EVENT_NAMES = [
+  'REPLAN_EVIDENCE_NORMALIZED',
   'REPLAN_PROPOSED',
   'REPLAN_AUTHORIZED',
   'REPLAN_CHECKPOINT_PREPARING',
@@ -1069,9 +1072,11 @@ export function validateRunState(value: unknown): RunState {
       }
     }
   }
+  const replanEvidenceNormalizations = value.replanEvidenceNormalizations === undefined ? undefined : parseReplanEvidenceNormalizations(value.replanEvidenceNormalizations);
   const replanProposals = value.replanProposals === undefined ? undefined : parseReplanProposals(value.replanProposals);
   const replanAuthorizations = value.replanAuthorizations === undefined ? undefined : parseReplanAuthorizations(value.replanAuthorizations);
   assertReplanState({ runId, tasks, ...(strategy === undefined ? {} : { strategy }),
+    ...(replanEvidenceNormalizations === undefined ? {} : { replanEvidenceNormalizations }),
     ...(replanProposals === undefined ? {} : { replanProposals }),
     ...(replanAuthorizations === undefined ? {} : { replanAuthorizations }),
   });
@@ -1090,6 +1095,7 @@ export function validateRunState(value: unknown): RunState {
     integration,
     ...(integrationAttempts === undefined ? {} : { integrationAttempts }),
     ...(recoveryPolicyHistory === undefined ? {} : { recoveryPolicyHistory }),
+    ...(replanEvidenceNormalizations === undefined ? {} : { replanEvidenceNormalizations }),
     ...(replanProposals === undefined ? {} : { replanProposals }),
     ...(replanAuthorizations === undefined ? {} : { replanAuthorizations }),
     errors: value.errors.map((error, index) => parseStoredError(error, `errors[${index}]`)),

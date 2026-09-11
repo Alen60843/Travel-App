@@ -26,6 +26,7 @@
     "agents:authorize-recovery-policy": "pnpm --filter @tripwith/agent-orchestrator authorize-recovery-policy",
     "agents:retry-integration": "pnpm --filter @tripwith/agent-orchestrator retry-integration",
     "agents:apply-integration-fix": "pnpm --filter @tripwith/agent-orchestrator apply-integration-fix",
+    "agents:normalize-replan-evidence": "pnpm --filter @tripwith/agent-orchestrator normalize-replan-evidence",
     "check:enums": "node scripts/check-enum-parity.mjs",
     "db:up": "docker compose -f infra/docker-compose.yml up -d",
     "db:down": "docker compose -f infra/docker-compose.yml down",

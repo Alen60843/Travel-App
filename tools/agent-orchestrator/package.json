@@ -24,6 +24,7 @@
     "authorize-recovery-policy": "pnpm --silent run build && node dist/cli.js authorize-recovery-policy",
     "retry-integration": "pnpm --silent run build && node dist/cli.js retry-integration",
     "apply-integration-fix": "pnpm --silent run build && node dist/cli.js apply-integration-fix",
+    "normalize-replan-evidence": "pnpm --silent run build && node dist/cli.js normalize-replan-evidence",
     "propose-replan": "pnpm --silent run build && node dist/cli.js propose-replan",
     "authorize-replan": "pnpm --silent run build && node dist/cli.js authorize-replan"
   },

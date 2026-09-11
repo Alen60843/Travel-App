@@ -28,6 +28,14 @@ The immutable proposal includes the normalized request, source artifact path/has
 
 Follow-up identity is deterministic. It inherits the source's static owner/model/effort/timeout; there is no new routing or capability discovery. Requested capabilities, risk, reason, and evidence remain visible in the proposal. The operator must inspect these alongside the chosen executor and required verification.
 
+## Evidence normalization
+
+Historical blocked handoffs may label a repository test-file path as `test` evidence. The explicit host command `pnpm agents:normalize-replan-evidence <run-id> <task-id> <evidence-index> file` records the only supported correction: `test -> file`. It does not edit the handoff, run a task, invoke a provider, or create a commit.
+
+The command uses the shared run mutation lock and requires the same static, untouched-integration, quiescent, blocked-source eligibility as proposal creation. It refuses when the reference exactly matches any persisted handoff test command, regardless of that test's result. The unchanged reference must normalize to a repository path, resolve to a regular non-symlink file in the registered source worktree, remain inside existing evidence scope, and appear in the handoff's changed-file evidence.
+
+Each append-only record is content-addressed over its source task, exact handoff SHA-256, request and evidence indexes, original evidence hash, unchanged reference, fixed reason `TEST_REFERENCE_IS_REPOSITORY_PATH`, prepared HEAD, and dirty-tree fingerprints. Proposal derivation revalidates that record against the immutable raw handoff and current worktree, changes only the in-memory evidence kind, then sends the derived request through ordinary strict file-evidence validation. The proposal hash includes the normalization ID. Authorization re-derives that identity; a removed, changed, stale, or mismatched record fails closed.
+
 ## Authorization and effective configuration
 
 Initial authorization re-runs the entire proposal calculation against current state, re-reads/re-hashes the handoff, and requires the exact same proposal ID. Any material change requires a new proposal. It appends a human grant with proposal ID, time, and overlay hash, and persists checkpoint intent before changing Git. Repeating an existing grant never duplicates tasks, dependencies, ownership, or commits; unresolved ready checkpoints are checked again before returning.

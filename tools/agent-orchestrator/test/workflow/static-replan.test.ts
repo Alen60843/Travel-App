@@ -10,6 +10,7 @@ import { StateStore, validateRunState, type RunState, type TaskRunState } from '
 import { parseHandoff, writeHandoff } from '../../src/handoff';
 import { applyReplanOverlays, replanHash, type ReplanProposal } from '../../src/replan/model';
 import { taskCodeInputs } from '../../src/replan/static-replanner';
+import { treeFingerprint } from '../../src/replan/checkpoint';
 import { TaskGraph, TaskScheduler } from '../../src/tasks';
 import { isOrchestratorError } from '../../src/errors';
 import { createTemporaryRepository } from '../git/helpers';
@@ -130,7 +131,9 @@ async function fixture(verify?: string | ((container: string) => string), conven
     handoffPath, handoffOutcome: 'valid', error: { code: 'REVIEW_BLOCKED', message: 'Chat outside ownership', at: initial.createdAt } };
   for (const id of ['review', 'correction', 'final-review', 'composed', 'phase-final']) tasks[id] = { ...tasks[id]!, status: 'BLOCKED', error: { code: 'TASK_DEPENDENCY_FAILED', message: 'Source blocked', at: initial.createdAt } };
   await store.save({ ...initial, status: 'BLOCKED', tasks });
-  return { repository, worktree, options, store, orchestrator, runId: initial.runId, handoffPath,
+  return { repository, manager, worktree, options, store, orchestrator, runId: initial.runId, handoffPath,
+    normalize: (evidenceIndex = 0, normalizedKind = 'file', requestIndex = 0) => AgentOrchestrator.normalizeReplanEvidence(initial.runId, 'event',
+      { requestIndex, evidenceIndex, normalizedKind }, options),
     propose: () => AgentOrchestrator.proposeReplan(initial.runId, 'event', options),
     authorize: (proposal: ReplanProposal, git?: GitClient) => AgentOrchestrator.authorizeReplan(initial.runId, proposal.id, { ...options, ...(git === undefined ? {} : { git }) }),
     edit: async (update: (state: RunState) => RunState) => store.save(update(await store.load())),
@@ -160,6 +163,36 @@ async function assertProposalRefusedWithoutMutation(f: Fixture): Promise<void> {
   assert.deepEqual(await readFile(join(f.worktree.path, eventPath)), beforeSource);
   assert.equal((await f.store.load()).replanProposals, undefined);
   noProviders(f);
+}
+
+async function assertNormalizationRefusedWithoutMutation(f: Fixture, call: () => Promise<unknown> = () => f.normalize()): Promise<void> {
+  const beforeState = await readFile(f.store.statePath, 'utf8');
+  const beforeEvents = await readFile(f.store.eventsPath, 'utf8');
+  const beforeHead = await f.repository.git.resolveCommit(f.worktree.path, 'HEAD');
+  const beforeStatus = await f.repository.git.run(f.worktree.path, ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
+  await assert.rejects(call());
+  assert.equal(await readFile(f.store.statePath, 'utf8'), beforeState);
+  assert.equal(await readFile(f.store.eventsPath, 'utf8'), beforeEvents);
+  assert.equal(await f.repository.git.resolveCommit(f.worktree.path, 'HEAD'), beforeHead);
+  assert.equal((await f.repository.git.run(f.worktree.path, ['status', '--porcelain=v1', '-z', '--untracked-files=all'])).stdout, beforeStatus.stdout);
+  noProviders(f);
+}
+
+async function installHistoricalEvidence(f: Fixture, evidence: { kind: string; reference: string; summary?: string } = {
+  kind: 'test', reference: eventPath, summary: 'Repository test-file evidence mislabeled as a command',
+}): Promise<void> {
+  await replaceRequest(f, (handoff) => {
+    handoff.additionalWorkRequests[0].evidence = [{ summary: 'Repository test-file evidence mislabeled as a command', ...evidence }];
+  });
+}
+
+async function installExactHistoricalEvidence(f: Fixture): Promise<void> {
+  await replaceRequest(f, (handoff) => {
+    handoff.additionalWorkRequests[0].evidence = [
+      { kind: 'file', reference: chatPath, summary: 'Existing Chat implementation lacks the Event policy' },
+      { kind: 'test', reference: eventPath, summary: 'Repository test-file evidence mislabeled as a command' },
+    ];
+  });
 }
 
 for (const changesRequested of [false, true]) test(`Event + Chat end-to-end: review ${changesRequested ? 'requests Chat correction' : 'approves and skips correction'}`, async () => {
@@ -207,6 +240,201 @@ for (const changesRequested of [false, true]) test(`Event + Chat end-to-end: rev
     assert.ok([...f.options.agents.codex.invocations, ...f.options.agents.claude.invocations].every((request) => !['durable', 'realtime', 'presence', 'event'].includes(request.taskId)));
     const events = (await readFile(f.store.eventsPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line).name);
     for (const event of ['REPLAN_PROPOSED', 'REPLAN_AUTHORIZED', 'REPLAN_CHECKPOINT_PREPARING', 'REPLAN_CHECKPOINT_READY', 'REPLAN_COMPOSED_VERIFIED', 'REPLAN_RESOLVED']) assert.ok(events.includes(event));
+  } finally { await f.repository.dispose(); }
+});
+
+test('historical test-file evidence normalizes immutably and completes the real replan path', async () => {
+  const f = await fixture();
+  try {
+    await installExactHistoricalEvidence(f);
+    const originalHandoff = await readFile(f.handoffPath);
+    const originalSource = await readFile(join(f.worktree.path, eventPath));
+    const originalHead = await f.repository.git.resolveCommit(f.worktree.path, 'HEAD');
+    const originalStatus = (await f.repository.git.run(f.worktree.path, ['status', '--porcelain=v1', '-z', '--untracked-files=all'])).stdout;
+    const originalTree = await treeFingerprint(f.repository.git, f.worktree.path, originalHead, true);
+    const originalWorktrees = await f.manager.listOwned();
+    const originalState = await f.store.load();
+    const beforeEvents = await readFile(f.store.eventsPath, 'utf8');
+    await assert.rejects(f.propose(), (error) => isOrchestratorError(error, 'TASK_STATE_INVALID'));
+    const normalization = await f.normalize(1);
+    assert.equal(normalization.originalKind, 'test');
+    assert.equal(normalization.normalizedKind, 'file');
+    assert.equal(normalization.reference, eventPath);
+    assert.equal(normalization.requestIndex, 0);
+    assert.equal(normalization.evidenceIndex, 1);
+    assert.equal(normalization.reason, 'TEST_REFERENCE_IS_REPOSITORY_PATH');
+    assert.deepEqual(await readFile(f.handoffPath), originalHandoff);
+    assert.deepEqual(await readFile(join(f.worktree.path, eventPath)), originalSource);
+    assert.equal(await f.repository.git.resolveCommit(f.worktree.path, 'HEAD'), originalHead);
+    assert.equal((await f.repository.git.run(f.worktree.path, ['status', '--porcelain=v1', '-z', '--untracked-files=all'])).stdout, originalStatus);
+    assert.equal(await treeFingerprint(f.repository.git, f.worktree.path, originalHead, true), originalTree);
+    assert.deepEqual(await f.manager.listOwned(), originalWorktrees);
+    noProviders(f);
+    const persisted = await f.store.load();
+    assert.deepEqual(persisted.replanEvidenceNormalizations, [normalization]);
+    const { updatedAt: _normalizedAt, replanEvidenceNormalizations: _normalizations, ...persistedRest } = persisted;
+    const { updatedAt: _originalAt, ...originalRest } = originalState;
+    assert.deepEqual(persistedRest, originalRest);
+    const eventsAfterFirst = await readFile(f.store.eventsPath, 'utf8');
+    const audit = eventsAfterFirst.trim().split('\n').map((line) => JSON.parse(line)).filter((event) => event.name === 'REPLAN_EVIDENCE_NORMALIZED');
+    assert.equal(audit.length, 1);
+    assert.equal(audit[0].taskId, 'event');
+    assert.equal(audit[0].data.normalizationId, normalization.id);
+    assert.equal(audit[0].data.reference, eventPath);
+    assert.equal(audit[0].data.evidenceIndex, 1);
+    assert.equal(audit[0].data.originalEvidenceHash, normalization.originalEvidenceHash);
+    assert.notEqual(eventsAfterFirst, beforeEvents);
+    assert.deepEqual(await f.normalize(1), normalization);
+    assert.equal(await readFile(f.store.eventsPath, 'utf8'), eventsAfterFirst);
+    assert.deepEqual((await f.store.load()).replanEvidenceNormalizations, [normalization]);
+
+    const proposal = await f.propose();
+    assert.deepEqual(proposal.evidenceNormalizationIds, [normalization.id]);
+    assert.deepEqual(proposal.request.evidence, [
+      { kind: 'file', reference: chatPath, summary: 'Existing Chat implementation lacks the Event policy' },
+      { kind: 'file', reference: eventPath, summary: 'Repository test-file evidence mislabeled as a command' },
+    ]);
+    const { id: _id, evidenceNormalizationIds: _normalizationIds, ...unboundBody } = proposal;
+    assert.notEqual(replanHash(unboundBody), proposal.id);
+    noProviders(f);
+    await f.authorize(proposal);
+    noProviders(f);
+    const completed = await (await AgentOrchestrator.resume(f.runId, f.options)).execute();
+    assert.equal(completed.status, 'COMPLETED');
+    assert.equal(completed.tasks.event!.replan!.proposalId, proposal.id);
+    assert.deepEqual(await readFile(f.handoffPath), originalHandoff);
+  } finally { await f.repository.dispose(); }
+});
+
+test('the historical handoff remains invalid for proposal without an authorized normalization', async () => {
+  const f = await fixture();
+  try {
+    await installExactHistoricalEvidence(f);
+    await assertProposalRefusedWithoutMutation(f);
+  } finally { await f.repository.dispose(); }
+});
+
+for (const result of ['pass', 'fail', 'not_run'] as const) {
+  test(`a matching ${result} handoff test command cannot be converted to file evidence`, async () => {
+    const f = await fixture();
+    try {
+      await installHistoricalEvidence(f);
+      await replaceRequest(f, (handoff) => { handoff.tests = [{ command: eventPath, result, details: 'Exact command identity' }]; });
+      await assertNormalizationRefusedWithoutMutation(f);
+    } finally { await f.repository.dispose(); }
+  });
+}
+
+for (const scenario of ['file-to-test', 'test-to-diff', 'test-to-schema', 'outside-repository', 'outside-scope', 'missing-file', 'not-changed-file', 'symlink'] as const) {
+  test(`evidence normalization refuses ${scenario}`, async () => {
+    const f = await fixture();
+    try {
+      if (scenario === 'file-to-test') await installHistoricalEvidence(f, { kind: 'file', reference: eventPath });
+      else if (scenario === 'outside-repository') await installHistoricalEvidence(f, { kind: 'test', reference: '../event.ts' });
+      else if (scenario === 'outside-scope') await installHistoricalEvidence(f, { kind: 'test', reference: 'design.md' });
+      else if (scenario === 'missing-file') {
+        await installHistoricalEvidence(f, { kind: 'test', reference: 'apps/api/src/events/missing.ts' });
+        await replaceRequest(f, (handoff) => { handoff.filesChanged = ['apps/api/src/events/missing.ts']; });
+      } else if (scenario === 'not-changed-file') {
+        await writeFile(join(f.worktree.path, 'apps/api/src/events/context.ts'), 'Context\n');
+        await installHistoricalEvidence(f, { kind: 'test', reference: 'apps/api/src/events/context.ts' });
+      } else if (scenario === 'symlink') {
+        const link = 'apps/api/src/events/link.ts';
+        await symlink(eventPath.split('/').at(-1)!, join(f.worktree.path, link));
+        await installHistoricalEvidence(f, { kind: 'test', reference: link });
+        await replaceRequest(f, (handoff) => { handoff.filesChanged.push(link); });
+      } else await installHistoricalEvidence(f);
+      await assertNormalizationRefusedWithoutMutation(f, () => f.normalize(0,
+        scenario === 'file-to-test' ? 'test' : scenario === 'test-to-diff' ? 'diff' : scenario === 'test-to-schema' ? 'schema' : 'file'));
+    } finally { await f.repository.dispose(); }
+  });
+}
+
+for (const scenario of ['wrong-request-index', 'missing-evidence-index', 'negative-evidence-index', 'malformed-handoff'] as const) {
+  test(`evidence normalization refuses ${scenario}`, async () => {
+    const f = await fixture();
+    try {
+      await installHistoricalEvidence(f);
+      if (scenario === 'malformed-handoff') await writeFile(f.handoffPath, '{');
+      const call = scenario === 'wrong-request-index' ? () => f.normalize(0, 'file', 1)
+        : scenario === 'missing-evidence-index' ? () => f.normalize(99)
+          : scenario === 'negative-evidence-index' ? () => f.normalize(-1) : () => f.normalize();
+      await assertNormalizationRefusedWithoutMutation(f, call);
+    } finally { await f.repository.dispose(); }
+  });
+}
+
+for (const scenario of ['handoff-bytes-changed', 'reference-changed', 'summary-changed', 'worktree-changed'] as const) {
+  test(`proposal refuses when normalized ${scenario}`, async () => {
+    const f = await fixture();
+    try {
+      await installHistoricalEvidence(f);
+      await f.normalize();
+      if (scenario === 'handoff-bytes-changed') await writeFile(f.handoffPath, `${await readFile(f.handoffPath, 'utf8')}\n`);
+      else if (scenario === 'reference-changed') await replaceRequest(f, (handoff) => { handoff.additionalWorkRequests[0].evidence[0].reference = chatPath; });
+      else if (scenario === 'summary-changed') await replaceRequest(f, (handoff) => { handoff.additionalWorkRequests[0].evidence[0].summary = 'Changed summary'; });
+      else await writeFile(join(f.worktree.path, eventPath), 'Event changed after normalization\n');
+      await assertProposalRefusedWithoutMutation(f);
+    } finally { await f.repository.dispose(); }
+  });
+}
+
+test('normalization refuses a source with an already persisted proposal', async () => {
+  const f = await fixture();
+  try {
+    await f.propose();
+    await installHistoricalEvidence(f);
+    await assertNormalizationRefusedWithoutMutation(f);
+  } finally { await f.repository.dispose(); }
+});
+
+for (const scenario of ['removed', 'changed'] as const) {
+  test(`authorization refuses when proposal normalization state is ${scenario}`, async () => {
+    const f = await fixture();
+    try {
+      await installHistoricalEvidence(f);
+      await f.normalize();
+      const proposal = await f.propose();
+      const state = JSON.parse(await readFile(f.store.statePath, 'utf8'));
+      if (scenario === 'removed') delete state.replanEvidenceNormalizations;
+      else state.replanEvidenceNormalizations[0].reference = chatPath;
+      await writeFile(f.store.statePath, `${JSON.stringify(state, null, 2)}\n`);
+      await assert.rejects(f.authorize(proposal));
+      assert.equal(await f.repository.git.resolveCommit(f.worktree.path, 'HEAD'), proposal.preparedHeadSha);
+      noProviders(f);
+    } finally { await f.repository.dispose(); }
+  });
+}
+
+for (const scenario of ['source-ineligible', 'integration-started', 'run-not-quiescent'] as const) {
+  test(`evidence normalization refuses when ${scenario}`, async () => {
+    const f = await fixture();
+    try {
+      await installHistoricalEvidence(f);
+      if (scenario === 'source-ineligible') await f.editTask('event', (task) => ({ ...task, handoffOutcome: 'invalid' }));
+      if (scenario === 'integration-started') await f.edit((state) => ({ ...state, integration: { ...state.integration, status: 'RUNNING' } }));
+      if (scenario === 'run-not-quiescent') await f.editTask('presence', (task) => ({ ...task, status: 'RUNNING' }));
+      await assertNormalizationRefusedWithoutMutation(f);
+    } finally { await f.repository.dispose(); }
+  });
+}
+
+test('host CLI persists evidence normalization without executing the replan', async () => {
+  const f = await fixture(undefined, true);
+  try {
+    await installExactHistoricalEvidence(f);
+    const result = spawnSync(process.execPath, [resolve(__dirname, '../../src/cli.js'), 'normalize-replan-evidence', f.runId, 'event', '1', 'file'],
+      { cwd: f.repository.repository, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.normalization.reference, eventPath);
+    assert.match(output.manualNextStep, /agents:propose-replan/);
+    const state = await f.store.load();
+    assert.equal(state.replanEvidenceNormalizations!.length, 1);
+    assert.equal(state.replanProposals, undefined);
+    assert.equal(state.tasks.event!.replan, undefined);
+    assert.equal(await f.repository.git.resolveCommit(f.worktree.path, 'HEAD'), state.tasks.event!.preparedHeadSha);
+    noProviders(f);
   } finally { await f.repository.dispose(); }
 });
 
@@ -392,6 +620,7 @@ test('repeated proposal, authorization and fresh loads are idempotent; old runs 
   const f = await fixture();
   try {
     const old = await f.store.load();
+    assert.equal('replanEvidenceNormalizations' in validateRunState(old), false);
     assert.equal('replanProposals' in validateRunState(old), false);
     const proposal = await f.propose();
     assert.equal((await f.propose()).id, proposal.id);
@@ -429,7 +658,7 @@ test('run mutation lock excludes authorization, resume, salvage, preflight and i
   try {
     const proposal = await f.propose();
     await new StateStore(f.options.runsRoot, f.runId).withRunMutationLock(async () => {
-      for (const call of [() => f.authorize(proposal), () => AgentOrchestrator.resume(f.runId, f.options),
+      for (const call of [() => f.normalize(), () => f.authorize(proposal), () => AgentOrchestrator.resume(f.runId, f.options),
         () => AgentOrchestrator.salvageTask(f.runId, 'event', f.options), () => AgentOrchestrator.retryPreflight(f.runId, 'review', f.options),
         () => AgentOrchestrator.retryIntegrationGate(f.runId, f.options), () => f.orchestrator.execute()]) {
         await assert.rejects(call(), (error) => isOrchestratorError(error, 'TASK_STATE_INVALID'));

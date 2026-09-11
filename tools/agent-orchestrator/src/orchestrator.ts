@@ -15,7 +15,7 @@ import {
 } from './agents';
 import { assertCodeInputHistory } from './replan/checkpoint';
 import { StaticReplanner, taskCodeInputs } from './replan/static-replanner';
-import { applyReplanOverlays, replanHash, type ReplanProposal } from './replan/model';
+import { applyReplanOverlays, replanHash, type ReplanEvidenceNormalization, type ReplanProposal } from './replan/model';
 import type { PhaseConfig } from './config';
 import { OrchestratorError, isOrchestratorError, type ErrorCode } from './errors';
 import {
@@ -627,6 +627,18 @@ export class AgentOrchestrator {
       ...(this.signal === undefined ? {} : { signal: this.signal }),
       save: async (state) => { await this.mutate(() => state); },
       event: (name, taskId, detail) => this.event(name, taskId, detail),
+    });
+  }
+
+  /** Calling this host API/CLI explicitly authorizes one deterministic semantic correction; it executes no work. */
+  static async normalizeReplanEvidence(runId: string, taskId: string, request: {
+    readonly requestIndex: number;
+    readonly evidenceIndex: number;
+    readonly normalizedKind: string;
+  }, options: OrchestratorOptions): Promise<ReplanEvidenceNormalization> {
+    return AgentOrchestrator.withRunMutation(runId, options, async () => {
+      const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options, false);
+      return orchestrator.replanner().normalizeEvidence(taskId, request.requestIndex, request.evidenceIndex, request.normalizedKind);
     });
   }
 

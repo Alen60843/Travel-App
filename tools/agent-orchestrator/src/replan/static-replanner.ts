@@ -8,7 +8,9 @@ import type { RunState, StateStore, TaskRunState, RunEventName } from '../state'
 import { TaskGraph, assertChangedFileOwnership, matchesOwnershipPattern, type TaskSpec } from '../tasks';
 import { ownershipGlobsOverlap, normalizeRepositoryPath } from '../tasks/ownership';
 import { parseTaskSpec } from '../tasks/task-schema';
-import { applyReplanOverlays, assertPristine, buildOverlay, followupDependencies, replanHash, refuse, type ReplanProposal, type TaskReplanState } from './model';
+import type { WorkRequestDraft } from '../adaptive/types';
+import { applyReplanOverlays, assertPristine, buildOverlay, followupDependencies, replanEvidenceNormalizationId, replanHash, refuse,
+  type ReplanEvidenceNormalization, type ReplanEvidenceNormalizationIdentity, type ReplanProposal, type TaskReplanState } from './model';
 import { assertCodeInputHistory, changedCandidatePaths, inspectCheckpoint, readReplanHandoff, treeFingerprint } from './checkpoint';
 
 export function taskCodeInputs(config: PhaseConfig, state: RunState, task: TaskSpec): IntegrationCommit[] {
@@ -92,16 +94,106 @@ export class StaticReplanner {
     return { task, spec, worktree, artifact };
   }
 
-  async propose(taskId: string, persist = true): Promise<ReplanProposal> {
+  private normalizedRequest(taskId: string, artifact: Awaited<ReturnType<typeof readReplanHandoff>>, normalizations: readonly ReplanEvidenceNormalization[]): {
+    readonly request: WorkRequestDraft;
+    readonly normalizationIds: readonly string[];
+  } {
+    const requests = artifact.handoff.additionalWorkRequests;
+    if (requests?.length !== 1) refuse('exactly one persisted additionalWorkRequest is required');
+    const sourceNormalizations = normalizations.filter((entry) => entry.sourceTaskId === taskId);
+    if (sourceNormalizations.some((entry) => entry.handoffSha256 !== artifact.sha256)) refuse('source has a stale evidence normalization for another handoff digest');
+    const applicable = sourceNormalizations.filter((entry) => entry.handoffSha256 === artifact.sha256);
+    const evidence = [...(requests[0]!.evidence ?? [])];
+    const coordinates = new Set<string>();
+    for (const normalization of applicable) {
+      const coordinate = `${normalization.requestIndex}:${normalization.evidenceIndex}`;
+      if (coordinates.has(coordinate)) refuse('multiple evidence normalizations target the same entry');
+      coordinates.add(coordinate);
+      const original = requests[normalization.requestIndex]?.evidence?.[normalization.evidenceIndex];
+      if (original === undefined || normalization.originalKind !== 'test' || normalization.normalizedKind !== 'file'
+        || normalization.requestIndex !== 0 || original.kind !== normalization.originalKind
+        || original.reference !== normalization.reference || replanHash(original) !== normalization.originalEvidenceHash
+        || !artifact.handoff.filesChanged.includes(original.reference)
+        || artifact.handoff.tests.some((entry) => entry.command === original.reference)) refuse('evidence normalization no longer matches its exact original entry');
+      evidence[normalization.evidenceIndex] = { ...original, kind: 'file' };
+    }
+    return {
+      request: applicable.length === 0 ? requests[0]! : { ...requests[0]!, evidence },
+      normalizationIds: applicable.map((entry) => entry.id).sort(),
+    };
+  }
+
+  /** The host invocation is the explicit human authorization for one immutable test -> file interpretation. */
+  async normalizeEvidence(taskId: string, requestIndex: number, evidenceIndex: number, normalizedKind: string): Promise<ReplanEvidenceNormalization> {
+    const state = this.ctx.state();
+    if (state.status !== 'BLOCKED') refuse('evidence normalization requires a blocked run');
+    await this.quiescent();
+    if (Object.values(state.tasks).some((task) => task.replan !== undefined && task.replan.phase !== 'RESOLVED')) refuse('another unresolved replan exists');
+    const { task, spec, worktree, artifact } = await this.source(taskId);
+    if (task.replan !== undefined) refuse('source already has a replan');
+    if (!Number.isSafeInteger(requestIndex) || requestIndex !== 0 || !Number.isSafeInteger(evidenceIndex) || evidenceIndex < 0) refuse('normalization requires exact request and evidence indexes');
+    if (normalizedKind !== 'file') refuse('v1 supports only test to file evidence normalization');
+    const requests = artifact.handoff.additionalWorkRequests;
+    if (requests?.length !== 1) refuse('exactly one persisted additionalWorkRequest is required');
+    const original = requests[requestIndex]?.evidence?.[evidenceIndex];
+    if (original === undefined) refuse('requested evidence entry is missing');
+    if (original.kind !== 'test') refuse('v1 normalization source kind must be test');
+    if (artifact.handoff.tests.some((entry) => entry.command === original.reference)) refuse('matching handoff test command proves this is test evidence');
+    const path = normalizeRepositoryPath(original.reference);
+    if (path !== original.reference) refuse('normalization cannot change the evidence reference');
+    if (!artifact.handoff.filesChanged.includes(path)) refuse('normalized file evidence must be present in source changed-file evidence');
+    if (state.replanProposals?.some((proposal) => proposal.sourceTaskId === taskId)) refuse('source already has a proposal with another evidence interpretation');
+    if (await this.ctx.git.resolveCommit(worktree.path, 'HEAD') !== task.preparedHeadSha) refuse('foreign commit in source worktree');
+    const changed = await changedCandidatePaths(this.ctx.git, worktree.path, task.preparedHeadSha);
+    if (changed.length === 0) refuse('source has no partial work');
+    assertChangedFileOwnership(taskId, changed, spec.files);
+    if (replanHash(changed) !== replanHash([...artifact.handoff.filesChanged].sort())) refuse('handoff changed files differ from candidate diff');
+    await this.ctx.git.run(worktree.path, ['diff', '--check', task.preparedHeadSha]);
+    const identity: ReplanEvidenceNormalizationIdentity = {
+      version: 1,
+      sourceTaskId: taskId,
+      handoffSha256: artifact.sha256,
+      requestIndex,
+      evidenceIndex,
+      originalEvidenceHash: replanHash(original),
+      originalKind: 'test',
+      normalizedKind: 'file',
+      reference: original.reference,
+      reason: 'TEST_REFERENCE_IS_REPOSITORY_PATH',
+      preparedHeadSha: task.preparedHeadSha,
+      trackedDiffFingerprint: await computeTrackedDiffFingerprint(this.ctx.git, worktree.path, task.preparedHeadSha),
+      treeFingerprint: await treeFingerprint(this.ctx.git, worktree.path, task.preparedHeadSha, true),
+    };
+    const record: ReplanEvidenceNormalization = { id: replanEvidenceNormalizationId(identity), ...identity,
+      authorizedBy: 'human', authorizedAt: this.ctx.clock().toISOString() };
+    const existing = state.replanEvidenceNormalizations?.find((entry) => entry.id === record.id);
+    const candidateNormalizations = existing === undefined ? [...(state.replanEvidenceNormalizations ?? []), record] : state.replanEvidenceNormalizations!;
+    const proposal = await this.propose(taskId, false, candidateNormalizations);
+    const current = await this.source(taskId);
+    const currentHead = await this.ctx.git.resolveCommit(current.worktree.path, 'HEAD');
+    const currentTrackedDiff = await computeTrackedDiffFingerprint(this.ctx.git, current.worktree.path, task.preparedHeadSha);
+    const currentTree = await treeFingerprint(this.ctx.git, current.worktree.path, task.preparedHeadSha, true);
+    if (current.artifact.sha256 !== record.handoffSha256 || proposal.preparedHeadSha !== record.preparedHeadSha
+      || currentHead !== record.preparedHeadSha || currentTrackedDiff !== record.trackedDiffFingerprint
+      || currentTree !== record.treeFingerprint || proposal.trackedDiffFingerprint !== record.trackedDiffFingerprint
+      || proposal.treeFingerprint !== record.treeFingerprint) refuse('source changed during evidence normalization inspection');
+    if (existing !== undefined) return existing;
+    await this.ctx.save({ ...state, replanEvidenceNormalizations: candidateNormalizations });
+    await this.ctx.event('REPLAN_EVIDENCE_NORMALIZED', taskId, { normalizationId: record.id, handoffSha256: record.handoffSha256,
+      requestIndex, evidenceIndex, originalEvidenceHash: record.originalEvidenceHash, originalKind: 'test', normalizedKind: 'file',
+      reference: record.reference, reason: record.reason, preparedHeadSha: record.preparedHeadSha,
+      trackedDiffFingerprint: record.trackedDiffFingerprint, treeFingerprint: record.treeFingerprint, authorizedBy: 'human' });
+    return record;
+  }
+
+  async propose(taskId: string, persist = true, normalizations: readonly ReplanEvidenceNormalization[] = this.ctx.state().replanEvidenceNormalizations ?? []): Promise<ReplanProposal> {
     const state = this.ctx.state();
     if (state.status !== 'BLOCKED') refuse('proposal requires a blocked run');
     await this.quiescent();
     if (Object.values(state.tasks).some((task) => task.replan !== undefined && task.replan.phase !== 'RESOLVED')) refuse('another unresolved replan exists');
     const { task, spec, worktree, artifact } = await this.source(taskId);
     if (task.replan !== undefined) refuse('v1 supports one replan per source');
-    const requests = artifact.handoff.additionalWorkRequests;
-    if (requests?.length !== 1) refuse('exactly one persisted additionalWorkRequest is required');
-    const request = requests[0]!;
+    const { request, normalizationIds } = this.normalizedRequest(taskId, artifact, normalizations);
     if (request.role !== 'implementation' || request.resourceClaims?.length === 0 || request.resourceClaims === undefined
       || request.resourceClaims.some((claim) => claim.kind !== 'repository_path') || (request.evidence?.length ?? 0) === 0) refuse('request requires implementation, repository claims, and evidence');
     const files = [...new Set(request.resourceClaims.filter((claim) => claim.mode === 'write').map((claim) => claim.key))].sort();
@@ -134,12 +226,18 @@ export class StaticReplanner {
     }, 0);
     const overlay = buildOverlay(this.ctx.config, spec, followup);
     for (const patch of overlay.patches) assertPristine(state.tasks[patch.taskId]);
+    const trackedDiffFingerprint = await computeTrackedDiffFingerprint(this.ctx.git, worktree.path, task.preparedHeadSha!);
+    const currentTreeFingerprint = await treeFingerprint(this.ctx.git, worktree.path, task.preparedHeadSha!, true);
+    for (const normalization of normalizations.filter((entry) => normalizationIds.includes(entry.id))) {
+      if (normalization.preparedHeadSha !== task.preparedHeadSha || normalization.trackedDiffFingerprint !== trackedDiffFingerprint
+        || normalization.treeFingerprint !== currentTreeFingerprint) refuse('source worktree changed after evidence normalization');
+    }
     const body = {
       version: 1 as const, runId: state.runId, sourceTaskId: taskId, handoffPath: artifact.path, handoffSha256: artifact.sha256,
-      preparedHeadSha: task.preparedHeadSha!, trackedDiffFingerprint: await computeTrackedDiffFingerprint(this.ctx.git, worktree.path, task.preparedHeadSha!),
-      treeFingerprint: await treeFingerprint(this.ctx.git, worktree.path, task.preparedHeadSha!, true),
+      preparedHeadSha: task.preparedHeadSha!, trackedDiffFingerprint, treeFingerprint: currentTreeFingerprint,
       sourceStateHash: replanHash(task), contextHash: replanHash({ config: this.ctx.config, tasks: state.tasks, integration: state.integration, baseSha: state.baseSha }),
-      sourceError: task.error!, request, overlay, verify: this.ctx.config.salvage.verify, prepare: this.ctx.config.agentWorktree.prepare,
+      sourceError: task.error!, ...(normalizationIds.length === 0 ? {} : { evidenceNormalizationIds: normalizationIds }),
+      request, overlay, verify: this.ctx.config.salvage.verify, prepare: this.ctx.config.agentWorktree.prepare,
     };
     if (!body.verify.some((command) => command.required)) refuse('required salvage.verify commands must be configured before proposing');
     const proposal: ReplanProposal = { id: replanHash(body), ...body };

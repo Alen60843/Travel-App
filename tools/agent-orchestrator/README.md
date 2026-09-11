@@ -16,7 +16,7 @@ Codex implementation
 
 The orchestrator never implements Phase 5 merely because the example file exists. `agents:plan` is read-only. `agents:run` starts paid/local agent processes and must only be used after the phase itself is approved.
 
-For blocked static writers that request work outside their ownership, see [Static scope-gap replanning v1](STATIC_SCOPE_REPLANNING.md). `agents:propose-replan` persists an inspectable proposal, `agents:authorize-replan` explicitly grants the checkpoint/follow-up overlay, and normal `agents:resume` executes and verifies the composed result.
+For blocked static writers that request work outside their ownership, see [Static scope-gap replanning v1](STATIC_SCOPE_REPLANNING.md). `agents:normalize-replan-evidence` may explicitly record the one supported historical semantic correction (`test -> file`) without editing the handoff. `agents:propose-replan` persists an inspectable proposal, `agents:authorize-replan` explicitly grants the checkpoint/follow-up overlay, and normal `agents:resume` executes and verifies the composed result.
 
 ## Requirements
 
@@ -49,6 +49,7 @@ pnpm agents:status <runId>
 pnpm agents:metrics <runId>
 pnpm agents:recover-handoffs <runId>
 pnpm agents:retry-agent <runId> <taskId>
+pnpm agents:normalize-replan-evidence <runId> <taskId> <evidenceIndex> file
 pnpm agents:salvage-task <runId> <taskId>
 pnpm agents:verify-blocked-task <runId> <taskId>
 pnpm agents:retry-integration <runId>
