@@ -20,6 +20,7 @@
     "agents:cleanup": "pnpm --filter @tripwith/agent-orchestrator cleanup",
     "agents:recover-handoffs": "pnpm --filter @tripwith/agent-orchestrator recover-handoffs",
     "agents:retry-agent": "pnpm --filter @tripwith/agent-orchestrator retry-agent",
+    "agents:retry-review-output": "pnpm --filter @tripwith/agent-orchestrator retry-review-output",
     "agents:retry-preflight": "pnpm --filter @tripwith/agent-orchestrator retry-preflight",
     "agents:salvage-task": "pnpm --filter @tripwith/agent-orchestrator salvage-task",
     "agents:verify-blocked-task": "pnpm --filter @tripwith/agent-orchestrator verify-blocked-task",

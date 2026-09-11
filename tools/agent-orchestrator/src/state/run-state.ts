@@ -107,6 +107,23 @@ export interface AgentFailureRecoveryState {
   readonly reopenedTaskIds: readonly string[];
 }
 
+/**
+ * Append-only authorization evidence for one bounded retry after a read-only
+ * review process succeeded but its output failed strict review validation.
+ */
+export interface ReviewOutputRecoveryState {
+  readonly recovery: number;
+  readonly authorizedAt: string;
+  readonly previousRunStatus: 'FAILED' | 'BLOCKED';
+  readonly previousTaskStatus: 'FAILED';
+  readonly error: StoredError;
+  readonly attempt: AgentAttemptState;
+  readonly previousHandoffOutcome: 'invalid';
+  readonly stdoutPath: string;
+  readonly stdoutSha256: string;
+  readonly reopenedTaskIds: readonly string[];
+}
+
 export interface TaskRunState {
   readonly id: string;
   readonly status: TaskStatus;
@@ -144,6 +161,8 @@ export interface TaskRunState {
   readonly handoffRepairAttempts: readonly HandoffRepairAttemptRecord[];
   /** Explicit agent/process failure recoveries, oldest first; never rewritten or removed. */
   readonly agentFailureRecoveries?: readonly AgentFailureRecoveryState[];
+  /** Explicit structured-review retries, oldest first; v1 permits one entry. */
+  readonly reviewOutputRecoveries?: readonly ReviewOutputRecoveryState[];
   /**
    * Crash-safety checkpoints for salvaging a timed-out writer's dirty
    * worktree (AgentOrchestrator.salvageTask). Present only once salvage has
@@ -310,6 +329,7 @@ export const RUN_EVENT_NAMES = [
   'HANDOFF_WRITTEN',
   'HANDOFF_REPAIR_ATTEMPTED',
   'AGENT_RETRY_AUTHORIZED',
+  'REVIEW_OUTPUT_RETRY_AUTHORIZED',
   'PREFLIGHT_RETRY_AUTHORIZED',
   'TASK_DEPENDENCY_REOPENED',
   'REVIEW_STARTED',
@@ -600,6 +620,55 @@ function parseAgentFailureRecovery(
   };
 }
 
+function parseReviewOutputRecovery(
+  value: unknown,
+  path: string,
+  expectedRecovery: number,
+): ReviewOutputRecoveryState {
+  if (!isObject(value)) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path} must be an object`);
+  }
+  const recovery = integer(value.recovery, `${path}.recovery`, 1);
+  if (recovery !== expectedRecovery) {
+    throw new OrchestratorError(
+      'STATE_CORRUPT',
+      `${path}.recovery must be the append-only sequence number ${expectedRecovery}`,
+    );
+  }
+  const previousRunStatus = string(value.previousRunStatus, `${path}.previousRunStatus`);
+  if (previousRunStatus !== 'FAILED' && previousRunStatus !== 'BLOCKED') {
+    throw new OrchestratorError(
+      'STATE_CORRUPT',
+      `${path}.previousRunStatus must be FAILED or BLOCKED`,
+    );
+  }
+  if (value.previousTaskStatus !== 'FAILED' || value.previousHandoffOutcome !== 'invalid') {
+    throw new OrchestratorError(
+      'STATE_CORRUPT',
+      `${path} must archive a FAILED task with invalid output`,
+    );
+  }
+  const stdoutSha256 = string(value.stdoutSha256, `${path}.stdoutSha256`);
+  if (!/^[0-9a-f]{64}$/.test(stdoutSha256)) {
+    throw new OrchestratorError(
+      'STATE_CORRUPT',
+      `${path}.stdoutSha256 must be a lowercase sha256 digest`,
+    );
+  }
+  return {
+    recovery,
+    authorizedAt: timestamp(value.authorizedAt, `${path}.authorizedAt`),
+    previousRunStatus,
+    previousTaskStatus: 'FAILED',
+    error: parseStoredError(value.error, `${path}.error`),
+    attempt: parseAttempt(value.attempt, `${path}.attempt`),
+    previousHandoffOutcome: 'invalid',
+    stdoutPath: string(value.stdoutPath, `${path}.stdoutPath`),
+    stdoutSha256,
+    reopenedTaskIds: stringArray(value.reopenedTaskIds, `${path}.reopenedTaskIds`),
+  };
+}
+
 /**
  * Factored out (previously inline in validateRunState) so the same parser
  * validates both the live `integration` field and each archived entry in
@@ -873,6 +942,22 @@ function parseTask(value: unknown, key: string): TaskRunState {
       ),
     );
   }
+  let reviewOutputRecoveries: ReviewOutputRecoveryState[] | undefined;
+  if (value.reviewOutputRecoveries !== undefined) {
+    if (!Array.isArray(value.reviewOutputRecoveries)) {
+      throw new OrchestratorError(
+        'STATE_CORRUPT',
+        `${path}.reviewOutputRecoveries must be an array`,
+      );
+    }
+    reviewOutputRecoveries = value.reviewOutputRecoveries.map((recovery, index) =>
+      parseReviewOutputRecovery(
+        recovery,
+        `${path}.reviewOutputRecoveries[${index}]`,
+        index + 1,
+      ),
+    );
+  }
   return {
     id,
     status: status as TaskStatus,
@@ -926,6 +1011,7 @@ function parseTask(value: unknown, key: string): TaskRunState {
         }),
     handoffRepairAttempts: normalizeHandoffRepairAttempts(value, path),
     ...(agentFailureRecoveries === undefined ? {} : { agentFailureRecoveries }),
+    ...(reviewOutputRecoveries === undefined ? {} : { reviewOutputRecoveries }),
     ...(value.salvage === undefined ? {} : { salvage: parseSalvageState(value.salvage, `${path}.salvage`) }),
     ...(value.replan === undefined ? {} : { replan: parseTaskReplan(value.replan) }),
   };

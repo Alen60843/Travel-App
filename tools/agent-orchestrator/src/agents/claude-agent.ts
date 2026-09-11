@@ -26,6 +26,9 @@ export class ClaudeAgent extends ProcessAgent {
 
   protected buildInvocation(request: AgentRequest): AgentInvocation {
     const access = request.access ?? defaultAccessForRole(request.role);
+    // Claude Code 2.1.71 documents workflow permission modes independently
+    // from --tools. `dontAsk` keeps headless reviews in normal execution while
+    // the explicit tool list supplies the read-only capability boundary.
     const args = [
       '-p',
       '--safe-mode',
@@ -35,14 +38,14 @@ export class ClaudeAgent extends ProcessAgent {
       '--effort',
       CLAUDE_EFFORT[request.requestedEffort],
       '--permission-mode',
-      access === 'read_only' ? 'plan' : 'acceptEdits',
+      access === 'read_only' ? 'dontAsk' : 'acceptEdits',
       '--tools',
       access === 'read_only' ? 'Read,Glob,Grep' : 'default',
     ];
 
     // `claude --help` documents `--model <model>` as a real, independent flag
     // (accepting an alias or a full model name) alongside --effort, verified
-    // against Claude Code 2.1.220 before wiring this. Only added when a task
+    // against Claude Code 2.1.71 before wiring this. Only added when a task
     // explicitly requests one, so the default behavior (session default
     // model) is unchanged for every existing phase file.
     if (request.requestedModel !== undefined) {

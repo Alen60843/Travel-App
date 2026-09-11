@@ -18,6 +18,7 @@
     "cleanup": "pnpm --silent run build && node dist/cli.js cleanup",
     "recover-handoffs": "pnpm --silent run build && node dist/cli.js recover-handoffs",
     "retry-agent": "pnpm --silent run build && node dist/cli.js retry-agent",
+    "retry-review-output": "pnpm --silent run build && node dist/cli.js retry-review-output",
     "retry-preflight": "pnpm --silent run build && node dist/cli.js retry-preflight",
     "salvage-task": "pnpm --silent run build && node dist/cli.js salvage-task",
     "verify-blocked-task": "pnpm --silent run build && node dist/cli.js verify-blocked-task",

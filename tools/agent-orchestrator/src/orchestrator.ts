@@ -61,6 +61,7 @@ import {
   type AgentAttemptState,
   type AgentFailureRecoveryState,
   type HandoffRepairAttemptRecord,
+  type ReviewOutputRecoveryState,
   type RecoveryPolicySnapshot,
   type RunEventName,
   type RunState,
@@ -220,6 +221,14 @@ export interface AgentFailureRetryResult {
   readonly orchestrator: AgentOrchestrator;
   readonly taskId: string;
   readonly recovery: AgentFailureRecoveryState;
+  readonly reopenedTasks: readonly string[];
+}
+
+/** Result of an explicit structured-review retry authorization. No agent is run by this operation. */
+export interface ReviewOutputRetryResult {
+  readonly orchestrator: AgentOrchestrator;
+  readonly taskId: string;
+  readonly recovery: ReviewOutputRecoveryState;
   readonly reopenedTasks: readonly string[];
 }
 
@@ -776,6 +785,96 @@ export class AgentOrchestrator {
       reopenedTasks,
     });
     return { orchestrator, taskId, recovery, reopenedTasks };
+  }
+
+  /** Authorize one fresh normal review invocation after malformed structured output. */
+  static async retryReviewOutput(
+    runId: string,
+    taskId: string,
+    options: OrchestratorOptions,
+  ): Promise<ReviewOutputRetryResult> {
+    const repositoryRoot = await (options.git ?? new GitClient()).repositoryRoot(resolve(options.repositoryPath));
+    const store = new StateStore(resolve(options.runsRoot ?? join(repositoryRoot, 'tools/agent-orchestrator/runs')), runId);
+    return store.withRunMutationLock(async () => {
+      const persisted = await store.load();
+      if (persisted.strategy === 'adaptive' || persisted.adaptive !== undefined) {
+        throw new OrchestratorError('TASK_STATE_INVALID', 'Structured-review retry supports static runs only');
+      }
+      const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options);
+      const checked = await orchestrator.checkReviewOutputRetryEligibility(taskId);
+      if (!checked.eligible) {
+        throw new OrchestratorError(
+          'TASK_STATE_INVALID',
+          `Refusing structured-review retry for ${taskId}: ${checked.reason}`,
+          { details: { runId, taskId, reason: checked.reason } },
+        );
+      }
+
+      const previous = orchestrator.state.tasks[taskId]!;
+      const reopenedTasks = orchestrator.dependencyOnlyDescendantsToReopen(taskId);
+      for (const id of reopenedTasks) {
+        const descendant = orchestrator.state.tasks[id]!;
+        if (descendant.reviewRounds !== 0 || descendant.preparation !== undefined
+          || descendant.salvage !== undefined || descendant.replan !== undefined
+          || (descendant.agentFailureRecoveries?.length ?? 0) > 0
+          || (descendant.reviewOutputRecoveries?.length ?? 0) > 0) {
+          throw new OrchestratorError(
+            'TASK_STATE_INVALID',
+            `Dependency-blocked task ${id} contains execution or recovery evidence`,
+          );
+        }
+      }
+      const recovery: ReviewOutputRecoveryState = {
+        recovery: 1,
+        authorizedAt: orchestrator.clock().toISOString(),
+        previousRunStatus: orchestrator.state.status as 'FAILED' | 'BLOCKED',
+        previousTaskStatus: 'FAILED',
+        error: previous.error!,
+        attempt: previous.agentAttempts.at(-1)!,
+        previousHandoffOutcome: 'invalid',
+        stdoutPath: checked.stdoutPath,
+        stdoutSha256: checked.stdoutSha256,
+        reopenedTaskIds: reopenedTasks,
+      };
+
+      await orchestrator.mutate((state) => {
+        const tasks = { ...state.tasks };
+        const target = tasks[taskId]!;
+        const {
+          error: _error,
+          finishedAt: _finishedAt,
+          startedAt: _startedAt,
+          handoffOutcome: _handoffOutcome,
+          skipReason: _skipReason,
+          ...retryable
+        } = target;
+        tasks[taskId] = {
+          ...retryable,
+          status: 'READY',
+          reviewOutputRecoveries: [...(target.reviewOutputRecoveries ?? []), recovery],
+        };
+        for (const id of reopenedTasks) {
+          const { error: _dependencyError, finishedAt: _dependencyFinishedAt, ...descendant } = tasks[id]!;
+          tasks[id] = { ...descendant, status: 'PENDING' };
+        }
+        return { ...state, status: 'RUNNING', tasks };
+      });
+      await orchestrator.event('REVIEW_OUTPUT_RETRY_AUTHORIZED', taskId, {
+        recovery: recovery.recovery,
+        failedAttempt: recovery.attempt.attempt,
+        errorCode: recovery.error.code,
+        stdoutPath: recovery.stdoutPath,
+        stdoutSha256: recovery.stdoutSha256,
+        reopenedTasks,
+      });
+      for (const id of reopenedTasks) {
+        await orchestrator.event('TASK_DEPENDENCY_REOPENED', id, { recoveredDependency: taskId });
+      }
+      await orchestrator.event('RUN_RESUMED', undefined, {
+        recoveryMode: 'structured_review_output_retry', taskId, reopenedTasks,
+      });
+      return { orchestrator, taskId, recovery, reopenedTasks };
+    });
   }
 
   /** Reconsider only a static review-round guard failure before any invocation. */
@@ -3780,6 +3879,142 @@ export class AgentOrchestrator {
       }
     }
     return completedRounds;
+  }
+
+  /** Fail-closed eligibility for the single v1 structured-review retry. */
+  private async checkReviewOutputRetryEligibility(taskId: string): Promise<
+    | { readonly eligible: true; readonly stdoutPath: string; readonly stdoutSha256: string }
+    | { readonly eligible: false; readonly reason: string }
+  > {
+    const refuse = (reason: string) => ({ eligible: false as const, reason });
+    if (this.state.strategy === 'adaptive' || this.state.adaptive !== undefined) {
+      return refuse('only static runs are supported');
+    }
+    if (this.state.status !== 'FAILED' && this.state.status !== 'BLOCKED') {
+      return refuse(`run status is ${this.state.status}, not FAILED or BLOCKED`);
+    }
+    if (Object.values(this.state.tasks).some((task) =>
+      task.status === 'PENDING' || task.status === 'READY' || task.status === 'RUNNING')) {
+      return refuse('run still contains non-terminal tasks');
+    }
+    const integration = this.state.integration;
+    if (integration.status !== 'PENDING' || integration.integratedTaskCommits.length > 0
+      || (integration.integrationFixCommits?.length ?? 0) > 0 || integration.worktreePath !== undefined
+      || integration.branch !== undefined || integration.headSha !== undefined
+      || integration.currentCommand !== undefined || integration.error !== undefined
+      || integration.preparation !== undefined || (this.state.integrationAttempts?.length ?? 0) > 0) {
+      return refuse('integration has started or has recovery state');
+    }
+    if ((await this.worktrees.listOwned()).some((entry) =>
+      entry.runId === this.state.runId && entry.kind === 'integration')) {
+      return refuse('an integration worktree is registered');
+    }
+
+    const spec = this.config.tasks.find((task) => task.id === taskId);
+    const task = this.state.tasks[taskId];
+    if (spec === undefined || task === undefined) return refuse('task id does not exist in this run');
+    if (!REVIEW_MODES.has(spec.mode) || !['review', 'final_review'].includes(spec.mode)) {
+      return refuse('task mode must be review or final_review');
+    }
+    if (spec.writer) return refuse('review task must be read-only');
+    if (task.status !== 'FAILED' || task.error?.code !== 'REVIEW_BLOCKED') {
+      return refuse('task must be FAILED with error code REVIEW_BLOCKED');
+    }
+    if ((task.reviewOutputRecoveries?.length ?? 0) >= 1) {
+      return refuse('structured-review retry budget is exhausted');
+    }
+    const attempt = task.agentAttempts.at(-1);
+    if (attempt?.outcome !== 'succeeded' || attempt.finishedAt === undefined) {
+      return refuse('last agent attempt must have a completed succeeded process outcome');
+    }
+    if (attempt.agent !== spec.owner) return refuse('last attempt agent does not match the task owner');
+    if (task.commit !== undefined) return refuse('a task commit is already recorded');
+    if (task.handoffPath !== undefined || task.reviewPaths.length > 0 || task.reviewRounds !== 0) {
+      return refuse('an accepted handoff or review already exists');
+    }
+    if (task.handoffOutcome !== 'invalid') return refuse('task does not record rejected structured output');
+    if (task.salvage !== undefined || task.replan !== undefined) return refuse('task has unrelated recovery state');
+    const unsatisfied = spec.dependsOn.filter((id) => {
+      const status = this.state.tasks[id]?.status;
+      return status !== 'SUCCEEDED' && status !== 'SKIPPED';
+    });
+    if (unsatisfied.length > 0) return refuse(`dependencies are no longer satisfied: ${unsatisfied.join(', ')}`);
+    for (const id of spec.dependsOn) {
+      const dependency = this.state.tasks[id]!;
+      if (dependency.status !== 'SKIPPED') continue;
+      const dependencySpec = this.config.tasks.find((candidate) => candidate.id === id);
+      if (dependencySpec?.condition === undefined || dependency.skipReason === undefined
+        || !(await this.evaluateCondition(dependencySpec.condition)).skip
+        || dependency.agentAttempts.length > 0 || dependency.commit !== undefined
+        || dependency.handoffPath !== undefined || dependency.reviewPaths.length > 0
+        || dependency.reviewRounds !== 0 || dependency.worktreePath !== undefined) {
+        return refuse(`skipped dependency ${id} is no longer a pristine conditional skip`);
+      }
+    }
+    if (spec.condition !== undefined && (await this.evaluateCondition(spec.condition)).skip) {
+      return refuse('the current task condition says to skip');
+    }
+    try {
+      const completedRounds = completedReviewRounds(
+        spec,
+        new TaskGraph(this.config.tasks),
+        (id) => this.state.tasks[id]?.status === 'SUCCEEDED',
+      );
+      assertReviewRoundAllowed(completedRounds, this.config.maxReviewRounds);
+    } catch (error) {
+      return refuse(`current review lineage is not eligible: ${errorText(error)}`);
+    }
+    if (task.worktreePath === undefined || task.branch === undefined || task.preparedHeadSha === undefined) {
+      return refuse('preserved task worktree/checkpoint is incomplete');
+    }
+
+    let worktree: OwnedWorktree;
+    try {
+      worktree = await this.worktrees.assertRegistered(task.worktreePath);
+      const listed = (await this.worktrees.listGitWorktrees()).find((entry) => entry.path === worktree.path);
+      if (worktree.kind !== 'task' || worktree.status !== 'active' || worktree.runId !== this.state.runId
+        || worktree.taskId !== taskId || worktree.branch !== task.branch || worktree.baseSha !== this.state.baseSha
+        || listed?.branch !== `refs/heads/${task.branch}`) {
+        return refuse('preserved worktree registration does not match the task checkpoint');
+      }
+      const inspection = await inspectTaskCommits(this.git, worktree.path, this.state.baseSha);
+      if (!inspection.clean) return refuse('preserved read-only worktree is dirty');
+      if (inspection.headSha !== task.preparedHeadSha) return refuse('preserved worktree HEAD moved');
+
+      const expected = this.dependencyCommits(spec);
+      if (inspection.commits.length !== expected.length) {
+        return refuse('prepared history has missing or foreign dependency commits');
+      }
+      const patch = async (sha: string) => (await this.git.run(worktree.path,
+        ['diff', '--binary', '--full-index', '--no-ext-diff', '--no-color', '--no-renames', `${sha}^`, sha])).stdout;
+      for (const [index, sha] of inspection.commits.entries()) {
+        const source = expected[index]!.commitSha;
+        const message = (await this.git.run(worktree.path, ['show', '-s', '--format=%B', sha])).stdout;
+        if (!message.includes(`(cherry picked from commit ${source})`) || await patch(sha) !== await patch(source)) {
+          return refuse('prepared dependency history differs from current dependency commits');
+        }
+      }
+      if (task.preparation !== undefined && (task.preparation.status !== 'SUCCEEDED'
+        || task.preparation.worktreePath !== worktree.path || task.preparation.headSha !== task.preparedHeadSha)) {
+        return refuse('preparation checkpoint is not a completed match');
+      }
+    } catch (error) {
+      return refuse(`preserved worktree checkpoint is invalid: ${errorText(error)}`);
+    }
+
+    const stdoutPath = this.taskAttemptStdoutLogPath(taskId, attempt);
+    try {
+      const details = await lstat(stdoutPath);
+      if (!details.isFile() || details.isSymbolicLink()) return refuse('original agent stdout is not a regular file');
+      const stdout = await readFile(stdoutPath);
+      return {
+        eligible: true,
+        stdoutPath,
+        stdoutSha256: createHash('sha256').update(stdout).digest('hex'),
+      };
+    } catch (error) {
+      return refuse(`original agent stdout is unavailable: ${errorText(error)}`);
+    }
   }
 
   /**

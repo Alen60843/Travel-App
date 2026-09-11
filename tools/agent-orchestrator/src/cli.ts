@@ -24,6 +24,7 @@ Usage:
   pnpm agents:metrics <run-id>
   pnpm agents:recover-handoffs <run-id>
   pnpm agents:retry-agent <run-id> <task-id>
+  pnpm agents:retry-review-output <run-id> <task-id>
   pnpm agents:retry-preflight <run-id> <task-id>
   pnpm agents:propose-replan <run-id> <task-id>
   pnpm agents:authorize-replan <run-id> <proposal-id>
@@ -55,6 +56,10 @@ retry-agent authorizes one additional attempt only for a FAILED agent/process-la
 with no commit, accepted structured artifact, dirty work, or unsatisfied dependency. It
 archives the failure and reopens only dependency-blocked descendants attributable to that
 task. It never invokes an agent itself; run agents:resume afterward.
+retry-review-output authorizes one bounded fresh invocation for a static read-only review or
+final_review task whose process succeeded but whose output failed strict review validation.
+It requires an unchanged pristine prepared worktree and dependency history, archives the
+original error/attempt/stdout hash, and invokes no provider. Run agents:resume afterward.
 retry-preflight rechecks only a static pre-invocation review-round guard failure with
 zero agent attempts and no accepted output. It requires a quiescent terminal run,
 the current condition and review limit to pass, and any prepared worktree to be pristine.
@@ -189,6 +194,25 @@ async function main(argv: readonly string[]): Promise<number> {
       archivedRecovery: result.recovery.recovery,
       reopenedTasks: result.reopenedTasks,
       manualNextStep: 'Run `pnpm agents:resume <run-id>` to execute the authorized retry.',
+    }, null, 2)}\n`);
+    return 0;
+  }
+  if (command === 'retry-review-output') {
+    const [taskId] = extra;
+    if (argument === undefined || taskId === undefined || extra.length !== 1) {
+      process.stderr.write(`${USAGE}\n`);
+      return 1;
+    }
+    const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
+    const result = await AgentOrchestrator.retryReviewOutput(argument, taskId, { repositoryPath });
+    process.stdout.write(`${JSON.stringify({
+      runId: result.orchestrator.snapshot().runId,
+      runStatus: result.orchestrator.snapshot().status,
+      taskId: result.taskId,
+      archivedRecovery: result.recovery.recovery,
+      originalStdoutSha256: result.recovery.stdoutSha256,
+      reopenedTasks: result.reopenedTasks,
+      manualNextStep: 'Run `pnpm agents:resume <run-id>` to execute the authorized review retry.',
     }, null, 2)}\n`);
     return 0;
   }

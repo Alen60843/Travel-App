@@ -95,6 +95,10 @@ test('Claude adapter uses non-interactive safe mode, maps extra_high to xhigh, a
     role: 'final_review',
     access: 'read_only',
     requestedEffort: 'extra_high',
+    requestedModel: 'claude-sonnet-4-6',
+    taskSpecification: {
+      responseSchema: { status: 'approved | changes_requested | blocked', findings: [] },
+    },
   });
   const agent = new ClaudeAgent({
     executable: fixture.executable,
@@ -111,24 +115,50 @@ test('Claude adapter uses non-interactive safe mode, maps extra_high to xhigh, a
   assert.ok(record.args.includes('--no-session-persistence'));
   assert.equal(argumentValue(record.args, '--output-format'), 'text');
   assert.equal(argumentValue(record.args, '--effort'), 'xhigh');
-  assert.equal(argumentValue(record.args, '--permission-mode'), 'plan');
+  assert.equal(argumentValue(record.args, '--permission-mode'), 'dontAsk');
   assert.equal(argumentValue(record.args, '--tools'), 'Read,Glob,Grep');
+  assert.equal(argumentValue(record.args, '--model'), 'claude-sonnet-4-6');
+  assert.equal(record.args.includes('plan'), false);
+  assert.equal(record.args.includes('--dangerously-skip-permissions'), false);
+  assert.equal(record.args.some((arg) => /(?:^|,)(?:Write|Edit|Bash)(?:,|$)/.test(arg)), false);
   assert.equal(record.args.some((arg) => arg.includes('Review the change')), false);
   assert.match(record.stdin, /final_review/);
+  assert.match(record.stdin, /responseSchema/);
+  assert.match(record.stdin, /exactly one JSON object/);
 });
 
-test('Claude writer requests use acceptEdits without bypassing permissions', async () => {
+test('Claude read-only headless invocation can return structured review output without Plan Mode tools', async () => {
+  const fixture = await createFixture('claude-review');
+  const agent = new ClaudeAgent({ executable: fixture.executable, environment: fixture.environment });
+
+  const result = await agent.run(makeRequest(fixture, {
+    role: 'review', access: 'read_only',
+    taskSpecification: { responseSchema: { status: 'approved', findings: [] } },
+  }));
+
+  assert.equal(result.status, 'succeeded');
+  assert.deepEqual(result.structuredHandoff, { status: 'approved', findings: [] });
+  const record = await readRecord(fixture.recordPath);
+  assert.equal(argumentValue(record.args, '--permission-mode'), 'dontAsk');
+  assert.equal(argumentValue(record.args, '--tools'), 'Read,Glob,Grep');
+});
+
+test('Claude writer requests keep acceptEdits, default tools, model, and effort without bypassing permissions', async () => {
   const fixture = await createFixture();
   const agent = new ClaudeAgent({
     executable: fixture.executable,
     environment: fixture.environment,
   });
 
-  await agent.run(makeRequest(fixture, { role: 'implementation' }));
+  await agent.run(makeRequest(fixture, {
+    role: 'implementation', requestedEffort: 'medium', requestedModel: 'claude-opus-4-1',
+  }));
 
   const record = await readRecord(fixture.recordPath);
   assert.equal(argumentValue(record.args, '--permission-mode'), 'acceptEdits');
   assert.equal(argumentValue(record.args, '--tools'), 'default');
+  assert.equal(argumentValue(record.args, '--effort'), 'medium');
+  assert.equal(argumentValue(record.args, '--model'), 'claude-opus-4-1');
   assert.equal(record.args.includes('--dangerously-skip-permissions'), false);
 });
 
@@ -508,6 +538,14 @@ process.stdin.on('end', () => {
   if (mode === 'fenced') {
     const fence = String.fromCharCode(96, 96, 96);
     process.stdout.write(fence + 'json\\n' + ${JSON.stringify(handoff)} + '\\n' + fence + '\\n');
+    return;
+  }
+  if (mode === 'claude-review') {
+    if (process.argv.includes('plan')) {
+      process.stdout.write('I completed the review but cannot exit plan mode.\\n');
+      return;
+    }
+    process.stdout.write(JSON.stringify({ status: 'approved', findings: [] }) + '\\n');
     return;
   }
   process.stdout.write(${JSON.stringify(handoff)} + '\\n');
