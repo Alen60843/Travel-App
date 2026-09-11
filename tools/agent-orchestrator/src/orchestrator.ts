@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 
 import {
@@ -217,6 +217,14 @@ export interface AgentFailureRetryResult {
   readonly taskId: string;
   readonly recovery: AgentFailureRecoveryState;
   readonly reopenedTasks: readonly string[];
+}
+
+export interface PreflightRetryResult {
+  readonly orchestrator: AgentOrchestrator;
+  readonly taskId: string;
+  readonly reopenedTasks: readonly string[];
+  readonly completedRounds: number;
+  readonly maxReviewRounds: number;
 }
 
 /** Result of AgentOrchestrator.salvageTask. */
@@ -704,6 +712,63 @@ export class AgentOrchestrator {
       reopenedTasks,
     });
     return { orchestrator, taskId, recovery, reopenedTasks };
+  }
+
+  /** Reconsider only a static review-round guard failure before any invocation. */
+  static async retryPreflight(
+    runId: string,
+    taskId: string,
+    options: OrchestratorOptions,
+  ): Promise<PreflightRetryResult> {
+    const repositoryRoot = await (options.git ?? new GitClient()).repositoryRoot(resolve(options.repositoryPath));
+    const store = new StateStore(resolve(options.runsRoot ?? join(repositoryRoot, 'tools/agent-orchestrator/runs')), runId);
+    return store.withPreflightRetryLock(async () => {
+      // Reject adaptive runs before loading can reconcile dynamic lifecycle.
+      const original = await store.load();
+      if (original.strategy === 'adaptive' || original.adaptive !== undefined) {
+        throw new OrchestratorError('TASK_STATE_INVALID', 'Preflight retry supports static runs only');
+      }
+      const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options);
+      const completedRounds = await orchestrator.checkPreflightRetryEligibility(taskId);
+      const reopenedTasks = orchestrator.dependencyOnlyDescendantsToReopen(taskId);
+      for (const id of reopenedTasks) {
+        const descendant = orchestrator.state.tasks[id]!;
+        if (descendant.reviewRounds !== 0 || descendant.preparation !== undefined || descendant.salvage !== undefined
+          || (descendant.agentFailureRecoveries?.length ?? 0) > 0) {
+          throw new OrchestratorError('TASK_STATE_INVALID', `Dependency-blocked task ${id} contains execution evidence`);
+        }
+      }
+      const previous = orchestrator.state.tasks[taskId]!;
+      if (JSON.stringify(await store.load()) !== JSON.stringify(orchestrator.state)) {
+        throw new OrchestratorError('TASK_STATE_INVALID', 'Run changed during preflight eligibility checks');
+      }
+      // Durably archive authorization and the complete terminal context BEFORE
+      // clearing current errors. If saving fails, the task remains terminal and
+      // retry-preflight can safely be repeated. No worktree is removed or reset.
+      await orchestrator.event('PREFLIGHT_RETRY_AUTHORIZED', taskId, {
+        recoveryMode: 'review_preflight_retry', previousErrorCode: previous.error!.code,
+        previousRunStatus: orchestrator.state.status, previousTask: previous,
+        completedRounds, maxReviewRounds: orchestrator.config.maxReviewRounds, reopenedTasks,
+      });
+      await orchestrator.mutate((state) => {
+        const tasks = { ...state.tasks };
+        const { error: _error, finishedAt: _finished, startedAt: _started, ...target } = tasks[taskId]!;
+        tasks[taskId] = { ...target, status: 'PENDING' };
+        for (const id of reopenedTasks) {
+          const { error: _dependencyError, finishedAt: _dependencyFinished, ...descendant } = tasks[id]!;
+          tasks[id] = { ...descendant, status: 'PENDING' };
+        }
+        const statuses = new TaskScheduler(orchestrator.config.tasks, orchestrator.config.concurrency,
+          taskStatusRecord({ ...state, tasks })).snapshot();
+        for (const id of [taskId, ...reopenedTasks]) tasks[id] = { ...tasks[id]!, status: statuses[id]! };
+        return { ...state, status: 'RUNNING', tasks };
+      });
+      for (const id of reopenedTasks) {
+        await orchestrator.event('TASK_DEPENDENCY_REOPENED', id, { recoveredDependency: taskId });
+      }
+      await orchestrator.event('RUN_RESUMED', undefined, { recoveryMode: 'review_preflight_retry', taskId, reopenedTasks });
+      return { orchestrator, taskId, reopenedTasks, completedRounds, maxReviewRounds: orchestrator.config.maxReviewRounds };
+    });
   }
 
   /**
@@ -3456,6 +3521,126 @@ export class AgentOrchestrator {
       'logs',
       `${this.state.runId}.${taskId}.${attempt.agent}.attempt-${attempt.attempt}.stdout.log`,
     );
+  }
+
+  /** Read-only checks for the single supported pre-invocation guard failure. */
+  private async checkPreflightRetryEligibility(taskId: string): Promise<number> {
+    const refuse = (reason: string): never => {
+      throw new OrchestratorError('TASK_STATE_INVALID', `Refusing preflight retry for ${taskId}: ${reason}`,
+        { details: { runId: this.state.runId, taskId, reason } });
+    };
+    if (!['FAILED', 'BLOCKED'].includes(this.state.status)) refuse('run must be terminal FAILED or BLOCKED');
+    if (Object.values(this.state.tasks).some((task) => ['PENDING', 'READY', 'RUNNING'].includes(task.status))) {
+      refuse('run contains non-terminal tasks');
+    }
+    const integration = this.state.integration;
+    if (integration.status !== 'PENDING' || integration.integratedTaskCommits.length > 0
+      || (integration.integrationFixCommits?.length ?? 0) > 0 || integration.worktreePath !== undefined
+      || integration.branch !== undefined || integration.headSha !== undefined || integration.currentCommand !== undefined
+      || integration.error !== undefined || integration.preparation !== undefined || (this.state.integrationAttempts?.length ?? 0) > 0) {
+      refuse('integration has started or has recovery state');
+    }
+    const task = this.config.tasks.find((candidate) => candidate.id === taskId);
+    const state = this.state.tasks[taskId];
+    if (task === undefined || state === undefined) return refuse('task is absent from persisted config/state');
+    if (!['FAILED', 'BLOCKED'].includes(state.status) || state.error?.code !== 'BLOCKED_FOR_HUMAN_REVIEW'
+      || !REVIEW_MODES.has(task.mode) || task.writer) {
+      refuse('requires a terminal read-only review-budget guard failure');
+    }
+    if (state.agentAttempts.length !== 0 || state.reviewRounds !== 0 || state.commit !== undefined
+      || state.handoffPath !== undefined || state.reviewPaths.length > 0 || state.handoffOutcome !== undefined
+      || state.handoffRepairAttempts.length > 0 || state.salvage !== undefined || state.skipReason !== undefined
+      || (state.agentFailureRecoveries?.length ?? 0) > 0) {
+      refuse('task contains invocation or structured-output evidence');
+    }
+    const exists = async (path: string): Promise<boolean> => {
+      try { await lstat(path); return true; } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+        throw error;
+      }
+    };
+    for (const directory of ['handoffs', 'reviews']) {
+      if (await exists(join(this.stateStore.runDirectory, directory, `${taskId}.json`))) refuse('a task artifact already exists on disk');
+    }
+    if (task.dependsOn.some((id) => !['SUCCEEDED', 'SKIPPED'].includes(this.state.tasks[id]?.status ?? ''))) {
+      refuse('dependencies are no longer satisfied');
+    }
+    for (const id of task.dependsOn) {
+      const dependency = this.state.tasks[id]!;
+      if (dependency.status !== 'SKIPPED') continue;
+      const condition = this.config.tasks.find((candidate) => candidate.id === id)?.condition;
+      if (condition === undefined || dependency.skipReason === undefined || !(await this.evaluateCondition(condition)).skip
+        || dependency.agentAttempts.length > 0 || dependency.commit !== undefined || dependency.handoffPath !== undefined
+        || dependency.reviewPaths.length > 0 || dependency.reviewRounds !== 0 || dependency.worktreePath !== undefined) {
+        refuse('a skipped dependency is not a pristine conditional skip');
+      }
+    }
+    if (task.condition !== undefined && (await this.evaluateCondition(task.condition)).skip) {
+      refuse('the current task condition says to skip');
+    }
+    const completedRounds = completedReviewRounds(task, new TaskGraph(this.config.tasks),
+      (id) => this.state.tasks[id]?.status === 'SUCCEEDED');
+    assertReviewRoundAllowed(completedRounds, this.config.maxReviewRounds);
+
+    const owned = await this.worktrees.listOwned();
+    if (owned.some((entry) => entry.runId === this.state.runId && entry.kind === 'integration')) {
+      refuse('an integration worktree is registered');
+    }
+    const branch = `agent/${this.state.runId}/${taskId}`;
+    const expectedPath = join(this.worktrees.ownedRoot, `${this.state.runId}-task-${taskId}`);
+    if (state.worktreePath === undefined) {
+      if (state.branch !== undefined || state.preparedHeadSha !== undefined || state.preparation !== undefined
+        || owned.some((entry) => entry.runId === this.state.runId && entry.taskId === taskId)
+        || await exists(expectedPath)
+        || (await this.git.run(this.repositoryRoot, ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], { allowFailure: true })).exitCode === 0) {
+        refuse('incomplete or orphaned worktree checkpoint');
+      }
+      return completedRounds;
+    }
+    if (state.worktreePath !== expectedPath || state.branch !== branch || state.preparedHeadSha === undefined) {
+      return refuse('prepared worktree checkpoint is incomplete or mismatched');
+    }
+    const worktree = await this.worktrees.assertRegistered(state.worktreePath);
+    const listed = (await this.worktrees.listGitWorktrees()).find((entry) => entry.path === worktree.path);
+    const directory = await lstat(worktree.path);
+    if (worktree.kind !== 'task' || worktree.status !== 'active' || worktree.runId !== this.state.runId
+      || worktree.taskId !== taskId || worktree.branch !== branch || worktree.baseSha !== this.state.baseSha
+      || worktree.baseBranch !== this.state.baseBranch || listed?.branch !== `refs/heads/${branch}`
+      || directory.isSymbolicLink() || !directory.isDirectory()) {
+      refuse('worktree registration does not match this task');
+    }
+    const inspection = await inspectTaskCommits(this.git, worktree.path, this.state.baseSha);
+    if (!inspection.clean || inspection.headSha !== state.preparedHeadSha) refuse('prepared worktree is dirty or HEAD moved');
+    // Ignored bootstrap output (e.g. node_modules) is retained, never deleted.
+    // Ordinary untracked files are included in inspectTaskCommits' clean check.
+    for (const marker of ['CHERRY_PICK_HEAD', 'MERGE_HEAD', 'REVERT_HEAD']) {
+      if ((await this.git.run(worktree.path, ['rev-parse', '--verify', '--quiet', marker], { allowFailure: true })).exitCode === 0) {
+        refuse('prepared worktree contains an unfinished Git operation');
+      }
+    }
+    const gitDirectory = (await this.git.run(worktree.path, ['rev-parse', '--absolute-git-dir'])).stdout.trim();
+    for (const marker of ['rebase-apply', 'rebase-merge', 'sequencer']) {
+      if (await exists(join(gitDirectory, marker))) refuse('prepared worktree contains an unfinished Git operation');
+    }
+    if (state.preparation !== undefined && (state.preparation.status !== 'SUCCEEDED'
+      || state.preparation.worktreePath !== worktree.path || state.preparation.headSha !== state.preparedHeadSha)) {
+      refuse('preparation checkpoint is not a completed match');
+    }
+    if (!canReuseIntegrationPreparation(state.preparation, worktree.path, state.preparedHeadSha, this.config.agentWorktree.prepare.length)) {
+      refuse('prepared environment cannot be reused by normal prepareTask');
+    }
+    const expected = this.dependencyCommits(task);
+    if (inspection.commits.length !== expected.length) refuse('prepared history has missing or foreign dependency commits');
+    for (const [index, sha] of inspection.commits.entries()) {
+      const source = expected[index]!.commitSha;
+      const message = (await this.git.run(worktree.path, ['show', '-s', '--format=%B', sha])).stdout;
+      const patch = async (commit: string) => (await this.git.run(worktree.path,
+        ['diff', '--binary', '--full-index', '--no-ext-diff', '--no-color', '--no-renames', `${commit}^`, commit])).stdout;
+      if (!message.includes(`(cherry picked from commit ${source})`) || await patch(sha) !== await patch(source)) {
+        refuse('prepared dependency history differs from canonical dependency commits');
+      }
+    }
+    return completedRounds;
   }
 
   /**

@@ -22,6 +22,7 @@ Usage:
   pnpm agents:metrics <run-id>
   pnpm agents:recover-handoffs <run-id>
   pnpm agents:retry-agent <run-id> <task-id>
+  pnpm agents:retry-preflight <run-id> <task-id>
   pnpm agents:salvage-task <run-id> <task-id>
   pnpm agents:verify-blocked-task <run-id> <task-id>
   pnpm agents:authorize-recovery-policy <run-id> <policy-file>
@@ -41,6 +42,10 @@ retry-agent authorizes one additional attempt only for a FAILED agent/process-la
 with no commit, accepted structured artifact, dirty work, or unsatisfied dependency. It
 archives the failure and reopens only dependency-blocked descendants attributable to that
 task. It never invokes an agent itself; run agents:resume afterward.
+retry-preflight rechecks only a static pre-invocation review-round guard failure with
+zero agent attempts and no accepted output. It requires a quiescent terminal run,
+the current condition and review limit to pass, and any prepared worktree to be pristine.
+It reopens scheduler state without running agents; inspect, then run agents:resume.
 verify-blocked-task explicitly verifies a valid blocked writer from the host CLI using
 salvage.verify in its preserved worktree, retaining the original blocked handoff. It
 invokes no agent, rejects adaptive runs, and requires agents:resume afterward.
@@ -104,6 +109,25 @@ async function main(argv: readonly string[]): Promise<number> {
       runStatus: orchestrator.snapshot().status,
       integrationFixCommits: orchestrator.snapshot().integration.integrationFixCommits ?? [],
       manualNextStep: 'Run `pnpm agents:resume <run-id>` to actually re-run the deterministic gate.',
+    }, null, 2)}\n`);
+    return 0;
+  }
+  if (command === 'retry-preflight') {
+    const [taskId] = extra;
+    if (argument === undefined || taskId === undefined || extra.length !== 1) {
+      process.stderr.write(`${USAGE}\n`);
+      return 1;
+    }
+    const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
+    const result = await AgentOrchestrator.retryPreflight(argument, taskId, { repositoryPath });
+    process.stdout.write(`${JSON.stringify({
+      runId: result.orchestrator.snapshot().runId,
+      runStatus: result.orchestrator.snapshot().status,
+      taskId: result.taskId,
+      reopenedTasks: result.reopenedTasks,
+      completedRounds: result.completedRounds,
+      maxReviewRounds: result.maxReviewRounds,
+      manualNextStep: `Inspect the reopened task, then run pnpm agents:resume ${argument}`,
     }, null, 2)}\n`);
     return 0;
   }
