@@ -86,6 +86,7 @@ describe('ChatGateway (real Nest frames, PostgreSQL and two-instance Redis)', ()
   const clients: WireClient[] = [];
   const rooms: string[] = [];
   const users: string[] = [];
+  const events: string[] = [];
   let a: string;
   let b: string;
   let outsider: string;
@@ -128,12 +129,19 @@ describe('ChatGateway (real Nest frames, PostgreSQL and two-instance Redis)', ()
     for (const app of apps.splice(0)) await app.close();
     if (!AppDataSource.isInitialized) return;
     await AppDataSource.transaction(async (manager) => {
+      if (events.length) {
+        // Existing EVENT fixture cleanup convention; trigger changes roll back on failure.
+        await manager.query('ALTER TABLE event_status_history DISABLE TRIGGER event_status_history_append_only');
+        await manager.query('DELETE FROM event_status_history WHERE event_id = ANY($1::uuid[])', [events]);
+        await manager.query('DELETE FROM events WHERE id = ANY($1::uuid[])', [events]);
+        await manager.query('ALTER TABLE event_status_history ENABLE TRIGGER event_status_history_append_only');
+      }
       await manager.query(`DELETE FROM matches WHERE chat_room_id = ANY($1::uuid[])`, [rooms]);
       await manager.query(`DELETE FROM chat_rooms WHERE id = ANY($1::uuid[])`, [rooms]);
       await manager.query(`DELETE FROM users WHERE id = ANY($1::uuid[])`, [users]);
     });
     if (cache?.status === 'ready' && users.length) await cache.del(...users.map((id) => `presence:v1:${id}`));
-    rooms.length = users.length = 0;
+    rooms.length = users.length = events.length = 0;
   });
   afterAll(async () => {
     cache?.disconnect();
@@ -173,6 +181,102 @@ describe('ChatGateway (real Nest frames, PostgreSQL and two-instance Redis)', ()
   const join = async (wire: WireClient, id = roomId) => {
     expect(await wire.request('chat:join', { roomId: id })).toMatchObject({ ok: true, data: { id } });
   };
+
+  async function eventRoom() {
+    const [event] = await AppDataSource.query(
+      `INSERT INTO events (host_type, host_user_id, category_id, title, capacity_max, status,
+         starts_at, ends_at, meeting_point)
+       VALUES ('USER', $1, (SELECT id FROM event_categories WHERE is_active ORDER BY id LIMIT 1),
+         'EVENT transport test', 4, 'ACTIVE', '2090-01-01T10:00:00Z', '2090-01-01T12:00:00Z',
+         ST_SetSRID(ST_MakePoint(35.235, 31.778), 4326)::geography) RETURNING id`, [a],
+    );
+    events.push(event.id);
+    // Fixture only: host has no participant row; the durable service owns policy.
+    await AppDataSource.query('INSERT INTO event_participants (event_id, user_id) VALUES ($1, $2)', [event.id, b]);
+    const [room] = await AppDataSource.query(
+      "INSERT INTO chat_rooms (type, event_id) VALUES ('EVENT', $1) RETURNING id", [event.id],
+    );
+    rooms.push(room.id);
+    roomId = room.id;
+    await AppDataSource.query('INSERT INTO chat_members (room_id, user_id) VALUES ($1, $2), ($1, $3)', [roomId, a, b]);
+    return event.id as string;
+  }
+
+  it('supports EVENT host/member fanout across active states and retained reads after completion', async () => {
+    const eventId = await eventRoom();
+    const first = await instance();
+    const second = await instance();
+    await until(async () => await first.gateway.server.sockets.adapter.serverCount() === 2);
+    const host = await client(first.port, a);
+    const participant = await client(second.port, b);
+    const stranger = await client(second.port, outsider);
+    await join(host);
+    await join(participant);
+    expect(await stranger.request('chat:join', { roomId }))
+      .toMatchObject({ ok: false, error: { code: 'CHAT_ROOM_FORBIDDEN' } });
+    let seq = 0;
+    for (const status of ['ACTIVE', 'FULL', 'IN_PROGRESS']) {
+      await AppDataSource.query('UPDATE events SET status = $2::event_status WHERE id = $1', [eventId, status]);
+      for (const wire of [host, participant]) {
+        expect(await wire.request('chat:send', sendInput(status))).toMatchObject({ ok: true, data: { seq: ++seq } });
+      }
+      await until(() => host.messages.length === seq && participant.messages.length === seq);
+    }
+    await AppDataSource.query("UPDATE events SET status = 'COMPLETED', completed_at = now() WHERE id = $1", [eventId]);
+    for (const wire of [host, participant]) {
+      await join(wire);
+      expect(await wire.request('chat:catch-up', { roomId, afterSeq: 0 }))
+        .toMatchObject({ ok: true, data: { highWaterSeq: seq, nextAfterSeq: seq } });
+      for (const key of ['IN_PROGRESS', 'after-completion']) {
+        expect(await wire.request('chat:send', sendInput(key)))
+          .toMatchObject({ ok: false, error: { code: 'CHAT_ROOM_FORBIDDEN' } });
+      }
+    }
+    expect(await first.chat.authorizeRoom(a, roomId)).toMatchObject({ lastSeq: seq });
+    await pause(100);
+    expect(host.messages).toHaveLength(seq);
+    expect(participant.messages).toHaveLength(seq);
+    expect(stranger.messages).toEqual([]);
+  });
+
+  it.each(['cancellation', 'participant', 'membership', 'account'])
+  ('denies stale EVENT recipients after %s while using current durable policy', async (policy) => {
+    const eventId = await eventRoom();
+    const first = await instance();
+    const second = await instance();
+    await until(async () => await first.gateway.server.sockets.adapter.serverCount() === 2);
+    const host = await client(first.port, a);
+    const participant = await client(second.port, b);
+    await join(participant);
+    expect(await host.request('chat:send', sendInput('before'))).toMatchObject({ ok: true });
+    await until(() => participant.messages.length === 1);
+    const socket = [...second.gateway.server.sockets.sockets.values()][0]!;
+    if (policy === 'cancellation') await AppDataSource.query(
+      "UPDATE events SET status = 'CANCELLED', cancelled_at = now() WHERE id = $1", [eventId],
+    );
+    if (policy === 'participant') await AppDataSource.query(
+      "UPDATE event_participants SET cancelled_at = now(), attendance_status = 'CANCELLED' WHERE event_id = $1 AND user_id = $2", [eventId, b],
+    );
+    if (policy === 'membership') await AppDataSource.query(
+      'UPDATE chat_members SET left_at = now() WHERE room_id = $1 AND user_id = $2', [roomId, b],
+    );
+    if (policy === 'account') await AppDataSource.query("UPDATE users SET account_status = 'SUSPENDED' WHERE id = $1", [b]);
+    expect(socket.rooms.has(chatRoom(roomId))).toBe(true);
+    first.gateway.server.serverSideEmit('chat:committed', { roomId, seq: 1 });
+    await until(() => !socket.rooms.has(chatRoom(roomId)));
+    expect(await host.request('chat:send', sendInput('after'))).toMatchObject(policy === 'cancellation'
+      ? { ok: false, error: { code: 'CHAT_ROOM_FORBIDDEN' } }
+      : { ok: true, data: { seq: 2 } });
+    for (const wire of policy === 'cancellation' ? [host, participant] : [participant]) {
+      for (const [event, input] of [
+        ['chat:join', { roomId }], ['chat:catch-up', { roomId, afterSeq: 0 }], ['chat:send', sendInput('denied')],
+      ] as const) {
+        expect(await wire.request(event, input)).toMatchObject({ ok: false, error: { code: 'CHAT_ROOM_FORBIDDEN' } });
+      }
+    }
+    await pause(100);
+    expect(participant.messages.map((message) => message.body)).toEqual(['before']);
+  });
 
   it('binds real acks, rejects outsiders/spoofing and delivers locally and over Redis without cross-room leakage', async () => {
     const first = await instance();

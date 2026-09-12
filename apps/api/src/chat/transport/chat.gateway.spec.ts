@@ -139,16 +139,51 @@ describe('chat transport boundaries', () => {
     expect(socket.emit).toHaveBeenCalledWith('chat:message', message);
   });
 
-  it('fails closed on EVENT transport until N1 implements event lifecycle authorization', async () => {
+  it('allows EVENT joins, sends, catch-up and committed delivery authorized by ChatService', async () => {
     const { chat, gateway, client, receive, socket } = fixture();
-    chat.authorizeRoom.mockResolvedValue({ type: 'EVENT' });
-    for (const result of [await gateway.join(client, { roomId }), await gateway.send(client, input), await gateway.catchUp(client, { roomId, afterSeq: 0 })]) {
-      expect(result).toMatchObject({ ok: false, error: { code: 'CHAT_ROOM_UNSUPPORTED' } });
-    }
+    chat.authorizeRoom.mockResolvedValue({ id: roomId, type: 'EVENT' });
+    expect(await gateway.join(client, { roomId })).toMatchObject({ ok: true, data: { type: 'EVENT' } });
+    expect(socket.join).toHaveBeenCalledWith(chatRoom(roomId));
+    expect(await gateway.send(client, input)).toEqual({ ok: true, data: message });
+    expect(await gateway.catchUp(client, { roomId, afterSeq: 0 }))
+      .toMatchObject({ ok: true, data: { messages: [message] } });
+    await tick();
+    socket.emit.mockClear();
     receive({ roomId, seq: 1 });
     await tick();
+    expect(socket.emit).toHaveBeenCalledWith('chat:message', message);
+  });
+
+  it('preserves EVENT read access when durable sending is forbidden, without publishing', async () => {
+    const { chat, gateway, client, server, socket } = fixture();
+    chat.authorizeRoom.mockResolvedValue({ id: roomId, type: 'EVENT' });
+    chat.sendMessage.mockRejectedValue(forbidden);
+    expect(await gateway.join(client, { roomId })).toMatchObject({ ok: true });
+    expect(await gateway.catchUp(client, { roomId, afterSeq: 0 })).toMatchObject({ ok: true });
+    expect(await gateway.send(client, input)).toMatchObject({ ok: false, error: { code: 'CHAT_ROOM_FORBIDDEN' } });
+    expect(server.serverSideEmit).not.toHaveBeenCalled();
     expect(socket.emit).not.toHaveBeenCalled();
-    expect(chat.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it.each(['catch-up', 'delivery'])('rejects EVENT revocation during %s history loading', async (operation) => {
+    const { chat, gateway, client, receive, socket } = fixture();
+    chat.authorizeRoom.mockResolvedValue({ id: roomId, type: 'EVENT' });
+    const history = deferred<{ messages: typeof message[] }>();
+    chat.history.mockReturnValueOnce(history.promise);
+    const pending = operation === 'catch-up'
+      ? gateway.catchUp(client, { roomId, afterSeq: 0 })
+      : receive({ roomId, seq: 1 });
+    await tick();
+    expect(chat.history).toHaveBeenCalled();
+    chat.authorizeRoom.mockRejectedValue(forbidden);
+    history.resolve({ messages: [message] });
+    if (operation === 'catch-up') {
+      expect(await pending).toMatchObject({ ok: false, error: { code: 'CHAT_ROOM_FORBIDDEN' } });
+    } else {
+      await tick();
+      expect(socket.leave).toHaveBeenCalledWith(chatRoom(roomId));
+    }
+    expect(socket.emit).not.toHaveBeenCalled();
   });
 });
 

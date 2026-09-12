@@ -18,7 +18,6 @@ const errors: Partial<Record<ChatErrorCode, string>> = {
   VALIDATION_FAILED: 'Invalid chat request.',
   CHAT_ROOM_FORBIDDEN: 'This chat room is unavailable.',
   CHAT_MESSAGE_CONFLICT: 'This clientMessageId was used for a different message.',
-  CHAT_ROOM_UNSUPPORTED: 'Event chat is not available yet.',
 };
 
 @WebSocketGateway()
@@ -38,7 +37,7 @@ export class ChatGateway implements OnGatewayInit {
     return this.reply(async () => {
       const userId = this.userId(socket);
       const { roomId } = parseChat(roomRequest, input);
-      const room = await this.authorize(userId, roomId);
+      const room = await this.chat.authorizeRoom(userId, roomId);
       if (socket.connected) await socket.join(chatRoom(roomId));
       return room;
     });
@@ -49,7 +48,7 @@ export class ChatGateway implements OnGatewayInit {
     return this.reply(async () => {
       const userId = this.userId(socket);
       const { roomId, message } = parseChat(sendRequest, input);
-      await this.authorize(userId, roomId);
+      await this.chat.authorizeRoom(userId, roomId);
       // N1 resolves only after COMMIT, including identical retry lookups.
       const committed = await this.chat.sendMessage(userId, roomId, message);
       // Fanout is best-effort and cannot change the durable success ack.
@@ -63,10 +62,10 @@ export class ChatGateway implements OnGatewayInit {
     return this.reply(async () => {
       const userId = this.userId(socket);
       const { roomId, ...query } = parseChat(catchUpRequest, input);
-      await this.authorize(userId, roomId);
+      await this.chat.authorizeRoom(userId, roomId);
       const page = await this.chat.history(userId, roomId, query);
       // History uses a snapshot; recheck after loading, before content leaves.
-      await this.authorize(userId, roomId);
+      await this.chat.authorizeRoom(userId, roomId);
       return page;
     });
   }
@@ -95,21 +94,13 @@ export class ChatGateway implements OnGatewayInit {
         const userId = this.userId(socket);
         const page = await this.chat.history(userId, roomId, { afterSeq: seq - 1, limit: 1 });
         const message = page.messages.find((candidate) => candidate.roomId === roomId && candidate.seq === seq);
-        await this.authorize(userId, roomId);
+        await this.chat.authorizeRoom(userId, roomId);
         if (message && socket.connected && socket.rooms.has(room)) socket.emit('chat:message', message);
       } catch {
         // Cleanup is local and optional for security: every delivery rechecks.
         await Promise.resolve(socket.leave(room)).catch(() => undefined);
       }
     }
-  }
-
-  private async authorize(userId: string, roomId: string) {
-    const room = await this.chat.authorizeRoom(userId, roomId);
-    // N1 has no EVENT lifecycle policy yet. Do not duplicate it in a gateway
-    // or enable content delivery which cancellation could not revoke.
-    if (room.type === 'EVENT') throw new AppError('CHAT_ROOM_UNSUPPORTED', errors.CHAT_ROOM_UNSUPPORTED!);
-    return room;
   }
 
   private userId(socket: ChatSocket): string {
