@@ -259,6 +259,8 @@ test('required verification failure preserves original handoff and candidate wit
     assert.equal(after.tasks.writer!.status, 'BLOCKED');
     assert.equal(after.tasks.writer!.commit, undefined);
     assert.equal(after.tasks.writer!.salvage!.verification, undefined);
+    assert.equal(after.tasks.writer!.salvage!.phase, 'FAILED');
+    assert.equal(after.tasks.writer!.salvage!.failures?.at(-1)?.reason, 'verify_command_failed');
     assert.equal(await computeTrackedDiffFingerprint(s.fixture.git, s.worktree.path, after.baseSha), fingerprint);
     assert.equal(await readFile(s.originalPath, 'utf8'), s.originalBytes);
     assert.ok((await events(s)).some((event) => event.name === 'SALVAGE_COMMAND_FINISHED'));

@@ -235,6 +235,7 @@ test('AGENT_TIMEOUT + dirty diff fully inside ownership: successful salvage auth
     assert.equal(after.tasks['timed-out-task']?.commit?.sha, result.commitSha);
     assert.deepEqual(after.tasks['timed-out-task']?.commit?.changedFiles, ['feature.txt']);
     assert.equal(after.tasks['timed-out-task']?.salvage?.verification?.result, 'passed');
+    assert.equal(after.tasks['timed-out-task']?.salvage?.phase, 'VERIFIED');
   } finally {
     await scenario.fixture.dispose();
   }
@@ -382,6 +383,10 @@ test('a required salvage.verify command failure (tracked source unchanged) preve
         return true;
       },
     );
+    const failed = (await scenario.orchestrator.stateStore.load()).tasks['timed-out-task']!.salvage;
+    assert.equal(failed?.phase, 'FAILED');
+    assert.equal(failed?.verification, undefined);
+    assert.equal(failed?.failures?.at(-1)?.reason, 'verify_command_failed');
   } finally {
     await scenario.fixture.dispose();
   }

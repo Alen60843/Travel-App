@@ -1,6 +1,6 @@
-# Static scope-gap replanning v1
+# Static scope-gap replanning
 
-This host CLI recovery flow completes partial work when a blocked static implementation writer's accepted handoff requests a bounded implementation outside its ownership. It retains the static strategy and the frozen `phase.yaml`. It neither uses AdaptiveCoordinator nor accepts arbitrary DAG edits.
+This host CLI recovery flow completes partial work when a blocked static implementation or testing writer's accepted handoff requests a bounded implementation outside its ownership. It retains the static strategy and the frozen `phase.yaml`. It neither uses AdaptiveCoordinator nor accepts arbitrary DAG edits.
 
 ```sh
 pnpm agents:propose-replan <run-id> <source-task-id>
@@ -10,6 +10,8 @@ pnpm agents:authorize-replan <run-id> <proposal-id>
 pnpm agents:resume <run-id>
 ```
 
+For a legacy handoff that needs bounded interpretation, authorize a content-hashed record first with `pnpm agents:interpret-replan <run-id> <source-task-id> <interpretation-file>`. A legacy salvage attempt whose event and command logs prove a terminal required-command failure must first be finalized with `pnpm agents:finalize-failed-salvage <run-id> <source-task-id>`. Both commands invoke zero providers and leave the source worktree and handoff untouched.
+
 Proposal and authorization invoke no providers and execute no tasks. Proposal **does persist metadata and an event**, so it is not a wholly read-only command. Authorization creates a source checkpoint; only subsequent normal execution runs the follow-up and verification. Every risk level, including high/critical, requires an explicit host authorization call. No handoff field or agent-produced draft can grant authority. These are local operator commands, not an authenticated multi-user service.
 
 ## Proposal contract
@@ -17,9 +19,9 @@ Proposal and authorization invoke no providers and execute no tasks. Proposal **
 V1 requires all of the following:
 
 - A `BLOCKED` static run with no integration history/worktree, running/ready tasks, unfinished attempts, or live recorded agent PIDs. Pristine pending tasks whose dependencies remain unsatisfied are allowed.
-- A blocked `implementation` writer with `REVIEW_BLOCKED`, a completed successful process attempt, a valid blocked handoff, a registered worktree, a prepared HEAD, and no canonical commit or salvage authorization.
+- A blocked `implementation` writer with `REVIEW_BLOCKED`, a completed successful process attempt, a valid blocked handoff, a registered worktree, a prepared HEAD, and no canonical commit. A salvage-bearing source must carry an exact terminal `FAILED` record; verified, authorized, verifying, and ambiguous legacy salvage remains ineligible.
 - The exact canonical `handoffs/<source-id>.json` path must equal the source's persisted `handoffPath`. The artifact must be a bounded regular file, with no symlink escape. Raw bytes are SHA-256 hashed and parsed through the existing handoff/WorkRequestDraft schemas.
-- Exactly one additional implementation request. Only repository resource claims are supported. Write claims become follow-up ownership and must be nonempty and disjoint from source ownership. Read claims remain explicit context, not write permission. Request dependencies must be existing source ancestors. Evidence must identify in-scope worktree files or an exactly matching handoff test whose persisted result is `pass`; failed, not-run, missing, unsafe, or unsupported references fail closed.
+- Exactly one additional implementation request, unless a v2 interpretation explicitly selects one raw request by index. Only repository resource claims are supported. Write claims become follow-up ownership and must be nonempty and disjoint from source ownership. Read claims remain explicit context, not write permission. Request dependencies must be existing source ancestors. Evidence must identify in-scope worktree files or an exactly matching handoff test whose persisted result is `pass`; failed, not-run, missing, unsafe, or unsupported references fail closed.
 - All source ancestors are successful or legitimately skipped. The prepared history must reproduce those canonical input patches. HEAD must still equal the prepared checkpoint. The nonempty dirty candidate must stay inside source ownership and match the handoff's changed-file set.
 - The source must have an existing direct downstream review. Reviews receiving a new dependency and their direct future correction tasks receiving union ownership must have no attempts, preparation, worktree, commit, artifacts, review rounds, or recovery evidence. They must be dependency-failure blocked or pending.
 - The complete proposed effective graph passes TaskGraph and parallel ownership checks. Required `salvage.verify` commands must already be configured; agent prose never supplies executable verification commands.
@@ -35,6 +37,14 @@ Historical blocked handoffs may label a repository test-file path as `test` evid
 The command uses the shared run mutation lock and requires the same static, untouched-integration, quiescent, blocked-source eligibility as proposal creation. It refuses when the reference exactly matches any persisted handoff test command, regardless of that test's result. The unchanged reference must normalize to a repository path, resolve to a regular non-symlink file in the registered source worktree, remain inside existing evidence scope, and appear in the handoff's changed-file evidence.
 
 Each append-only record is content-addressed over its source task, exact handoff SHA-256, request and evidence indexes, original evidence hash, unchanged reference, fixed reason `TEST_REFERENCE_IS_REPOSITORY_PATH`, prepared HEAD, and dirty-tree fingerprints. Proposal derivation revalidates that record against the immutable raw handoff and current worktree, changes only the in-memory evidence kind, then sends the derived request through ordinary strict file-evidence validation. The proposal hash includes the normalization ID. Authorization re-derives that identity; a removed, changed, stale, or mismatched record fails closed.
+
+## Interpretation v2 and failed salvage provenance
+
+V2 retains the raw handoff as the source of facts and stores a separate append-only human authorization. Its identity binds the run and source, handoff SHA-256, prepared HEAD, tracked diff and tree fingerprints, selected request index and original request hash, exact selected claims, and ordered evidence transformations. The proposal body includes the interpretation ID, and authorization recomputes the proposal from the raw handoff and persisted record.
+
+An interpretation may select exactly one request; retain an exact subset of its original repository claims or downgrade the same exact path from write to read; remove a single positive decimal line suffix from a canonical in-worktree regular-file reference; and change `test` to `file` only for a changed, in-scope repository file that is not any persisted handoff test command. It cannot merge requests, rewrite globs, add paths, escalate read to write, add capabilities or dependencies, or rewrite objectives and execution metadata. Selected requests still pass the ordinary strict proposal validator.
+
+New salvage attempts persist `AUTHORIZED`, `VERIFYING`, and terminal `FAILED` or `VERIFIED` phases. `VERIFIED` retains the exact successful checkpoint. `FAILED` retains append-only content-hashed failure records. Missing phases on legacy salvage objects remain ambiguous and ineligible. The legacy finalizer accepts only a quiescent static blocked run before integration, checks the registered worktree without changing it, requires the latest authorized attempt to terminate in `SALVAGE_VERIFICATION_FAILED`, rejects later success or reordered lifecycle evidence, and hashes the exact JSONL lines and bounded stdout/stderr log contents. Static replanning accepts a salvage-bearing source only in terminal `FAILED` state with failure evidence, no successful checkpoint, and no canonical commit.
 
 ## Authorization and effective configuration
 
@@ -80,4 +90,4 @@ Events record `REPLAN_PROPOSED`, `REPLAN_AUTHORIZED`, `REPLAN_CHECKPOINT_PREPARI
 
 Host continuation/recovery commands, proposal, authorization, execution/integration, and cleanup share `StateStore.withRunMutationLock`. It reuses the hardened preflight primitive and its historical `retry-preflight.lock` path, so preflight participates in the same exclusion. Execution holds the lock through provider calls and deterministic verification. A stale loaded orchestrator must be reloaded before execution/cleanup rather than overwriting newer state. Source authorization additionally requires a quiescent run and fails closed on live/unfinished attempts.
 
-This is cooperative exclusion among this version's host commands. Older binaries, manual `run.json` edits, and unrelated Git processes do not participate; stop them before recovery. V1 supports one request per proposal, one replan per source, and one unresolved replan at a time. It does not automatically replan, expand a running task, convert strategy, route providers, or edit the frozen phase snapshot.
+This is cooperative exclusion among this version's host commands. Older binaries, manual `run.json` edits, and unrelated Git processes do not participate; stop them before recovery. Raw v1 proposals support one request; v2 requires explicit selection when a handoff contains more than one. The system supports one replan per source and one unresolved replan at a time. It does not automatically replan, expand a running task, convert strategy, route providers, or edit the frozen phase snapshot.

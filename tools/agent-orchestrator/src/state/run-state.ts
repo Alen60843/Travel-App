@@ -1,4 +1,4 @@
-import { assertReplanState, parseTaskReplan, parseReplanEvidenceNormalizations, parseReplanProposals, parseReplanAuthorizations } from '../replan/model';
+import { assertReplanState, parseTaskReplan, parseReplanEvidenceNormalizations, parseReplanInterpretations, parseReplanProposals, parseReplanAuthorizations } from '../replan/model';
 import { ERROR_CODES, OrchestratorError, type ErrorCode } from '../errors';
 import { parseAdaptiveRunState } from '../adaptive/state-validation';
 import type { AdaptiveRunState } from '../adaptive/types';
@@ -172,9 +172,21 @@ export interface TaskRunState {
    */
   readonly salvage?: {
     readonly authorizedAt: string;
+    readonly phase?: 'AUTHORIZED' | 'VERIFYING' | 'FAILED' | 'VERIFIED';
+    readonly failures?: readonly SalvageFailureRecord[];
     readonly verification?: SalvageVerificationCheckpoint;
   };
   readonly replan?: import('../replan/model').TaskReplanState;
+}
+
+export interface SalvageFailureRecord {
+  readonly id: string;
+  readonly failedAt: string;
+  readonly source: 'runtime' | 'legacy_event_finalization';
+  readonly reason: string;
+  readonly worktreeHeadSha: string;
+  readonly trackedDiffFingerprint: string;
+  readonly evidenceHash: string;
 }
 
 /**
@@ -296,6 +308,7 @@ export interface RunState {
   readonly recoveryPolicyHistory?: readonly RecoveryPolicySnapshot[];
   /** Append-only explicit human semantic corrections for static replan evidence. */
   readonly replanEvidenceNormalizations?: readonly import('../replan/model').ReplanEvidenceNormalization[];
+  readonly replanInterpretations?: readonly import('../replan/model').ReplanInterpretation[];
   readonly replanProposals?: readonly import('../replan/model').ReplanProposal[];
   readonly replanAuthorizations?: readonly import('../replan/model').ReplanAuthorization[];
 }
@@ -311,6 +324,7 @@ export interface RecoveryPolicySnapshot {
 
 export const RUN_EVENT_NAMES = [
   'REPLAN_EVIDENCE_NORMALIZED',
+  'REPLAN_INTERPRETATION_AUTHORIZED',
   'REPLAN_PROPOSED',
   'REPLAN_AUTHORIZED',
   'REPLAN_CHECKPOINT_PREPARING',
@@ -372,6 +386,7 @@ export const RUN_EVENT_NAMES = [
   'SALVAGE_AUTHORIZED',
   'SALVAGE_VERIFIED',
   'SALVAGE_VERIFICATION_FAILED',
+  'SALVAGE_FAILED_FINALIZED',
   'RECOVERY_POLICY_AUTHORIZED',
 ] as const;
 export type RunEventName = (typeof RUN_EVENT_NAMES)[number];
@@ -865,15 +880,34 @@ function parseSalvageVerificationCheckpoint(value: unknown, path: string): Salva
 function parseSalvageState(
   value: unknown,
   path: string,
-): { readonly authorizedAt: string; readonly verification?: SalvageVerificationCheckpoint } {
+): NonNullable<TaskRunState['salvage']> {
   if (!isObject(value)) {
     throw new OrchestratorError('STATE_CORRUPT', `${path} must be an object`);
   }
+  const phase = value.phase === undefined ? undefined : string(value.phase, `${path}.phase`);
+  if (phase !== undefined && !['AUTHORIZED', 'VERIFYING', 'FAILED', 'VERIFIED'].includes(phase)) throw new OrchestratorError('STATE_CORRUPT', `${path}.phase is invalid`);
+  const failures = value.failures === undefined ? undefined : (() => {
+    if (!Array.isArray(value.failures)) throw new OrchestratorError('STATE_CORRUPT', `${path}.failures must be an array`);
+    return value.failures.map((raw, index): SalvageFailureRecord => {
+      const itemPath = `${path}.failures[${index}]`;
+      if (!isObject(raw)) throw new OrchestratorError('STATE_CORRUPT', `${itemPath} must be an object`);
+      const id = string(raw.id, `${itemPath}.id`); const head = string(raw.worktreeHeadSha, `${itemPath}.worktreeHeadSha`);
+      if (!/^[a-f0-9]{64}$/.test(id) || !/^[a-f0-9]{64}$/.test(string(raw.evidenceHash, `${itemPath}.evidenceHash`))) throw new OrchestratorError('STATE_CORRUPT', `${itemPath} has an invalid digest`);
+      assertFullSha(head, `${itemPath}.worktreeHeadSha`);
+      const source = string(raw.source, `${itemPath}.source`);
+      if (!['runtime', 'legacy_event_finalization'].includes(source)) throw new OrchestratorError('STATE_CORRUPT', `${itemPath}.source is invalid`);
+      return { id, failedAt: timestamp(raw.failedAt, `${itemPath}.failedAt`), source: source as SalvageFailureRecord['source'], reason: string(raw.reason, `${itemPath}.reason`), worktreeHeadSha: head, trackedDiffFingerprint: string(raw.trackedDiffFingerprint, `${itemPath}.trackedDiffFingerprint`), evidenceHash: string(raw.evidenceHash, `${itemPath}.evidenceHash`) };
+    });
+  })();
+  const verification = value.verification === undefined ? undefined : parseSalvageVerificationCheckpoint(value.verification, `${path}.verification`);
+  if (phase === 'FAILED' && (verification !== undefined || failures?.length === 0 || failures === undefined)) throw new OrchestratorError('STATE_CORRUPT', `${path} failed lifecycle lacks terminal evidence`);
+  if (phase === 'VERIFIED' && verification === undefined) throw new OrchestratorError('STATE_CORRUPT', `${path} verified lifecycle lacks checkpoint`);
+  if (verification !== undefined && phase !== undefined && phase !== 'VERIFIED') throw new OrchestratorError('STATE_CORRUPT', `${path} verification conflicts with phase`);
   return {
     authorizedAt: timestamp(value.authorizedAt, `${path}.authorizedAt`),
-    ...(value.verification === undefined
-      ? {}
-      : { verification: parseSalvageVerificationCheckpoint(value.verification, `${path}.verification`) }),
+    ...(phase === undefined ? {} : { phase: phase as Exclude<NonNullable<TaskRunState['salvage']>['phase'], undefined> }),
+    ...(failures === undefined ? {} : { failures }),
+    ...(verification === undefined ? {} : { verification }),
   };
 }
 
@@ -1159,10 +1193,12 @@ export function validateRunState(value: unknown): RunState {
     }
   }
   const replanEvidenceNormalizations = value.replanEvidenceNormalizations === undefined ? undefined : parseReplanEvidenceNormalizations(value.replanEvidenceNormalizations);
+  const replanInterpretations = value.replanInterpretations === undefined ? undefined : parseReplanInterpretations(value.replanInterpretations);
   const replanProposals = value.replanProposals === undefined ? undefined : parseReplanProposals(value.replanProposals);
   const replanAuthorizations = value.replanAuthorizations === undefined ? undefined : parseReplanAuthorizations(value.replanAuthorizations);
   assertReplanState({ runId, tasks, ...(strategy === undefined ? {} : { strategy }),
     ...(replanEvidenceNormalizations === undefined ? {} : { replanEvidenceNormalizations }),
+    ...(replanInterpretations === undefined ? {} : { replanInterpretations }),
     ...(replanProposals === undefined ? {} : { replanProposals }),
     ...(replanAuthorizations === undefined ? {} : { replanAuthorizations }),
   });
@@ -1182,6 +1218,7 @@ export function validateRunState(value: unknown): RunState {
     ...(integrationAttempts === undefined ? {} : { integrationAttempts }),
     ...(recoveryPolicyHistory === undefined ? {} : { recoveryPolicyHistory }),
     ...(replanEvidenceNormalizations === undefined ? {} : { replanEvidenceNormalizations }),
+    ...(replanInterpretations === undefined ? {} : { replanInterpretations }),
     ...(replanProposals === undefined ? {} : { replanProposals }),
     ...(replanAuthorizations === undefined ? {} : { replanAuthorizations }),
     errors: value.errors.map((error, index) => parseStoredError(error, `errors[${index}]`)),

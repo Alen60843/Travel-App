@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import type { Agent, AgentRequest, AgentResult } from '../../src/agents';
 import { AgentOrchestrator } from '../../src/orchestrator';
-import { GitClient, WorktreeManager, integrateTaskCommits, type GitRunOptions } from '../../src/git';
+import { computeTrackedDiffFingerprint, GitClient, WorktreeManager, integrateTaskCommits, type GitRunOptions } from '../../src/git';
 import { StateStore, validateRunState, type RunState, type TaskRunState } from '../../src/state';
 import { parseHandoff, writeHandoff } from '../../src/handoff';
 import { applyReplanOverlays, replanHash, type ReplanProposal } from '../../src/replan/model';
@@ -157,6 +157,7 @@ async function fixture(
   return { repository, manager, worktree, options, store, orchestrator, runId: initial.runId, handoffPath,
     normalize: (evidenceIndex = 0, normalizedKind = 'file', requestIndex = 0) => AgentOrchestrator.normalizeReplanEvidence(initial.runId, 'event',
       { requestIndex, evidenceIndex, normalizedKind }, options),
+    interpret: (request: Parameters<typeof AgentOrchestrator.interpretReplan>[2]) => AgentOrchestrator.interpretReplan(initial.runId, 'event', request, options),
     propose: () => AgentOrchestrator.proposeReplan(initial.runId, 'event', options),
     authorize: (proposal: ReplanProposal, git?: GitClient) => AgentOrchestrator.authorizeReplan(initial.runId, proposal.id, { ...options, ...(git === undefined ? {} : { git }) }),
     edit: async (update: (state: RunState) => RunState) => store.save(update(await store.load())),
@@ -221,8 +222,227 @@ async function installExactHistoricalEvidence(f: Fixture): Promise<void> {
   });
 }
 
+async function installLegacyFailedSalvage(f: Fixture): Promise<void> {
+  const at = new Date().toISOString();
+  const stdoutPath = join(f.store.runDirectory, 'logs', 'legacy-stdout'); const stderrPath = join(f.store.runDirectory, 'logs', 'legacy-stderr');
+  await mkdir(join(f.store.runDirectory, 'logs'), { recursive: true }); await writeFile(stdoutPath, 'failed\n'); await writeFile(stderrPath, 'diagnostic\n');
+  await f.editTask('event', (task) => ({ ...task, salvage: { authorizedAt: at } }));
+  await f.store.appendEvent({ name: 'SALVAGE_AUTHORIZED', timestamp: at, runId: f.runId, taskId: 'event' });
+  await f.store.appendEvent({ name: 'SALVAGE_COMMAND_FINISHED', timestamp: at, runId: f.runId, taskId: 'event', data: { command: 'fixture', required: true, exitCode: 1, signal: null, termination: null, timedOut: false, stdoutPath, stderrPath, hostVerification: true } });
+  await f.store.appendEvent({ name: 'SALVAGE_VERIFICATION_FAILED', timestamp: at, runId: f.runId, taskId: 'event', data: { reason: 'verify_command_failed' } });
+}
+
 test('static replan source modes are exactly implementation and testing', () => {
   assert.deepEqual(TASK_MODES.filter(isSupportedStaticReplanSourceMode), ['implementation', 'testing']);
+});
+
+test('v2 explicitly selects one request, removes an exact claim, normalizes line references, and reclassifies file-shaped evidence', async () => {
+  const f = await fixture(undefined, false, 'testing', true);
+  await replaceRequest(f, (handoff) => {
+    const selected = handoff.additionalWorkRequests[0];
+    selected.resourceClaims = [
+      { kind: 'repository_path', key: 'apps/api/src/chat/transport/**', mode: 'write' },
+      { kind: 'repository_path', key: 'apps/api/src/chat/presence/**', mode: 'write' },
+      { kind: 'repository_path', key: 'apps/api/src/events/**', mode: 'read' },
+    ];
+    selected.evidence = [
+      { kind: 'file', reference: `${eventPath}:1`, summary: 'Exact source line' },
+      { kind: 'test', reference: eventPath, summary: 'File-shaped historical evidence' },
+    ];
+    handoff.additionalWorkRequests.unshift({ ...selected, objective: 'Unselected request' });
+  });
+  const selectedClaims = [
+    { kind: 'repository_path' as const, key: 'apps/api/src/chat/transport/**', mode: 'write' as const },
+    { kind: 'repository_path' as const, key: 'apps/api/src/events/**', mode: 'read' as const },
+  ];
+  const interpretation = await f.interpret({ requestIndex: 1, resourceClaims: selectedClaims, evidenceTransformations: [
+    { evidenceIndex: 0, normalizedReference: eventPath },
+    { evidenceIndex: 1, normalizedKind: 'file' },
+  ] });
+  assert.equal(interpretation.version, 2);
+  assert.equal(interpretation.requestIndex, 1);
+  assert.deepEqual(interpretation.resourceClaims, selectedClaims);
+  assert.deepEqual(interpretation.evidenceTransformations.map((entry) => [entry.originalReference, entry.normalizedReference, entry.normalizedKind]), [
+    [`${eventPath}:1`, eventPath, 'file'], [eventPath, eventPath, 'file'],
+  ]);
+  const proposal = await f.propose();
+  assert.deepEqual(proposal.interpretationIds, [interpretation.id]);
+  const { id: _id, ...proposalBody } = proposal;
+  assert.equal(proposal.id, replanHash(proposalBody));
+  const { interpretationIds: _interpretationIds, ...rawSemanticBody } = proposalBody;
+  assert.notEqual(proposal.id, replanHash(rawSemanticBody));
+  assert.deepEqual(proposal.request.resourceClaims, selectedClaims);
+  assert.equal(proposal.request.objective, 'Enforce Event lifecycle in Chat');
+  assert.deepEqual(proposal.request.evidence?.map((entry) => [entry.kind, entry.reference]), [['file', eventPath], ['file', eventPath]]);
+  assert.equal((await f.store.load()).replanProposals?.[0]?.id, proposal.id);
+  noProviders(f);
+});
+
+test('removing an interpretation after proposal persistence invalidates authorization replay', async () => {
+  const f = await fixture(); await f.interpret({ requestIndex: 0 }); const proposal = await f.propose();
+  const state = await f.store.load();
+  await assert.rejects(f.store.save({ ...state, replanInterpretations: [] }), (error) => isOrchestratorError(error, 'TASK_STATE_INVALID'));
+  assert.equal((await f.store.load()).replanInterpretations?.length, 1);
+  assert.equal((await f.authorize(proposal)).id, proposal.id);
+  noProviders(f);
+});
+
+test('v2 interpretation is content-hashed and proposal replay refuses source drift', async () => {
+  const f = await fixture();
+  const interpretation = await f.interpret({ requestIndex: 0 });
+  await writeFile(join(f.worktree.path, eventPath), 'Event checkpoint changed\n');
+  await assert.rejects(f.propose(), (error) => isOrchestratorError(error, 'TASK_STATE_INVALID'));
+  const persisted = JSON.parse(await readFile(f.store.statePath, 'utf8'));
+  persisted.replanInterpretations[0].requestIndex = 1;
+  await writeFile(f.store.statePath, `${JSON.stringify(persisted, null, 2)}\n`);
+  await assert.rejects(f.store.load(), (error) => isOrchestratorError(error, 'TASK_STATE_INVALID'));
+  assert.equal(interpretation.authorizedBy, 'human');
+  noProviders(f);
+});
+
+test('v2 permits only a same-path write-to-read claim downgrade', async () => {
+  const f = await fixture();
+  const interpretation = await f.interpret({ requestIndex: 0, resourceClaims: [
+    { kind: 'repository_path', key: 'apps/api/src/chat/**', mode: 'read' },
+    { kind: 'repository_path', key: 'apps/api/src/events/**', mode: 'read' },
+  ] });
+  assert.equal(interpretation.resourceClaims[0]?.mode, 'read');
+  await assert.rejects(f.propose(), /write scope must be nonempty/);
+  noProviders(f);
+});
+
+for (const scenario of ['claim-mode-escalation', 'claim-glob-rewrite', 'new-path', 'bad-request-index', 'line-zero', 'line-negative', 'line-nonnumeric', 'arbitrary-colon', 'missing-file', 'outside-scope', 'symlink', 'real-test-command'] as const) {
+  test(`v2 interpretation refuses ${scenario} without persistence or providers`, async () => {
+    const f = await fixture();
+    if (scenario === 'symlink') await symlink('../../../design.md', join(f.worktree.path, 'apps/api/src/events/link.ts'));
+    await replaceRequest(f, (handoff) => {
+      const reference = scenario === 'line-zero' ? `${eventPath}:0` : scenario === 'line-negative' ? `${eventPath}:-1`
+        : scenario === 'line-nonnumeric' ? `${eventPath}:abc` : scenario === 'arbitrary-colon' ? 'fixture:thing'
+          : scenario === 'missing-file' ? 'apps/api/src/events/missing.ts:1' : scenario === 'outside-scope' ? 'design.md:1'
+            : scenario === 'symlink' ? 'apps/api/src/events/link.ts:1' : `${eventPath}:1`;
+      handoff.additionalWorkRequests[0].evidence = [{ kind: 'file', reference, summary: 'Line' }];
+      if (scenario === 'real-test-command') handoff.additionalWorkRequests[0].evidence = [{ kind: 'test', reference: 'fixture', summary: 'Real command' }];
+    });
+    const before = await readFile(f.store.statePath, 'utf8');
+    const claims: any[] = scenario === 'claim-mode-escalation' ? [{ kind: 'repository_path', key: 'apps/api/src/events/**', mode: 'write' }]
+      : scenario === 'claim-glob-rewrite' ? [{ kind: 'repository_path', key: 'apps/api/src/chat/*', mode: 'write' }]
+        : scenario === 'new-path' ? [{ kind: 'repository_path', key: 'apps/api/src/new/**', mode: 'write' }]
+        : draft.resourceClaims;
+    const normalizedReference = scenario === 'missing-file' ? 'apps/api/src/events/missing.ts' : scenario === 'outside-scope' ? 'design.md'
+      : scenario === 'symlink' ? 'apps/api/src/events/link.ts' : eventPath;
+    await assert.rejects(f.interpret({ requestIndex: scenario === 'bad-request-index' ? 9 : 0, resourceClaims: claims,
+      evidenceTransformations: [{ evidenceIndex: 0, ...(scenario === 'real-test-command' ? { normalizedKind: 'file' }
+        : { normalizedReference }) }],
+    }), (error) => isOrchestratorError(error, 'TASK_STATE_INVALID'));
+    assert.equal(await readFile(f.store.statePath, 'utf8'), before);
+    noProviders(f);
+  });
+}
+
+test('terminal failed salvage remains eligible while authorized, verifying, verified, and legacy salvage refuse', async () => {
+  for (const phase of ['AUTHORIZED', 'VERIFYING', 'VERIFIED', 'legacy'] as const) {
+    const f = await fixture();
+    await f.editTask('event', (task) => ({ ...task, salvage: phase === 'legacy' ? { authorizedAt: task.error!.at }
+      : phase === 'VERIFIED' ? { authorizedAt: task.error!.at, phase, verification: { worktreeHeadSha: task.preparedHeadSha!, trackedDiffFingerprint: 'x', verifyConfigFingerprint: 'y', result: 'passed' } }
+        : { authorizedAt: task.error!.at, phase } }));
+    await assertProposalRefusedWithoutMutation(f);
+  }
+  const f = await fixture();
+  const trackedDiffFingerprint = await computeTrackedDiffFingerprint(f.repository.git, f.worktree.path, (await f.store.load()).tasks.event!.preparedHeadSha!);
+  await f.editTask('event', (task) => {
+    const body = { failedAt: task.error!.at, source: 'runtime' as const, reason: 'verify_command_failed', worktreeHeadSha: task.preparedHeadSha!, trackedDiffFingerprint, evidenceHash: 'b'.repeat(64) };
+    return { ...task, salvage: { authorizedAt: task.error!.at, phase: 'FAILED', failures: [{ id: replanHash({ runId: f.runId, taskId: task.id, ...body }), ...body }] } };
+  });
+  assert.ok((await f.propose()).id);
+  noProviders(f);
+});
+
+test('legacy failed-salvage finalizer binds exact event evidence, is idempotent, and enables interpretation without executing work', async () => {
+  const f = await fixture();
+  await installLegacyFailedSalvage(f);
+  const beforeHead = await f.repository.git.resolveCommit(f.worktree.path, 'HEAD');
+  const failure = await AgentOrchestrator.finalizeFailedSalvage(f.runId, 'event', f.options);
+  const afterFirst = await readFile(f.store.eventsPath, 'utf8');
+  assert.equal((await f.store.load()).tasks.event!.salvage?.phase, 'FAILED');
+  assert.equal((await f.store.load()).tasks.event!.salvage?.failures?.[0]?.id, failure.id);
+  assert.deepEqual(await AgentOrchestrator.finalizeFailedSalvage(f.runId, 'event', f.options), failure);
+  assert.equal(await readFile(f.store.eventsPath, 'utf8'), afterFirst);
+  assert.equal(await f.repository.git.resolveCommit(f.worktree.path, 'HEAD'), beforeHead);
+  assert.ok((await f.propose()).id);
+  noProviders(f);
+});
+
+test('concurrent legacy finalization cannot append two terminal records', async () => {
+  const f = await fixture(); await installLegacyFailedSalvage(f);
+  const results = await Promise.allSettled([AgentOrchestrator.finalizeFailedSalvage(f.runId, 'event', f.options), AgentOrchestrator.finalizeFailedSalvage(f.runId, 'event', f.options)]);
+  assert.ok(results.some((result) => result.status === 'fulfilled'));
+  const state = await f.store.load();
+  assert.equal(state.tasks.event!.salvage?.failures?.length, 1);
+  assert.equal((await readFile(f.store.eventsPath, 'utf8')).split('\n').filter((line) => line.includes('SALVAGE_FAILED_FINALIZED')).length, 1);
+  noProviders(f);
+});
+
+test('legacy failed-salvage finalizer refuses contradictory later success', async () => {
+  const f = await fixture(); const at = new Date().toISOString();
+  const stdoutPath = join(f.store.runDirectory, 'logs', 'legacy-stdout'); const stderrPath = join(f.store.runDirectory, 'logs', 'legacy-stderr');
+  await mkdir(join(f.store.runDirectory, 'logs'), { recursive: true }); await writeFile(stdoutPath, 'failed\n'); await writeFile(stderrPath, 'diagnostic\n');
+  await f.editTask('event', (task) => ({ ...task, salvage: { authorizedAt: at } }));
+  await f.store.appendEvent({ name: 'SALVAGE_AUTHORIZED', timestamp: at, runId: f.runId, taskId: 'event' });
+  await f.store.appendEvent({ name: 'SALVAGE_COMMAND_FINISHED', timestamp: at, runId: f.runId, taskId: 'event', data: { command: 'fixture', required: true, exitCode: 1, stdoutPath, stderrPath, hostVerification: true } });
+  await f.store.appendEvent({ name: 'SALVAGE_VERIFICATION_FAILED', timestamp: at, runId: f.runId, taskId: 'event', data: { reason: 'verify_command_failed' } });
+  await f.store.appendEvent({ name: 'SALVAGE_VERIFIED', timestamp: at, runId: f.runId, taskId: 'event' });
+  await assert.rejects(AgentOrchestrator.finalizeFailedSalvage(f.runId, 'event', f.options), (error) => isOrchestratorError(error, 'TASK_STATE_INVALID'));
+  assert.equal((await f.store.load()).tasks.event!.salvage?.phase, undefined);
+  noProviders(f);
+});
+
+test('legacy failed-salvage finalizer fails closed when exact command logs are absent', async () => {
+  const f = await fixture(); const at = new Date().toISOString();
+  await f.editTask('event', (task) => ({ ...task, salvage: { authorizedAt: at } }));
+  await f.store.appendEvent({ name: 'SALVAGE_AUTHORIZED', timestamp: at, runId: f.runId, taskId: 'event' });
+  await f.store.appendEvent({ name: 'SALVAGE_COMMAND_FINISHED', timestamp: at, runId: f.runId, taskId: 'event', data: { command: 'fixture', required: true, exitCode: 1, hostVerification: true } });
+  await f.store.appendEvent({ name: 'SALVAGE_VERIFICATION_FAILED', timestamp: at, runId: f.runId, taskId: 'event', data: { reason: 'verify_command_failed' } });
+  await assert.rejects(AgentOrchestrator.finalizeFailedSalvage(f.runId, 'event', f.options), (error) => isOrchestratorError(error, 'TASK_STATE_INVALID'));
+  assert.equal((await f.store.load()).tasks.event!.salvage?.phase, undefined);
+  noProviders(f);
+});
+
+test('Phase-7-shaped v2 flow preserves the raw handoff through failed-salvage finalization, interpretation, checkpoint, follow-up, composed verification, and final review', async () => {
+  const f = await fixture(undefined, false, 'testing', true);
+  await replaceRequest(f, (handoff) => {
+    const implementation = handoff.additionalWorkRequests[0];
+    implementation.resourceClaims = [
+      { kind: 'repository_path', key: 'apps/api/src/chat/transport/**', mode: 'write' },
+      { kind: 'repository_path', key: 'apps/api/src/chat/presence/**', mode: 'write' },
+      { kind: 'repository_path', key: 'apps/api/src/events/**', mode: 'read' },
+    ];
+    implementation.evidence = [
+      { kind: 'file', reference: 'apps/api/src/chat/transport/feature.txt:1', summary: 'Transport defect line' },
+      { kind: 'file', reference: 'apps/api/src/chat/presence/feature.txt:1', summary: 'Presence evidence retained read-only' },
+      { kind: 'test', reference: eventPath, summary: 'File-shaped source evidence' },
+    ];
+    handoff.additionalWorkRequests.push({ ...implementation, role: 'testing', objective: 'Unselected test work' });
+  });
+  const rawHandoff = await readFile(f.handoffPath);
+  await installLegacyFailedSalvage(f);
+  await AgentOrchestrator.finalizeFailedSalvage(f.runId, 'event', f.options);
+  const interpretation = await f.interpret({ requestIndex: 0, resourceClaims: [
+    { kind: 'repository_path', key: 'apps/api/src/chat/transport/**', mode: 'write' },
+    { kind: 'repository_path', key: 'apps/api/src/chat/presence/**', mode: 'read' },
+    { kind: 'repository_path', key: 'apps/api/src/events/**', mode: 'read' },
+  ], evidenceTransformations: [
+    { evidenceIndex: 0, normalizedReference: 'apps/api/src/chat/transport/feature.txt' },
+    { evidenceIndex: 1, normalizedReference: 'apps/api/src/chat/presence/feature.txt' },
+    { evidenceIndex: 2, normalizedKind: 'file' },
+  ] });
+  const proposal = await f.propose();
+  assert.deepEqual(proposal.interpretationIds, [interpretation.id]);
+  await f.authorize(proposal);
+  const result = await (await AgentOrchestrator.resume(f.runId, f.options)).execute();
+  assert.equal(result.status, 'COMPLETED');
+  assert.equal(result.tasks.event!.status, 'SUCCEEDED');
+  assert.equal(result.tasks[proposal.overlay.followup.id]!.status, 'SUCCEEDED');
+  assert.deepEqual(await readFile(f.handoffPath), rawHandoff);
 });
 
 for (const mode of TASK_MODES.filter((candidate) => !isSupportedStaticReplanSourceMode(candidate))) {

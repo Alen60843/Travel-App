@@ -1,4 +1,4 @@
-import { lstat, realpath } from 'node:fs/promises';
+import { lstat, readFile, realpath } from 'node:fs/promises';
 import { join, sep } from 'node:path';
 import type { PhaseConfig } from '../config';
 import { computeTrackedDiffFingerprint, inspectTaskCommits, type GitClient, type WorktreeManager, type IntegrationCommit } from '../git';
@@ -9,8 +9,8 @@ import { TaskGraph, assertChangedFileOwnership, matchesOwnershipPattern, type Ta
 import { ownershipGlobsOverlap, normalizeRepositoryPath } from '../tasks/ownership';
 import { parseTaskSpec } from '../tasks/task-schema';
 import type { WorkRequestDraft } from '../adaptive/types';
-import { applyReplanOverlays, assertPristine, buildOverlay, followupDependencies, replanEvidenceNormalizationId, replanHash, refuse,
-  type ReplanEvidenceNormalization, type ReplanEvidenceNormalizationIdentity, type ReplanProposal, type TaskReplanState } from './model';
+import { applyReplanOverlays, assertPristine, buildOverlay, followupDependencies, replanEvidenceNormalizationId, replanHash, replanInterpretationId, refuse,
+  type ReplanEvidenceNormalization, type ReplanEvidenceNormalizationIdentity, type ReplanInterpretation, type ReplanInterpretationIdentity, type ReplanProposal, type TaskReplanState } from './model';
 import { assertCodeInputHistory, changedCandidatePaths, inspectCheckpoint, readReplanHandoff, treeFingerprint } from './checkpoint';
 
 export function taskCodeInputs(config: PhaseConfig, state: RunState, task: TaskSpec): IntegrationCommit[] {
@@ -78,12 +78,19 @@ export class StaticReplanner {
     const attempt = task?.agentAttempts.at(-1);
     if (task === undefined || spec === undefined || task.status !== 'BLOCKED' || !spec.writer || !isSupportedStaticReplanSourceMode(spec.mode)
       || task.error?.code !== 'REVIEW_BLOCKED' || attempt?.outcome !== 'succeeded' || attempt.finishedAt === undefined
-      || task.handoffOutcome !== 'valid' || task.commit !== undefined || task.salvage !== undefined
+      || task.handoffOutcome !== 'valid' || task.commit !== undefined
+      || (task.salvage !== undefined && (task.salvage.phase !== 'FAILED' || task.salvage.verification !== undefined
+        || task.salvage.failures?.at(-1)?.reason !== 'verify_command_failed'))
       || task.worktreePath === undefined || task.branch === undefined || task.preparedHeadSha === undefined) refuse('source must be a blocked implementation or testing writer with an accepted blocked handoff and no canonical commit');
     const worktree = await this.ctx.worktrees.assertRegistered(task.worktreePath);
     const registered = (await this.ctx.worktrees.listGitWorktrees()).find((entry) => entry.path === worktree.path);
     if (worktree.runId !== state.runId || worktree.taskId !== task.id || worktree.kind !== 'task' || worktree.branch !== task.branch
       || worktree.baseSha !== state.baseSha || registered?.branch !== `refs/heads/${task.branch}`) refuse('source worktree registration mismatch');
+    if (task.salvage !== undefined) {
+      const failure = task.salvage.failures!.at(-1)!;
+      if (await this.ctx.git.resolveCommit(worktree.path, 'HEAD') !== failure.worktreeHeadSha
+        || await computeTrackedDiffFingerprint(this.ctx.git, worktree.path, task.preparedHeadSha) !== failure.trackedDiffFingerprint) refuse('source no longer matches terminal salvage failure evidence');
+    }
     const graph = new TaskGraph(this.ctx.config.tasks);
     for (const ancestor of graph.tasks.filter((entry) => graph.hasDependencyPath(task.id, entry.id))) {
       const prior = state.tasks[ancestor.id];
@@ -98,12 +105,34 @@ export class StaticReplanner {
     return { task, spec, worktree, artifact };
   }
 
-  private normalizedRequest(taskId: string, artifact: Awaited<ReturnType<typeof readReplanHandoff>>, normalizations: readonly ReplanEvidenceNormalization[]): {
+  private async normalizedRequest(taskId: string, artifact: Awaited<ReturnType<typeof readReplanHandoff>>, normalizations: readonly ReplanEvidenceNormalization[], interpretations: readonly ReplanInterpretation[]): Promise<{
     readonly request: WorkRequestDraft;
     readonly normalizationIds: readonly string[];
-  } {
+    readonly interpretationIds: readonly string[];
+  }> {
     const requests = artifact.handoff.additionalWorkRequests;
-    if (requests?.length !== 1) refuse('exactly one persisted additionalWorkRequest is required');
+    if (requests === undefined || requests.length === 0) refuse('at least one persisted additionalWorkRequest is required');
+    const sourceInterpretations = interpretations.filter((entry) => entry.sourceTaskId === taskId);
+    if (sourceInterpretations.some((entry) => entry.handoffSha256 !== artifact.sha256)) refuse('source has a stale interpretation for another handoff digest');
+    const applicableInterpretations = sourceInterpretations.filter((entry) => entry.handoffSha256 === artifact.sha256);
+    if (applicableInterpretations.length > 1) refuse('source has multiple applicable interpretations');
+    if (applicableInterpretations.length === 1) {
+      if (normalizations.some((entry) => entry.sourceTaskId === taskId)) refuse('v1 evidence normalization cannot be combined with v2 interpretation');
+      const interpretation = applicableInterpretations[0]!;
+      const original = requests[interpretation.requestIndex];
+      if (original === undefined || replanHash(original) !== interpretation.originalRequestHash) refuse('interpretation request selection no longer matches its original entry');
+      const originalClaims = original.resourceClaims ?? [];
+      if (interpretation.resourceClaims.some((claim) => !originalClaims.some((candidate) => replanHash(candidate) === replanHash(claim)
+        || candidate.kind === 'repository_path' && candidate.key === claim.key && candidate.mode === 'write' && claim.mode === 'read'))) refuse('interpretation resource claims are not a bounded original subset');
+      const evidence = [...(original.evidence ?? [])];
+      for (const transform of interpretation.evidenceTransformations) {
+        const prior = evidence[transform.evidenceIndex];
+        if (prior === undefined || replanHash(prior) !== transform.originalEvidenceHash || prior.kind !== transform.originalKind || prior.reference !== transform.originalReference) refuse('interpretation evidence no longer matches its original entry');
+        evidence[transform.evidenceIndex] = { ...prior, kind: transform.normalizedKind as typeof prior.kind, reference: transform.normalizedReference };
+      }
+      return { request: { ...original, resourceClaims: interpretation.resourceClaims, evidence }, normalizationIds: [], interpretationIds: [interpretation.id] };
+    }
+    if (requests.length !== 1) refuse('multiple requests require an explicit v2 request selection');
     const sourceNormalizations = normalizations.filter((entry) => entry.sourceTaskId === taskId);
     if (sourceNormalizations.some((entry) => entry.handoffSha256 !== artifact.sha256)) refuse('source has a stale evidence normalization for another handoff digest');
     const applicable = sourceNormalizations.filter((entry) => entry.handoffSha256 === artifact.sha256);
@@ -124,7 +153,78 @@ export class StaticReplanner {
     return {
       request: applicable.length === 0 ? requests[0]! : { ...requests[0]!, evidence },
       normalizationIds: applicable.map((entry) => entry.id).sort(),
+      interpretationIds: [],
     };
+  }
+
+  /** Persists one bounded interpretation of immutable handoff content. */
+  async interpret(taskId: string, input: { readonly requestIndex: number; readonly resourceClaims?: readonly unknown[]; readonly evidenceTransformations?: readonly { readonly evidenceIndex: number; readonly normalizedKind?: string; readonly normalizedReference?: string }[] }): Promise<ReplanInterpretation> {
+    const state = this.ctx.state();
+    if (state.status !== 'BLOCKED') refuse('interpretation requires a blocked run');
+    await this.quiescent();
+    const { task, spec, worktree, artifact } = await this.source(taskId);
+    if (task.replan !== undefined || state.replanProposals?.some((entry) => entry.sourceTaskId === taskId)) refuse('source already has a proposal or replan');
+    if (!Number.isSafeInteger(input.requestIndex) || input.requestIndex < 0) refuse('interpretation requires an exact request index');
+    const original = artifact.handoff.additionalWorkRequests?.[input.requestIndex];
+    if (original === undefined) refuse('selected request is missing');
+    const originalClaims = original.resourceClaims ?? [];
+    const resourceClaims = (input.resourceClaims ?? originalClaims).map((raw) => {
+      if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) refuse('interpretation claim must be an object');
+      const claim = raw as { kind?: unknown; key?: unknown; mode?: unknown };
+      if (claim.kind !== 'repository_path' || typeof claim.key !== 'string' || !['read', 'write'].includes(String(claim.mode))) refuse('interpretation supports repository claims only');
+      const key = normalizeRepositoryPath(claim.key);
+      if (key !== claim.key) refuse('interpretation claim must already be canonical');
+      const selected = { kind: 'repository_path' as const, key, mode: claim.mode as 'read' | 'write' };
+      if (!originalClaims.some((candidate) => replanHash(candidate) === replanHash(selected)
+        || candidate.kind === 'repository_path' && candidate.key === selected.key && candidate.mode === 'write' && selected.mode === 'read')) refuse('interpretation may only remove claims or downgrade same-path write to read');
+      return selected;
+    });
+    if (new Set(resourceClaims.map((claim) => replanHash(claim))).size !== resourceClaims.length) refuse('interpretation contains duplicate claims');
+    const transformations = [...(input.evidenceTransformations ?? [])].sort((a, b) => a.evidenceIndex - b.evidenceIndex);
+    if (new Set(transformations.map((entry) => entry.evidenceIndex)).size !== transformations.length) refuse('interpretation targets evidence more than once');
+    const evidenceTransformations = [] as ReplanInterpretationIdentity['evidenceTransformations'][number][];
+    for (const requested of transformations) {
+      if (!Number.isSafeInteger(requested.evidenceIndex) || requested.evidenceIndex < 0) refuse('invalid interpretation evidence index');
+      const evidence = original.evidence?.[requested.evidenceIndex];
+      if (evidence === undefined) refuse('interpretation evidence entry is missing');
+      let normalizedReference = requested.normalizedReference ?? evidence.reference;
+      let normalizedKind = requested.normalizedKind ?? evidence.kind;
+      if (normalizedReference !== evidence.reference) {
+        const match = /^([^:]+):([1-9][0-9]*)$/.exec(evidence.reference);
+        if (match === null || match[1] !== normalizedReference) refuse('reference normalization only removes one positive line suffix');
+        const path = normalizeRepositoryPath(normalizedReference);
+        if (path !== normalizedReference) refuse('normalized reference must be canonical');
+        let source: string;
+        try { source = await readFile(join(worktree.path, path), 'utf8'); } catch { refuse('normalized reference must name an existing regular file'); }
+        if (Number(match[2]) > source.split(/\r?\n/).length) refuse('reference line does not exist');
+      }
+      if (normalizedKind !== evidence.kind) {
+        if (evidence.kind !== 'test' || normalizedKind !== 'file') refuse('only test to file evidence interpretation is supported');
+        const path = normalizeRepositoryPath(normalizedReference);
+        normalizedReference = path;
+        if (artifact.handoff.tests.some((entry) => entry.command === evidence.reference || entry.command === path)) refuse('a handoff test command cannot be reinterpreted as file evidence');
+        if (!artifact.handoff.filesChanged.includes(path)) refuse('test to file evidence must name a changed file');
+      }
+      if (normalizedKind === 'file') {
+        const path = normalizeRepositoryPath(normalizedReference);
+        if (![...spec.files, ...resourceClaims.map((claim) => claim.key)].some((pattern) => matchesOwnershipPattern(path, pattern))) refuse('interpreted file evidence is outside selected scope');
+        try {
+          const absolute = join(worktree.path, path);
+          if (!(await lstat(absolute)).isFile() || !(await realpath(absolute)).startsWith(`${await realpath(worktree.path)}${sep}`)) refuse('interpreted evidence must resolve to an in-worktree regular file');
+        } catch { refuse('interpreted evidence must resolve to an in-worktree regular file'); }
+      }
+      evidenceTransformations.push({ evidenceIndex: requested.evidenceIndex, originalEvidenceHash: replanHash(evidence), originalKind: evidence.kind, normalizedKind, originalReference: evidence.reference, normalizedReference });
+    }
+    const identity: ReplanInterpretationIdentity = { version: 2, runId: state.runId, sourceTaskId: taskId, handoffSha256: artifact.sha256, preparedHeadSha: task.preparedHeadSha!, trackedDiffFingerprint: await computeTrackedDiffFingerprint(this.ctx.git, worktree.path, task.preparedHeadSha!), treeFingerprint: await treeFingerprint(this.ctx.git, worktree.path, task.preparedHeadSha!, true), requestIndex: input.requestIndex, originalRequestHash: replanHash(original), resourceClaims, evidenceTransformations };
+    const record: ReplanInterpretation = { id: replanInterpretationId(identity), ...identity, authorizedBy: 'human', authorizedAt: this.ctx.clock().toISOString() };
+    const existing = state.replanInterpretations?.find((entry) => entry.id === record.id);
+    if (existing !== undefined) return existing;
+    if (state.replanInterpretations?.some((entry) => entry.sourceTaskId === taskId)) refuse('source already has a different interpretation');
+    const current = await this.source(taskId);
+    if (current.artifact.sha256 !== record.handoffSha256 || await this.ctx.git.resolveCommit(worktree.path, 'HEAD') !== record.preparedHeadSha || await computeTrackedDiffFingerprint(this.ctx.git, worktree.path, task.preparedHeadSha!) !== record.trackedDiffFingerprint || await treeFingerprint(this.ctx.git, worktree.path, task.preparedHeadSha!, true) !== record.treeFingerprint) refuse('source changed during interpretation inspection');
+    await this.ctx.save({ ...state, replanInterpretations: [...(state.replanInterpretations ?? []), record] });
+    await this.ctx.event('REPLAN_INTERPRETATION_AUTHORIZED', taskId, { interpretationId: record.id, requestIndex: record.requestIndex, authorizedBy: 'human' });
+    return record;
   }
 
   /** The host invocation is the explicit human authorization for one immutable test -> file interpretation. */
@@ -190,14 +290,14 @@ export class StaticReplanner {
     return record;
   }
 
-  async propose(taskId: string, persist = true, normalizations: readonly ReplanEvidenceNormalization[] = this.ctx.state().replanEvidenceNormalizations ?? []): Promise<ReplanProposal> {
+  async propose(taskId: string, persist = true, normalizations: readonly ReplanEvidenceNormalization[] = this.ctx.state().replanEvidenceNormalizations ?? [], interpretations: readonly ReplanInterpretation[] = this.ctx.state().replanInterpretations ?? []): Promise<ReplanProposal> {
     const state = this.ctx.state();
     if (state.status !== 'BLOCKED') refuse('proposal requires a blocked run');
     await this.quiescent();
     if (Object.values(state.tasks).some((task) => task.replan !== undefined && task.replan.phase !== 'RESOLVED')) refuse('another unresolved replan exists');
     const { task, spec, worktree, artifact } = await this.source(taskId);
     if (task.replan !== undefined) refuse('v1 supports one replan per source');
-    const { request, normalizationIds } = this.normalizedRequest(taskId, artifact, normalizations);
+    const { request, normalizationIds, interpretationIds } = await this.normalizedRequest(taskId, artifact, normalizations, interpretations);
     if (request.role !== 'implementation' || request.resourceClaims?.length === 0 || request.resourceClaims === undefined
       || request.resourceClaims.some((claim) => claim.kind !== 'repository_path') || (request.evidence?.length ?? 0) === 0) refuse('request requires implementation, repository claims, and evidence');
     const files = [...new Set(request.resourceClaims.filter((claim) => claim.mode === 'write').map((claim) => claim.key))].sort();
@@ -236,11 +336,15 @@ export class StaticReplanner {
       if (normalization.preparedHeadSha !== task.preparedHeadSha || normalization.trackedDiffFingerprint !== trackedDiffFingerprint
         || normalization.treeFingerprint !== currentTreeFingerprint) refuse('source worktree changed after evidence normalization');
     }
+    for (const interpretation of interpretations.filter((entry) => interpretationIds.includes(entry.id))) {
+      if (interpretation.preparedHeadSha !== task.preparedHeadSha || interpretation.trackedDiffFingerprint !== trackedDiffFingerprint || interpretation.treeFingerprint !== currentTreeFingerprint) refuse('source worktree changed after interpretation');
+    }
     const body = {
       version: 1 as const, runId: state.runId, sourceTaskId: taskId, handoffPath: artifact.path, handoffSha256: artifact.sha256,
       preparedHeadSha: task.preparedHeadSha!, trackedDiffFingerprint, treeFingerprint: currentTreeFingerprint,
       sourceStateHash: replanHash(task), contextHash: replanHash({ config: this.ctx.config, tasks: state.tasks, integration: state.integration, baseSha: state.baseSha }),
       sourceError: task.error!, ...(normalizationIds.length === 0 ? {} : { evidenceNormalizationIds: normalizationIds }),
+      ...(interpretationIds.length === 0 ? {} : { interpretationIds }),
       request, overlay, verify: this.ctx.config.salvage.verify, prepare: this.ctx.config.agentWorktree.prepare,
     };
     if (!body.verify.some((command) => command.required)) refuse('required salvage.verify commands must be configured before proposing');

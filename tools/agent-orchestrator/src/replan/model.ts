@@ -37,11 +37,39 @@ export interface ReplanProposal {
   readonly sourceError: StoredError;
   /** Present only when the in-memory request used a persisted semantic normalization. */
   readonly evidenceNormalizationIds?: readonly string[];
+  /** Present only when v2 applied one persisted, human-authorized interpretation. */
+  readonly interpretationIds?: readonly string[];
   readonly request: WorkRequestDraft;
   readonly overlay: ReplanOverlay;
   readonly verify: readonly IntegrationCommand[];
   readonly prepare: readonly IntegrationCommand[];
 }
+export interface ReplanEvidenceTransformation {
+  readonly evidenceIndex: number;
+  readonly originalEvidenceHash: string;
+  readonly originalKind: string;
+  readonly normalizedKind: string;
+  readonly originalReference: string;
+  readonly normalizedReference: string;
+}
+export interface ReplanInterpretation {
+  readonly id: string;
+  readonly version: 2;
+  readonly runId: string;
+  readonly sourceTaskId: string;
+  readonly handoffSha256: string;
+  readonly preparedHeadSha: string;
+  readonly trackedDiffFingerprint: string;
+  readonly treeFingerprint: string;
+  readonly requestIndex: number;
+  readonly originalRequestHash: string;
+  readonly resourceClaims: readonly { readonly kind: 'repository_path'; readonly key: string; readonly mode: 'read' | 'write' }[];
+  readonly evidenceTransformations: readonly ReplanEvidenceTransformation[];
+  readonly authorizedBy: 'human';
+  readonly authorizedAt: string;
+}
+export type ReplanInterpretationIdentity = Omit<ReplanInterpretation, 'id' | 'authorizedBy' | 'authorizedAt'>;
+export function replanInterpretationId(identity: ReplanInterpretationIdentity): string { return replanHash(identity); }
 export interface ReplanEvidenceNormalization {
   readonly id: string;
   readonly version: 1;
@@ -158,7 +186,7 @@ function strings(value: unknown): string[] { return array(value).map(text); }
 
 export function parseReplanProposals(value: unknown): ReplanProposal[] {
   return array(value).map((raw) => {
-    const p = object(raw, ['id', 'version', 'runId', 'sourceTaskId', 'handoffPath', 'handoffSha256', 'preparedHeadSha', 'trackedDiffFingerprint', 'treeFingerprint', 'sourceStateHash', 'contextHash', 'sourceError', 'evidenceNormalizationIds', 'request', 'overlay', 'verify', 'prepare']);
+    const p = object(raw, ['id', 'version', 'runId', 'sourceTaskId', 'handoffPath', 'handoffSha256', 'preparedHeadSha', 'trackedDiffFingerprint', 'treeFingerprint', 'sourceStateHash', 'contextHash', 'sourceError', 'evidenceNormalizationIds', 'interpretationIds', 'request', 'overlay', 'verify', 'prepare']);
     if (p.version !== 1) refuse('unsupported proposal version');
     for (const key of ['runId', 'sourceTaskId', 'handoffPath']) text(p[key]);
     for (const key of ['id', 'handoffSha256', 'trackedDiffFingerprint', 'treeFingerprint', 'sourceStateHash', 'contextHash']) digest(p[key]);
@@ -180,11 +208,47 @@ export function parseReplanProposals(value: unknown): ReplanProposal[] {
     if (!(p.verify as IntegrationCommand[]).some((command) => command.required)) refuse('proposal has no required verification');
     const evidenceNormalizationIds = p.evidenceNormalizationIds === undefined ? undefined : strings(p.evidenceNormalizationIds).map(digest);
     if (evidenceNormalizationIds !== undefined && new Set(evidenceNormalizationIds).size !== evidenceNormalizationIds.length) refuse('proposal has duplicate evidence normalizations');
-    const proposal = { ...p, ...(evidenceNormalizationIds === undefined ? {} : { evidenceNormalizationIds }), request: parseWorkRequestDraft(p.request), overlay: { followup, patches } } as unknown as ReplanProposal;
+    const interpretationIds = p.interpretationIds === undefined ? undefined : strings(p.interpretationIds).map(digest);
+    if (interpretationIds !== undefined && (interpretationIds.length !== 1 || new Set(interpretationIds).size !== interpretationIds.length)) refuse('proposal must bind exactly one interpretation');
+    const proposal = { ...p, ...(evidenceNormalizationIds === undefined ? {} : { evidenceNormalizationIds }), ...(interpretationIds === undefined ? {} : { interpretationIds }), request: parseWorkRequestDraft(p.request), overlay: { followup, patches } } as unknown as ReplanProposal;
     const { id, ...body } = proposal;
     if (replanHash(body) !== id) refuse('proposal digest mismatch');
     return proposal;
   });
+}
+
+export function parseReplanInterpretations(value: unknown): ReplanInterpretation[] {
+  const entries = array(value).map((raw) => {
+    const entry = object(raw, ['id', 'version', 'runId', 'sourceTaskId', 'handoffSha256', 'preparedHeadSha', 'trackedDiffFingerprint', 'treeFingerprint', 'requestIndex', 'originalRequestHash', 'resourceClaims', 'evidenceTransformations', 'authorizedBy', 'authorizedAt']);
+    if (entry.version !== 2 || entry.authorizedBy !== 'human' || !Number.isSafeInteger(entry.requestIndex) || Number(entry.requestIndex) < 0) refuse('invalid v2 interpretation');
+    const resourceClaims = array(entry.resourceClaims).map((rawClaim) => {
+      const claim = object(rawClaim, ['kind', 'key', 'mode']);
+      if (claim.kind !== 'repository_path' || !['read', 'write'].includes(String(claim.mode))) refuse('interpretation contains an invalid resource claim');
+      const key = text(claim.key); normalizeRepositoryPath(key);
+      return { kind: 'repository_path' as const, key, mode: claim.mode as 'read' | 'write' };
+    });
+    const evidenceTransformations = array(entry.evidenceTransformations).map((rawTransform) => {
+      const transform = object(rawTransform, ['evidenceIndex', 'originalEvidenceHash', 'originalKind', 'normalizedKind', 'originalReference', 'normalizedReference']);
+      if (!Number.isSafeInteger(transform.evidenceIndex) || Number(transform.evidenceIndex) < 0) refuse('invalid interpretation evidence index');
+      const originalKind = text(transform.originalKind); const normalizedKind = text(transform.normalizedKind);
+      const originalReference = text(transform.originalReference); const normalizedReference = text(transform.normalizedReference);
+      if (normalizedKind !== originalKind && !(originalKind === 'test' && normalizedKind === 'file')) refuse('interpretation contains an unsupported kind transformation');
+      const lineMatch = /^([^:]+):([1-9][0-9]*)$/.exec(originalReference);
+      if (normalizedReference !== originalReference && (lineMatch === null || lineMatch[1] !== normalizedReference)) refuse('interpretation contains an unsupported reference transformation');
+      if (normalizedReference !== originalReference || normalizedKind === 'file') normalizeRepositoryPath(normalizedReference);
+      if (normalizedReference === originalReference && normalizedKind === originalKind) refuse('interpretation contains a no-op evidence transformation');
+      return { evidenceIndex: Number(transform.evidenceIndex), originalEvidenceHash: digest(transform.originalEvidenceHash), originalKind, normalizedKind, originalReference, normalizedReference };
+    });
+    if (new Set(evidenceTransformations.map((item) => item.evidenceIndex)).size !== evidenceTransformations.length) refuse('interpretation targets evidence more than once');
+    const identity: ReplanInterpretationIdentity = { version: 2, runId: text(entry.runId), sourceTaskId: text(entry.sourceTaskId), handoffSha256: digest(entry.handoffSha256), preparedHeadSha: sha(entry.preparedHeadSha), trackedDiffFingerprint: digest(entry.trackedDiffFingerprint), treeFingerprint: digest(entry.treeFingerprint), requestIndex: Number(entry.requestIndex), originalRequestHash: digest(entry.originalRequestHash), resourceClaims, evidenceTransformations };
+    const id = digest(entry.id);
+    if (id !== replanInterpretationId(identity)) refuse('interpretation digest mismatch');
+    const authorizedAt = text(entry.authorizedAt);
+    if (!Number.isFinite(Date.parse(authorizedAt))) refuse('invalid interpretation authorization');
+    return { id, ...identity, authorizedBy: 'human' as const, authorizedAt };
+  });
+  if (new Set(entries.map((entry) => entry.id)).size !== entries.length) refuse('duplicate interpretation');
+  return entries;
 }
 
 export function parseReplanEvidenceNormalizations(value: unknown): ReplanEvidenceNormalization[] {
@@ -257,18 +321,27 @@ export function parseTaskReplan(value: unknown): TaskReplanState {
 }
 
 /** Cross-link persisted authority, lifecycle and canonical results; hashes alone are insufficient. */
-export function assertReplanState(state: Pick<RunState, 'runId' | 'strategy' | 'tasks' | 'replanEvidenceNormalizations' | 'replanProposals' | 'replanAuthorizations'>): void {
+export function assertReplanState(state: Pick<RunState, 'runId' | 'strategy' | 'tasks' | 'replanEvidenceNormalizations' | 'replanInterpretations' | 'replanProposals' | 'replanAuthorizations'>): void {
   const normalizations = state.replanEvidenceNormalizations ?? [];
+  const interpretations = state.replanInterpretations ?? [];
   const proposals = state.replanProposals ?? [];
   const grants = state.replanAuthorizations ?? [];
-  if (state.strategy === 'adaptive' && (normalizations.length > 0 || proposals.length > 0 || grants.length > 0)) refuse('adaptive state cannot contain static replans');
+  if (state.strategy === 'adaptive' && (normalizations.length > 0 || interpretations.length > 0 || proposals.length > 0 || grants.length > 0)) refuse('adaptive state cannot contain static replans');
   for (const normalization of normalizations) if (state.tasks[normalization.sourceTaskId] === undefined) refuse('evidence normalization source task is missing');
+  for (const interpretation of interpretations) if (interpretation.runId !== state.runId || state.tasks[interpretation.sourceTaskId] === undefined) refuse('interpretation source binding is invalid');
+  for (const task of Object.values(state.tasks)) for (const failure of task.salvage?.failures ?? []) {
+    const { id, ...body } = failure;
+    if (id !== replanHash({ runId: state.runId, taskId: task.id, ...body })) refuse('salvage failure digest mismatch');
+  }
   if (new Set(proposals.map((entry) => entry.id)).size !== proposals.length) refuse('duplicate proposal');
   for (const proposal of proposals) {
     const bound = [...(proposal.evidenceNormalizationIds ?? [])].sort();
     const expected = normalizations.filter((entry) => entry.sourceTaskId === proposal.sourceTaskId && entry.handoffSha256 === proposal.handoffSha256)
       .map((entry) => entry.id).sort();
     if (replanHash(bound) !== replanHash(expected)) refuse('proposal does not bind its exact evidence normalizations');
+    const boundInterpretations = [...(proposal.interpretationIds ?? [])].sort();
+    const expectedInterpretations = interpretations.filter((entry) => entry.sourceTaskId === proposal.sourceTaskId && entry.handoffSha256 === proposal.handoffSha256).map((entry) => entry.id).sort();
+    if (replanHash(boundInterpretations) !== replanHash(expectedInterpretations)) refuse('proposal does not bind its exact interpretation');
   }
   const sources = new Set<string>();
   for (const grant of grants) {

@@ -29,8 +29,10 @@ Usage:
   pnpm agents:propose-replan <run-id> <task-id>
   pnpm agents:authorize-replan <run-id> <proposal-id>
   pnpm agents:normalize-replan-evidence <run-id> <task-id> <evidence-index> file
+  pnpm agents:interpret-replan <run-id> <task-id> <interpretation-file>
   pnpm agents:salvage-task <run-id> <task-id>
   pnpm agents:verify-blocked-task <run-id> <task-id>
+  pnpm agents:finalize-failed-salvage <run-id> <task-id>
   pnpm agents:authorize-recovery-policy <run-id> <policy-file>
   pnpm agents:retry-integration <run-id>
   pnpm agents:apply-integration-fix <run-id> <summary> <ownership-glob> [more-globs...]
@@ -136,6 +138,25 @@ async function main(argv: readonly string[]): Promise<number> {
       { requestIndex: 0, evidenceIndex: Number(evidenceIndexText), normalizedKind }, { repositoryPath });
     process.stdout.write(`${JSON.stringify({ normalization,
       manualNextStep: `Inspect the normalization, then run pnpm agents:propose-replan ${argument} ${taskId}` }, null, 2)}\n`);
+    return 0;
+  }
+  if (command === 'interpret-replan') {
+    const [taskId, interpretationFile] = extra;
+    if (argument === undefined || taskId === undefined || interpretationFile === undefined || extra.length !== 2) {
+      process.stderr.write('Usage: interpret-replan <run-id> <task-id> <interpretation-file>\n'); return 1;
+    }
+    const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
+    const request = parseStrictYaml(await readFile(resolve(interpretationFile), 'utf8')) as Parameters<typeof AgentOrchestrator.interpretReplan>[2];
+    const interpretation = await AgentOrchestrator.interpretReplan(argument, taskId, request, { repositoryPath });
+    process.stdout.write(`${JSON.stringify({ interpretation, manualNextStep: `Inspect the interpretation, then run pnpm agents:propose-replan ${argument} ${taskId}` }, null, 2)}\n`);
+    return 0;
+  }
+  if (command === 'finalize-failed-salvage') {
+    const [taskId] = extra;
+    if (argument === undefined || taskId === undefined || extra.length !== 1) { process.stderr.write('Usage: finalize-failed-salvage <run-id> <task-id>\n'); return 1; }
+    const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
+    const failure = await AgentOrchestrator.finalizeFailedSalvage(argument, taskId, { repositoryPath });
+    process.stdout.write(`${JSON.stringify({ failure, manualNextStep: `Inspect the finalized evidence, then create an interpretation or proposal for ${taskId}` }, null, 2)}\n`);
     return 0;
   }
   if (command === 'apply-integration-fix') {

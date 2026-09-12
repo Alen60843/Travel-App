@@ -15,7 +15,7 @@ import {
 } from './agents';
 import { assertCodeInputHistory } from './replan/checkpoint';
 import { StaticReplanner, taskCodeInputs } from './replan/static-replanner';
-import { applyReplanOverlays, replanHash, type ReplanEvidenceNormalization, type ReplanProposal } from './replan/model';
+import { applyReplanOverlays, replanHash, type ReplanEvidenceNormalization, type ReplanInterpretation, type ReplanProposal } from './replan/model';
 import type { PhaseConfig } from './config';
 import { OrchestratorError, isOrchestratorError, type ErrorCode } from './errors';
 import {
@@ -648,6 +648,18 @@ export class AgentOrchestrator {
     return AgentOrchestrator.withRunMutation(runId, options, async () => {
       const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options, false);
       return orchestrator.replanner().normalizeEvidence(taskId, request.requestIndex, request.evidenceIndex, request.normalizedKind);
+    });
+  }
+
+  /** Explicitly authorizes one content-hashed, bounded interpretation; invokes no provider and changes no worktree. */
+  static async interpretReplan(runId: string, taskId: string, request: {
+    readonly requestIndex: number;
+    readonly resourceClaims?: readonly unknown[];
+    readonly evidenceTransformations?: readonly { readonly evidenceIndex: number; readonly normalizedKind?: string; readonly normalizedReference?: string }[];
+  }, options: OrchestratorOptions): Promise<ReplanInterpretation> {
+    return AgentOrchestrator.withRunMutation(runId, options, async () => {
+      const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options, false);
+      return orchestrator.replanner().interpret(taskId, request);
     });
   }
 
@@ -1342,6 +1354,75 @@ export class AgentOrchestrator {
     return AgentOrchestrator.recoverDirtyWriter(runId, taskId, options, true);
   }
 
+  /** Finalizes legacy event-backed verification failure provenance without executing commands or touching the worktree. */
+  static async finalizeFailedSalvage(runId: string, taskId: string, options: OrchestratorOptions) {
+    return AgentOrchestrator.withRunMutation(runId, options, async () => {
+      const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options, false);
+      const state = orchestrator.state;
+      const task = state.tasks[taskId];
+      if (state.strategy !== undefined || state.adaptive !== undefined || state.status !== 'BLOCKED' || task?.status !== 'BLOCKED'
+        || task.salvage === undefined || task.salvage.verification !== undefined || task.commit !== undefined
+        || state.integration.status !== 'PENDING' || state.integration.integratedTaskCommits.length !== 0
+        || (state.integrationAttempts?.length ?? 0) !== 0 || Object.values(state.tasks).some((entry) => ['RUNNING', 'READY'].includes(entry.status))) {
+        throw new OrchestratorError('TASK_STATE_INVALID', `Refusing failed salvage finalization for ${taskId}: run is not a quiescent static blocked source before integration`);
+      }
+      if ((await orchestrator.worktrees.listOwned()).some((entry) => entry.runId === runId && entry.kind === 'integration')) throw new OrchestratorError('TASK_STATE_INVALID', 'Integration worktree already exists');
+      for (const entry of Object.values(state.tasks)) for (const attempt of entry.agentAttempts) {
+        if (attempt.finishedAt === undefined) throw new OrchestratorError('TASK_STATE_INVALID', 'Run contains an unfinished agent attempt');
+        if (attempt.pid !== undefined) { try { process.kill(attempt.pid, 0); throw new OrchestratorError('TASK_STATE_INVALID', 'Run contains a live recorded agent process'); } catch (error) { if (error instanceof OrchestratorError || (error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; } }
+      }
+      const checked = await orchestrator.checkSalvageEligibility(taskId, true);
+      if (!checked.eligible) throw new OrchestratorError('TASK_STATE_INVALID', `Refusing failed salvage finalization for ${taskId}: ${checked.reason}`);
+      const source = await readFile(orchestrator.stateStore.eventsPath, 'utf8');
+      const lines = source.split('\n').filter((line) => line.length > 0);
+      const events = lines.map((line, index) => {
+        try { return { raw: line, index, event: JSON.parse(line) as { name?: string; runId?: string; taskId?: string; timestamp?: string; data?: Record<string, unknown> } }; }
+        catch (error) { throw new OrchestratorError('STATE_CORRUPT', `Invalid event JSON at line ${index + 1}`, { cause: error }); }
+      });
+      const taskEvents = events.filter(({ event }) => event.runId === runId && event.taskId === taskId);
+      const failurePosition = taskEvents.map(({ event }) => event.name).lastIndexOf('SALVAGE_VERIFICATION_FAILED');
+      if (failurePosition < 0) throw new OrchestratorError('TASK_STATE_INVALID', 'No salvage verification failure event exists for this task');
+      const failureEvent = taskEvents[failurePosition]!;
+      const authorizedPosition = taskEvents.slice(0, failurePosition).map(({ event }) => event.name).lastIndexOf('SALVAGE_AUTHORIZED');
+      if (authorizedPosition < 0) throw new OrchestratorError('TASK_STATE_INVALID', 'Salvage failure has no preceding authorization event');
+      if (taskEvents.slice(authorizedPosition + 1, failurePosition).some(({ event }) => ['SALVAGE_AUTHORIZED', 'SALVAGE_VERIFIED', 'SALVAGE_VERIFICATION_FAILED'].includes(event.name ?? ''))) throw new OrchestratorError('TASK_STATE_INVALID', 'Legacy salvage lifecycle evidence is ambiguous or reordered');
+      if (taskEvents.slice(failurePosition + 1).some(({ event }) => ['SALVAGE_VERIFIED', 'SALVAGE_AUTHORIZED', 'SALVAGE_COMMAND_FINISHED', 'SALVAGE_VERIFICATION_FAILED'].includes(event.name ?? ''))) throw new OrchestratorError('TASK_STATE_INVALID', 'Salvage failure is contradicted by later lifecycle evidence');
+      const commandEvents = taskEvents.slice(authorizedPosition + 1, failurePosition).filter(({ event }) => event.name === 'SALVAGE_COMMAND_FINISHED');
+      const reason = typeof failureEvent.event.data?.reason === 'string' ? failureEvent.event.data.reason : '';
+      const lastCommand = commandEvents.at(-1)?.event.data;
+      if (reason !== 'verify_command_failed' || commandEvents.some(({ event }) => event.data?.hostVerification !== true)
+        || lastCommand?.required !== true || !(lastCommand.exitCode !== 0 || lastCommand.timedOut === true || lastCommand.signal !== null && lastCommand.signal !== undefined || lastCommand.termination !== null && lastCommand.termination !== undefined)) {
+        throw new OrchestratorError('TASK_STATE_INVALID', 'Legacy salvage events do not prove a required verification command failed');
+      }
+      const worktreeHeadSha = await orchestrator.git.resolveCommit(checked.worktree.path, 'HEAD');
+      if (worktreeHeadSha !== task.preparedHeadSha) throw new OrchestratorError('TASK_STATE_INVALID', 'Legacy failed salvage worktree HEAD changed');
+      const trackedDiffFingerprint = await computeTrackedDiffFingerprint(orchestrator.git, checked.worktree.path, task.preparedHeadSha!);
+      const authorizationEvent = taskEvents[authorizedPosition]!;
+      if (typeof authorizationEvent.event.timestamp !== 'string' || Date.parse(authorizationEvent.event.timestamp) < Date.parse(task.salvage.authorizedAt)) throw new OrchestratorError('TASK_STATE_INVALID', 'Salvage authorization event does not match persisted authorization');
+      const evidenceLines = [authorizationEvent, ...commandEvents, failureEvent].map(({ index, raw }) => ({ line: index + 1, sha256: createHash('sha256').update(raw).digest('hex') }));
+      const logEvidence = [] as { path: string; sha256: string }[];
+      for (const { event } of commandEvents) for (const key of ['stdoutPath', 'stderrPath'] as const) {
+        const path = event.data?.[key];
+        if (typeof path !== 'string' || !resolve(path).startsWith(`${resolve(orchestrator.stateStore.runDirectory)}/`)) throw new OrchestratorError('TASK_STATE_INVALID', `Legacy salvage command lacks bounded ${key} evidence`);
+        let content: Buffer;
+        try { content = await readFile(path); } catch (error) { throw new OrchestratorError('TASK_STATE_INVALID', `Legacy salvage ${key} evidence is unreadable`, { cause: error }); }
+        logEvidence.push({ path, sha256: createHash('sha256').update(content).digest('hex') });
+      }
+      const evidenceHash = replanHash({ evidenceLines, logEvidence });
+      const failedAt = typeof failureEvent.event.timestamp === 'string' && Number.isFinite(Date.parse(failureEvent.event.timestamp)) ? failureEvent.event.timestamp : (() => { throw new OrchestratorError('STATE_CORRUPT', 'Failure event timestamp is invalid'); })();
+      const body = { failedAt, source: 'legacy_event_finalization' as const, reason, worktreeHeadSha, trackedDiffFingerprint, evidenceHash };
+      const failure = { id: replanHash({ runId, taskId, ...body }), ...body };
+      if (task.salvage.phase === 'FAILED') {
+        if (task.salvage.failures?.some((entry) => entry.id === failure.id)) return failure;
+        throw new OrchestratorError('TASK_STATE_INVALID', 'Persisted failed lifecycle differs from legacy evidence');
+      }
+      if (task.salvage.phase !== undefined) throw new OrchestratorError('TASK_STATE_INVALID', 'Only an ambiguous legacy salvage lifecycle may be finalized');
+      await orchestrator.mutate((current) => updateTask(current, taskId, (entry) => ({ ...entry, salvage: { ...entry.salvage!, phase: 'FAILED', failures: [failure] } })));
+      await orchestrator.event('SALVAGE_FAILED_FINALIZED', taskId, { failureId: failure.id, evidenceHash, evidenceLines, logEvidence });
+      return failure;
+    });
+  }
+
   private static async recoverDirtyWriter(
     runId: string,
     taskId: string,
@@ -1376,7 +1457,7 @@ export class AgentOrchestrator {
     if (orchestrator.state.tasks[taskId]?.salvage === undefined) {
       await orchestrator.mutate((state) => updateTask(state, taskId, (task) => ({
         ...task,
-        salvage: { authorizedAt: orchestrator.clock().toISOString() },
+        salvage: { authorizedAt: orchestrator.clock().toISOString(), phase: 'AUTHORIZED' },
       })));
       await orchestrator.event('SALVAGE_AUTHORIZED', taskId, blockedWriter
         ? { recoveryMode: 'blocked_writer_host_verification', originalHandoffPath: originalTask.handoffPath, error: originalTask.error, attempt: originalTask.agentAttempts.at(-1) }
@@ -1403,6 +1484,22 @@ export class AgentOrchestrator {
       && existingCheckpoint.verifyConfigFingerprint === verifyConfigFingerprint;
 
     if (!checkpointValid) {
+      await orchestrator.mutate((state) => updateTask(state, taskId, (task) => ({
+        ...task, salvage: { authorizedAt: task.salvage!.authorizedAt, phase: 'VERIFYING', ...(task.salvage!.failures === undefined ? {} : { failures: task.salvage!.failures }) },
+      })));
+      const recordFailure = async (reason: string, commandResults: readonly IntegrationCommandResult[] = []): Promise<void> => {
+        const failedAt = orchestrator.clock().toISOString();
+        const worktreeHeadSha = await orchestrator.git.resolveCommit(checked.worktree.path, 'HEAD');
+        const trackedDiffFingerprint = await computeTrackedDiffFingerprint(orchestrator.git, checked.worktree.path, preparedHeadSha);
+        const evidence = { runId, taskId, reason, failedAt, worktreeHeadSha, trackedDiffFingerprint, verifyConfigFingerprint, commandResults };
+        const evidenceHash = createHash('sha256').update(JSON.stringify(evidence)).digest('hex');
+        const body = { failedAt, source: 'runtime' as const, reason, worktreeHeadSha, trackedDiffFingerprint, evidenceHash };
+        const failure = { id: replanHash({ runId, taskId, ...body }), ...body };
+        await orchestrator.mutate((state) => updateTask(state, taskId, (task) => ({ ...task,
+          salvage: { ...task.salvage!, phase: 'FAILED', failures: [...(task.salvage!.failures ?? []), failure] },
+        })));
+        await orchestrator.event('SALVAGE_VERIFICATION_FAILED', taskId, { reason, failureId: failure.id, evidenceHash });
+      };
       // Unique attempt directories preserve command logs and evidence across retries.
       const logsDirectory = join(orchestrator.stateStore.runDirectory, 'logs', taskId,
         `salvage-${randomBytes(12).toString('hex')}`);
@@ -1464,6 +1561,7 @@ export class AgentOrchestrator {
         }
       }
       if (orchestrator.config.salvage.verify.length === 0) {
+        await recordFailure('no_verify_configured');
         throw new OrchestratorError(
           'SALVAGE_VERIFICATION_FAILED',
           `Refusing salvage for ${taskId}: no salvage.verify commands configured`,
@@ -1488,7 +1586,7 @@ export class AgentOrchestrator {
       // even one that happens to also report success.
       if (postFingerprint !== preFingerprint
         || await orchestrator.git.resolveCommit(checked.worktree.path, 'HEAD') !== preparedHeadSha) {
-        await orchestrator.event('SALVAGE_VERIFICATION_FAILED', taskId, { reason: 'verify_mutated_tracked_source' });
+        await recordFailure('verify_mutated_tracked_source', verified.commands);
         throw new OrchestratorError(
           'SALVAGE_VERIFICATION_FAILED',
           `Refusing salvage for ${taskId}: verify commands modified tracked source`,
@@ -1496,7 +1594,7 @@ export class AgentOrchestrator {
         );
       }
       if (!verified.passed) {
-        await orchestrator.event('SALVAGE_VERIFICATION_FAILED', taskId, { reason: 'verify_command_failed' });
+        await recordFailure('verify_command_failed', verified.commands);
         throw new OrchestratorError(
           'SALVAGE_VERIFICATION_FAILED',
           `Refusing salvage for ${taskId}: required verify command failed`,
@@ -1531,6 +1629,8 @@ export class AgentOrchestrator {
         ...task,
         salvage: {
           authorizedAt: task.salvage!.authorizedAt,
+          phase: 'VERIFIED',
+          ...(task.salvage!.failures === undefined ? {} : { failures: task.salvage!.failures }),
           verification: {
             worktreeHeadSha: preparedHeadSha,
             trackedDiffFingerprint: postFingerprint,
