@@ -2,9 +2,9 @@
 
 > Persistent source of truth for continuing Orchestrator development across chats, agents, and context resets.
 >
-> Read this file first in any future session, but **always inspect live persisted run state/events before mutating anything**.
+> Read this file first in any future session, but **always inspect live persisted run state/events/worktree state before mutating anything**.
 
-Last updated: 2026-09-11
+Last updated: 2026-09-12
 
 ## Project priority
 
@@ -28,10 +28,10 @@ Core goals:
 run-20260910100819-8ddbdc28
 phase: 7
 baseBranch: phase7/chat-realtime-design
-orchestrator development branch: orchestrator/replan-evidence-normalization
+orchestrator development branch: orchestrator/claude-readonly-review-retry
 ```
 
-### Major Phase 7 milestone: static scope replan succeeded
+### Major Phase 7 milestone: first static scope replan succeeded
 
 The original Event writer `phase7-event-chat-integration` hit a legitimate ownership gap: Event work required complementary Chat authorization changes outside its static ownership.
 
@@ -46,7 +46,7 @@ follow-up commit: a57c582e4ec4027d6b5bd94b4795d2243563c28c
 
 A legacy mislabeled evidence entry (`kind: test` containing a repository file path) was normalized explicitly to file evidence without modifying the original handoff.
 
-The dynamic Chat follow-up initially blocked on PostgreSQL verification. Host verification then exposed a **real test setup defect**, not a DB outage: PostgreSQL could not infer `$2` consistently because the integration test reused it both as `event_status` and in an untyped comparison. The preserved worktree was corrected narrowly with explicit `event_status` casts.
+The dynamic Chat follow-up initially blocked on PostgreSQL verification. Host verification exposed a real test setup defect: PostgreSQL could not infer `$2` consistently because an integration test reused it both as `event_status` and in an untyped comparison. The preserved worktree was corrected narrowly with explicit `event_status` casts.
 
 Verification after that repair:
 
@@ -55,49 +55,190 @@ focused integration test: 14/14 passed
 full API suite: 74 suites / 639 tests passed
 ```
 
-Canonical `verify-blocked-task` then succeeded and produced the follow-up commit above.
-
-On the next `agents:resume`, the replan completed successfully:
+Canonical `verify-blocked-task` produced the follow-up commit, and the next `agents:resume` completed the replan:
 
 ```text
 phase7-event-chat-integration.status = SUCCEEDED
 phase7-event-chat-integration.commit = b324663a719eb519a884117a8a556c98936c0738
 replan.phase = RESOLVED
-composed verification = PASSED
+composed replan verification = PASSED
 ```
 
-The composed verification ran:
+### Major Phase 7 milestone: Claude read-only review recovery succeeded end-to-end
+
+`phase7-event-chat-review` originally failed even though the Claude process succeeded:
+
+```text
+status = FAILED
+error.code = REVIEW_BLOCKED
+error.message = "review: must be an object"
+attempt 1 outcome = succeeded
+reviewRounds = 0
+```
+
+Raw stdout proved Claude had completed the review reasoning and intended `approved`, but it had been placed in Claude Plan Mode while only `Read,Glob,Grep` were available. The adapter conflated read-only capability with Plan Mode workflow semantics.
+
+Root cause:
+
+```text
+read_only task
+→ --permission-mode plan
+→ tools restricted to Read,Glob,Grep
+→ Claude expects plan-file / ExitPlanMode workflow
+→ cannot complete Plan Mode
+→ returns prose instead of structured review
+```
+
+Orchestrator fix on branch `orchestrator/claude-readonly-review-retry`:
+
+```text
+commit: 354bc7c36bca76c1584be1068e4c05b8107b422c
+read-only Claude mode: --permission-mode dontAsk
+read-only tools: Read,Glob,Grep
+writer behavior: unchanged
+```
+
+A bounded explicit recovery primitive was added:
+
+```text
+pnpm agents:retry-review-output <run-id> <task-id>
+```
+
+It preserves attempt 1/stdout/provenance, invokes zero providers during authorization, allows one retry, reopens only attributable pristine descendants, and requires the retry to pass through the normal strict review path.
+
+Real dogfood result:
+
+```text
+retry-review-output authorization: PASSED
+phase7-event-chat-review attempt 2: SUCCEEDED
+reviewRounds: 1
+phase7-event-chat-correction: SKIPPED
+phase7-event-chat-final-review: SKIPPED
+```
+
+This proves the complete sequence:
+
+```text
+real provider-adapter defect
+→ evidence-first diagnosis
+→ Orchestrator code repair
+→ independent adversarial review
+→ bounded retry authorization
+→ original evidence preserved
+→ second real provider invocation
+→ strict structured-review validation
+→ scheduler continuation
+```
+
+Failure classification to remember:
+
+```text
+ORCHESTRATOR_DEFECT
+└── PROVIDER_ADAPTER_MODE_MISMATCH
+    └── STRUCTURED_OUTPUT_FAILURE
+```
+
+### Current blocker: Phase 7 composed verification exposed two independent defects
+
+`phase7-composed-verification` ran after Event review succeeded. Codex added seven composed integration cases inside its declared ownership and blocked with `REVIEW_BLOCKED` because live verification could not complete inside its sandbox.
+
+Host probes proved infrastructure was healthy:
+
+```text
+PostgreSQL 127.0.0.1:5432      reachable / healthy
+Redis queue 127.0.0.1:6379     reachable / healthy
+Redis cache 127.0.0.1:6380     reachable / healthy
+```
+
+Canonical `verify-blocked-task` then ran the real host verification:
 
 ```text
 pnpm install --frozen-lockfile                       PASS
 pnpm --filter @tripwith/shared build                PASS
 pnpm --filter @tripwith/api typecheck               PASS
-pnpm --filter @tripwith/api test -- --runInBand     PASS
+pnpm --filter @tripwith/api test -- --runInBand     FAIL
 ```
 
-### Current blocker: Event review structured output
-
-After successful replan resolution, `phase7-event-chat-review` invoked Claude and the **provider process itself succeeded**, but the structured review failed strict validation:
+Result:
 
 ```text
-phase7-event-chat-review.status = FAILED
-attempts = 1
-latestAttempt.outcome = succeeded
-error.code = REVIEW_BLOCKED
-error.message = "review: must be an object"
-reviewRounds = 0
+75 suites total
+74 passed
+1 failed
+646 tests total
+641 passed
+5 failed
+only failing suite: test/phase7-chat-realtime/composed.int-spec.ts
 ```
 
-All downstream Event correction/final-review and final composed tasks are blocked only by dependency failure.
+The failures split into **two distinct clusters** and must not be treated as one generic failure.
 
-Important: the current runtime's `parseOrRecoverReview()` already performs two deterministic recovery attempts during live completion:
+#### Cluster A — TEST_FIXTURE_CLEANUP_DEFECT
 
-1. normalize only `approved` + material findings -> `changes_requested`;
-2. framing extraction from raw stdout followed by strict `validateReview`.
+Three composed tests failed only during teardown. Root cause:
 
-Therefore the current failure means the live parser did **not** find a valid review through those paths. `agents:recover-handoffs` still explicitly supports terminal `REVIEW_BLOCKED` review tasks whose agent process succeeded, so it is safe to try as the canonical persisted structured-output recovery primitive, but it may legitimately skip this task if the same persisted evidence is insufficient. It must not silently manufacture review semantics.
+```text
+cleanup deleted users before chat rooms/messages
+→ messages.sender_user_id ON DELETE SET NULL
+→ non-SYSTEM messages temporarily had sender_user_id = NULL
+→ messages_sender_chk rejected the row state
+```
 
-If deterministic recovery skips, inspect the original raw stdout and `HANDOFF_REPAIR_ATTEMPTED`/repair-history evidence before designing any new primitive. Preserve the original stdout byte-for-byte.
+Additional constraint: Match rooms cannot simply be deleted first because `matches.chat_room_id` uses `ON DELETE RESTRICT`.
+
+Authorized fixture correction inside the preserved composed-verification worktree:
+
+```text
+DELETE tracked matches by chat_room_id
+DELETE tracked chat_rooms       # cascades messages/memberships
+DELETE tracked users
+```
+
+Codex verified the unaffected composed cases after this correction. No commit was created.
+
+#### Cluster B — EVENT_REALTIME_AUTHORIZATION_DEFECT / second scope gap
+
+Both EVENT composed cases fail at the first realtime `chat:join` for approved Event host/member (`manual=true` and `manual=false`).
+
+Complete wire payload:
+
+```json
+{"ok":false,"error":{"code":"CHAT_ROOM_UNSUPPORTED","message":"Event chat is not available yet."}}
+```
+
+Evidence trace:
+
+```text
+ChatGateway.authorize
+→ ChatService.authorizeRoom succeeds
+→ ChatService already enforces Event membership/lifecycle/account policy
+→ ChatGateway then unconditionally rejects room.type === 'EVENT'
+→ valid approved Event host/member cannot join realtime chat
+```
+
+Presence is not involved in this initial `chat:join` rejection.
+
+The obsolete guard is in:
+
+```text
+apps/api/src/chat/transport/chat.gateway.ts
+```
+
+Required production ownership:
+
+```text
+apps/api/src/chat/transport/**
+```
+
+But `phase7-composed-verification` owns only:
+
+```text
+apps/api/test/phase7-chat-realtime/**
+```
+
+Therefore Codex correctly **did not edit production code** and reported a second real static ownership gap. The next canonical action is to use the existing authorized static-scope replanning mechanism rather than bypass ownership.
+
+Current preserved composed-verification worktree contains only the authorized fixture cleanup/test work and remains uncommitted for canonical recovery/replan handling.
 
 ---
 
@@ -112,6 +253,7 @@ c2701c6  stale preflight lock cleanup race hardening
 f170d54  authorized static scope-gap replanning
 aef8c50  strict replan evidence + ownership hardening
 c6cd427  explicit normalization of legacy mislabeled replan evidence
+354bc7c  fix Claude read-only mode + bounded structured-review retry
 ```
 
 Current recovery/replan primitives include:
@@ -122,6 +264,7 @@ agents:retry-agent
 agents:salvage-task
 agents:verify-blocked-task
 agents:retry-preflight
+agents:retry-review-output
 agents:normalize-replan-evidence
 agents:propose-replan
 agents:authorize-replan
@@ -136,8 +279,6 @@ Design rule: preserve evidence and provenance; prefer deterministic recovery; ne
 
 ### Provider claims are hypotheses, not facts
 
-Use:
-
 ```text
 agent claim
 → evidence probe
@@ -146,7 +287,10 @@ agent claim
 → recovery/repair policy
 ```
 
-A provider saying “sandbox EPERM” is not enough. In Phase 7, host verification disproved the simple environmental explanation and exposed a real SQL test defect.
+Examples from Phase 7:
+
+- “PostgreSQL blocked by sandbox” was not accepted as truth; host verification exposed a real SQL test defect.
+- “PostgreSQL/Redis connection failures” from composed verification were followed by host health probes and canonical host verification, which exposed a real realtime Event guard plus a fixture cleanup defect.
 
 ### Recovery != Repair
 
@@ -162,8 +306,23 @@ quota exhaustion                  -> recovery / reroute
 useful dirty AGENT_FAILED writer  -> salvage recovery
 blocked sandbox DB verification   -> host verification recovery
 bad SQL integration test          -> bounded repair
-review-lineage algorithm defect   -> Orchestrator self-repair candidate
+read-only Claude Plan Mode bug     -> Orchestrator repair + bounded retry
+static ownership gap              -> authorized replan
 ```
+
+### Failure clustering matters
+
+One failed command or suite may contain multiple root causes. Do not issue a generic “fix all failing tests” repair.
+
+The composed suite demonstrated:
+
+```text
+same failing suite
+├── TEST_FIXTURE_CLEANUP_DEFECT
+└── EVENT_REALTIME_AUTHORIZATION_DEFECT
+```
+
+Failure Intelligence must cluster failures before selecting repairs.
 
 ### Dynamic work uses the same safety machinery
 
@@ -205,21 +364,23 @@ Failure Intelligence is a **core subsystem**.
 
 ### Failure Facts
 
-Persist machine-readable observations separately from policy decisions. Do not put subjective fields such as `retryable: true` into raw facts.
+Persist machine-readable observations separately from policy decisions. Do not put subjective policy such as `retryable: true` into raw facts.
 
-Example:
+Useful facts include:
 
 ```text
-source: verification
-command: pnpm --filter @tripwith/api test -- --runInBand
-exitCode: 1
-passingSuites: 73
-failingSuites: 1
-passingTests: 635
-failingTests: 4
-errorClass: QueryFailedError
-file: src/chat/event-chat.int-spec.ts
-databaseReachable: true
+source
+command
+exitCode
+provider/process outcome
+passing/failing suites and tests
+error class/code
+file/line
+DB/Redis reachability
+worktree/git state
+ownership scope
+structured-output validity
+provider capability/quota state
 ```
 
 ### Evidence probes
@@ -229,11 +390,12 @@ logs
 focused tests
 git state
 provider health/quota
-DB reachability
+DB/Redis reachability
 permission/sandbox capability
 schema inspection
 previous failure history
 structured-output inspection
+exact wire/API payloads
 ```
 
 ### Initial taxonomy
@@ -246,7 +408,10 @@ PERMISSION_DENIED
 ENVIRONMENT_FAILURE
 VERIFICATION_FAILURE
 TEST_FAILURE
+TEST_FIXTURE_CLEANUP_DEFECT
 STRUCTURED_OUTPUT_FAILURE
+PROVIDER_ADAPTER_MODE_MISMATCH
+EVENT_REALTIME_AUTHORIZATION_DEFECT
 OWNERSHIP_GAP
 PLAN_GAP
 RECOVERY_GAP
@@ -316,7 +481,10 @@ static Event/Chat ownership gap
 legacy mislabeled replan evidence
 PostgreSQL sandbox limitation
 SQL enum parameter inference test defect
-Event review structured-output shape failure
+Claude read-only Plan Mode / structured-output failure
+composed fixture cleanup ordering defect
+EVENT realtime transport obsolete unsupported-room guard
+second static scope gap: composed verification -> chat transport
 ```
 
 Goals: cluster recurring failures, measure human interventions, identify hotspots, reuse successful repairs, learn provider weaknesses, and predict avoidable failures before dispatch.
@@ -489,11 +657,13 @@ The UI consumes the event-sourced runtime; it is never the source of truth.
 
 1. Inspect persisted run state/events/worktree status before mutation.
 2. Never manually edit protected run artifacts.
-3. Do not manually commit preserved task worktrees when a canonical recovery primitive should commit them.
+3. Do not manually commit preserved task worktrees when a canonical recovery/replan primitive should own the commit.
 4. Treat provider explanations as hypotheses until verified.
 5. Prefer the narrowest repair over broad refactors.
 6. Preserve raw stdout, handoffs, reviews, checkpoints, and provenance.
 7. Fail closed on ambiguity.
 8. Do not delete active run worktrees or prune while Phase 7 is unresolved.
 9. Avoid provider calls when deterministic probes can classify the failure first.
-10. Update this file after every material architectural decision, recovery primitive, roadmap change, or dogfood milestone.
+10. Separate multiple failure clusters before choosing a repair.
+11. Never fix an out-of-ownership production defect inside a verification/test-only task; use authorized replan.
+12. Update this file after every material architectural decision, recovery primitive, roadmap change, or dogfood milestone.
