@@ -5,7 +5,7 @@ import { computeTrackedDiffFingerprint, inspectTaskCommits, type GitClient, type
 import { writeHandoff } from '../handoff';
 import { IntegrationGate } from '../integration/integration-gate';
 import type { RunState, StateStore, TaskRunState, RunEventName } from '../state';
-import { TaskGraph, assertChangedFileOwnership, matchesOwnershipPattern, type TaskSpec } from '../tasks';
+import { TaskGraph, assertChangedFileOwnership, matchesOwnershipPattern, type TaskMode, type TaskSpec } from '../tasks';
 import { ownershipGlobsOverlap, normalizeRepositoryPath } from '../tasks/ownership';
 import { parseTaskSpec } from '../tasks/task-schema';
 import type { WorkRequestDraft } from '../adaptive/types';
@@ -43,6 +43,10 @@ interface ReplannerContext {
   readonly event: (name: RunEventName, taskId: string, detail: Record<string, unknown>) => Promise<void>;
 }
 
+export function isSupportedStaticReplanSourceMode(mode: TaskMode): mode is 'implementation' | 'testing' {
+  return mode === 'implementation' || mode === 'testing';
+}
+
 export class StaticReplanner {
   constructor(private readonly ctx: ReplannerContext) {}
 
@@ -72,10 +76,10 @@ export class StaticReplanner {
     const task = state.tasks[taskId];
     const spec = this.ctx.config.tasks.find((entry) => entry.id === taskId);
     const attempt = task?.agentAttempts.at(-1);
-    if (task === undefined || spec === undefined || task.status !== 'BLOCKED' || !spec.writer || spec.mode !== 'implementation'
+    if (task === undefined || spec === undefined || task.status !== 'BLOCKED' || !spec.writer || !isSupportedStaticReplanSourceMode(spec.mode)
       || task.error?.code !== 'REVIEW_BLOCKED' || attempt?.outcome !== 'succeeded' || attempt.finishedAt === undefined
       || task.handoffOutcome !== 'valid' || task.commit !== undefined || task.salvage !== undefined
-      || task.worktreePath === undefined || task.branch === undefined || task.preparedHeadSha === undefined) refuse('source must be a blocked implementation writer with an accepted blocked handoff and no canonical commit');
+      || task.worktreePath === undefined || task.branch === undefined || task.preparedHeadSha === undefined) refuse('source must be a blocked implementation or testing writer with an accepted blocked handoff and no canonical commit');
     const worktree = await this.ctx.worktrees.assertRegistered(task.worktreePath);
     const registered = (await this.ctx.worktrees.listGitWorktrees()).find((entry) => entry.path === worktree.path);
     if (worktree.runId !== state.runId || worktree.taskId !== task.id || worktree.kind !== 'task' || worktree.branch !== task.branch
