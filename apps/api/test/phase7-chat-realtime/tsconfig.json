@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "../../../..",
+    "noEmit": true,
+    "paths": {
+      "@tripwith/shared": ["../../../../packages/shared/src/index.ts"]
+    }
+  },
+  "include": ["./*.ts"]
+}
