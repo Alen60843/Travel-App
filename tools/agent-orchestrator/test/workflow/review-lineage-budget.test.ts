@@ -6,8 +6,9 @@ import test from 'node:test';
 import type { Agent, AgentName, AgentRequest, AgentResult } from '../../src/agents';
 import { isOrchestratorError } from '../../src/errors';
 import { AgentOrchestrator } from '../../src/orchestrator';
+import { completedReviewRounds } from '../../src/review/lineage';
 import type { RunEvent, RunState } from '../../src/state';
-import type { TaskCondition, TaskMode } from '../../src/tasks';
+import { TaskGraph, type TaskCondition, type TaskMode } from '../../src/tasks';
 import { createTemporaryRepository } from '../git/helpers';
 
 interface Task {
@@ -73,6 +74,7 @@ async function runWorkflow(
   options: { maxReviewRounds?: number; concurrency?: number; approved?: string[] },
   check: (result: {
     state: RunState; events: RunEvent[]; invocations: string[];
+    orchestrator: AgentOrchestrator;
     repositoryPath: string; runsRoot: string; agents: { codex: ReviewAgent; claude: ReviewAgent };
   }) => Promise<void> | void,
 ): Promise<void> {
@@ -101,7 +103,7 @@ async function runWorkflow(
     assert.deepEqual(JSON.parse(await readFile(join(orchestrator.stateStore.runDirectory, 'run.json'), 'utf8')), state);
     const events = (await readFile(join(orchestrator.stateStore.runDirectory, 'events.jsonl'), 'utf8'))
       .trim().split('\n').map((line) => JSON.parse(line) as RunEvent);
-    await check({ state, events, invocations: [...agents.codex.invocations, ...agents.claude.invocations],
+    await check({ state, events, orchestrator, invocations: [...agents.codex.invocations, ...agents.claude.invocations],
       repositoryPath: fixture.repository, runsRoot, agents });
   } finally {
     await fixture.dispose();
@@ -165,7 +167,7 @@ test('parallel workstreams after a shared reviewed ancestor each receive an inde
   });
 });
 
-test('legacy unconditioned Phase 5 chains work without naming conventions and still block a third round', async () => {
+test('unconditioned reviews in legacy chains now start fresh explicit budget lineages', async () => {
   await runWorkflow([
     task('oak', 'implementation', [], ['one.txt']), task('birch', 'review', ['oak']),
     task('elm', 'correction', ['birch'], ['one.txt']), task('ash', 'final_review', ['elm']),
@@ -174,11 +176,11 @@ test('legacy unconditioned Phase 5 chains work without naming conventions and st
     task('cedar', 'review', ['fir']),
   ], {}, ({ state, events }) => {
     assertRound(state, events, 'birch', 1);
-    assertRound(state, events, 'ash', 2);
+    assertRound(state, events, 'ash', 1);
     assertRound(state, events, 'pine', 1);
-    assertRound(state, events, 'fir', 2);
-    assert.deepEqual(state.tasks.cedar?.error?.details, { completedRounds: 2, maxReviewRounds: 2 });
-    assert.equal(state.tasks.cedar?.agentAttempts.length, 0);
+    assertRound(state, events, 'fir', 1);
+    assertRound(state, events, 'cedar', 1);
+    assert.equal(state.status, 'COMPLETED');
   });
 });
 
@@ -195,7 +197,7 @@ test('skipped correction and final review consume no round, including a subseque
       assert.ok(!invocations.includes(id));
     }
     assertRound(state, events, 'core-review', 1);
-    assertRound(state, events, 'audit', 2);
+    assertRound(state, events, 'audit', 1);
     assertRound(state, events, 'realtime-review', 1);
     assertRound(state, events, 'realtime-final-review', 2);
   });
@@ -219,7 +221,7 @@ test('an explicit reviewOf selects its own lineage when another reviewed workstr
   });
 });
 
-test('synthesis joins retain both input lineages and fail closed when their successful rounds exhaust the budget', async () => {
+test('an unconditioned synthesis after a join starts a fresh review budget', async () => {
   await runWorkflow([
     task('seed', 'implementation', [], ['seed.txt']),
     task('one', 'review', ['seed']), task('two', 'review', ['seed']),
@@ -227,8 +229,59 @@ test('synthesis joins retain both input lineages and fail closed when their succ
   ], { concurrency: 2 }, ({ state, events }) => {
     assertRound(state, events, 'one', 1);
     assertRound(state, events, 'two', 1);
-    assert.equal(state.tasks.combined?.error?.code, 'BLOCKED_FOR_HUMAN_REVIEW');
-    assert.deepEqual(state.tasks.combined?.error?.details, { completedRounds: 2, maxReviewRounds: 2 });
-    assert.equal(state.tasks.combined?.agentAttempts.length, 0);
+    assertRound(state, events, 'combined', 1);
+    assert.equal(state.status, 'COMPLETED');
+  });
+});
+
+test('four reviewed workstreams joined by testing do not consume a new unconditioned final review budget', async () => {
+  const tasks = ['a', 'b', 'c', 'd'].flatMap((prefix) => [
+    task(`${prefix}-impl`, 'implementation', [], [`${prefix}.txt`]),
+    task(`${prefix}-review`, 'review', [`${prefix}-impl`]),
+  ]);
+  tasks.push(task('composed', 'testing', ['a-review', 'b-review', 'c-review', 'd-review'], ['composed.txt']));
+  tasks.push(task('phase-final', 'final_review', ['composed']));
+  await runWorkflow(tasks, { concurrency: 4 }, ({ state, events, agents, orchestrator }) => {
+    assert.equal(state.status, 'COMPLETED');
+    const spec = orchestrator.config.tasks.find((entry) => entry.id === 'phase-final')!;
+    assert.equal(completedReviewRounds(spec, new TaskGraph(orchestrator.config.tasks), (id) => state.tasks[id]?.status === 'SUCCEEDED'), 0);
+    assertRound(state, events, 'phase-final', 1);
+    assert.equal(agents.claude.invocations.filter((id) => id === 'phase-final').length, 1);
+  });
+});
+
+test('an explicit reviewOf after a multi-lineage join counts only the selected lineage', async () => {
+  await runWorkflow([
+    task('a-impl', 'implementation', [], ['a.txt']), task('a-review', 'review', ['a-impl']),
+    task('b-impl', 'implementation', [], ['b.txt']), task('b-review', 'review', ['b-impl']),
+    task('composed', 'testing', ['a-review', 'b-review'], ['composed.txt']),
+    task('phase-final', 'final_review', ['composed'], [], 'a-review'),
+  ], {}, ({ state, events }) => {
+    assert.equal(state.status, 'COMPLETED');
+    assertRound(state, events, 'phase-final', 2);
+  });
+});
+
+test('intermediate correction, testing, and synthesis do not erase an explicitly selected lineage', async () => {
+  await runWorkflow([
+    task('impl', 'implementation', [], ['shared.txt']), task('initial', 'review', ['impl']),
+    task('fix', 'correction', ['initial'], ['shared.txt'], 'initial'),
+    task('test', 'testing', ['fix'], ['test.txt']), task('summary', 'synthesis', ['test']),
+    task('final', 'final_review', ['summary'], [], 'initial'),
+  ], {}, ({ state, events }) => {
+    assert.equal(state.status, 'COMPLETED');
+    assertRound(state, events, 'initial', 1);
+    assertRound(state, events, 'summary', 1);
+    assertRound(state, events, 'final', 2);
+  });
+});
+
+test('a review directly depending on another review without reviewOf starts a fresh lineage', async () => {
+  await runWorkflow([
+    task('impl', 'implementation', [], ['shared.txt']), task('first', 'review', ['impl']), task('second', 'final_review', ['first']),
+  ], {}, ({ state, events }) => {
+    assert.equal(state.status, 'COMPLETED');
+    assertRound(state, events, 'first', 1);
+    assertRound(state, events, 'second', 1);
   });
 });

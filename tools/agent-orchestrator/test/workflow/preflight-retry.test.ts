@@ -28,9 +28,10 @@ class FakeAgent implements Agent {
     this.invocations.push(request.taskId);
     await request.onStarted?.(process.pid);
     const writer = request.access === 'writer';
-    if (writer) await writeFile(join(request.worktreePath, 'shared.txt'), request.taskId);
+    const changedFile = request.allowedFileOwnership[0] ?? 'shared.txt';
+    if (writer) await writeFile(join(request.worktreePath, changedFile), request.taskId);
     const output = writer ? {
-      status: 'complete', summary: request.taskId, filesChanged: ['shared.txt'], decisions: [], tests: [],
+      status: 'complete', summary: request.taskId, filesChanged: [changedFile], decisions: [], tests: [],
       openQuestions: [], reviewRequested: [],
     } : request.taskId.endsWith('final-review') ? approved : changes;
     const timestamp = new Date().toISOString();
@@ -163,6 +164,51 @@ for (const prepared of [true, false]) {
     } finally { await f.repository.dispose(); }
   });
 }
+
+test('preflight retry recomputes zero rounds for a final review after four reviewed branches join through testing', async () => {
+  const repository = await createTemporaryRepository();
+  try {
+    await writeFile(join(repository.repository, 'design.md'), '# Design');
+    await repository.git.run(repository.repository, ['add', '--', 'design.md']);
+    await repository.git.run(repository.repository, ['commit', '-m', 'design']);
+    const joinedTarget = 'joined-final-review';
+    const branchTasks = ['a', 'b', 'c', 'd'].flatMap((prefix) => [
+      { id: `${prefix}-impl`, title: `${prefix}-impl`, mode: 'implementation', owner: 'codex', files: [`${prefix}.txt`], dependsOn: [] },
+      { id: `${prefix}-review`, title: `${prefix}-review`, mode: 'review', owner: 'claude', files: [], dependsOn: [`${prefix}-impl`] },
+    ]);
+    const tasks = [...branchTasks,
+      { id: 'composed', title: 'composed', mode: 'testing', owner: 'codex', files: ['composed.txt'], dependsOn: ['a-review', 'b-review', 'c-review', 'd-review'] },
+      { id: joinedTarget, title: joinedTarget, mode: 'final_review', owner: 'claude', files: [], dependsOn: ['composed'] },
+    ];
+    const phaseFile = join(repository.container, 'phase.yaml');
+    await writeFile(phaseFile, JSON.stringify({ phase: 'joined-preflight', name: 'Joined preflight', baseBranch: repository.baseBranch,
+      canonicalDesignDocument: 'design.md', maxReviewRounds: 2, concurrency: 4, tasks, integration: { commands: ['true'] } }));
+    const agents = { codex: new FakeAgent('codex'), claude: new FakeAgent('claude') };
+    const options = { repositoryPath: repository.repository, runsRoot: join(repository.container, 'runs'), agents };
+    const orchestrator = await AgentOrchestrator.start(phaseFile, options);
+    const prototype = AgentOrchestrator.prototype as unknown as { executeTask(task: TaskSpec): Promise<void>; prepareTask(task: TaskSpec): Promise<unknown> };
+    const executeTask = prototype.executeTask;
+    prototype.executeTask = async function (task) {
+      if (task.id !== joinedTarget) return executeTask.call(this, task);
+      await this.prepareTask(task);
+      throw new OrchestratorError('BLOCKED_FOR_HUMAN_REVIEW', 'Historical joined-lineage failure', { details: { completedRounds: 4, maxReviewRounds: 2 } });
+    };
+    let failed: RunState;
+    try { failed = await orchestrator.execute(); } finally { prototype.executeTask = executeTask; }
+    assert.equal(failed.tasks[joinedTarget]?.agentAttempts.length, 0);
+    assert.deepEqual(failed.tasks[joinedTarget]?.error?.details, { completedRounds: 4, maxReviewRounds: 2 });
+    const calls = [...agents.claude.invocations];
+    const result = await AgentOrchestrator.retryPreflight(failed.runId, joinedTarget, options);
+    assert.equal(result.completedRounds, 0);
+    assert.equal(result.maxReviewRounds, 2);
+    assert.deepEqual(agents.claude.invocations, calls, 'authorization invokes no provider');
+    const completed = await (await AgentOrchestrator.resume(failed.runId, options)).execute();
+    assert.equal(completed.status, 'COMPLETED');
+    assert.equal(agents.claude.invocations.filter((id) => id === joinedTarget).length, 1);
+    const runEvents = (await readFile(orchestrator.stateStore.eventsPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as RunEvent);
+    assert.deepEqual(runEvents.filter((event) => event.name === 'REVIEW_STARTED' && event.taskId === joinedTarget).map((event) => event.data?.round), [1]);
+  } finally { await repository.dispose(); }
+});
 
 test('preflight retry refuses unsupported state and evidence without mutation or providers', async (t) => {
   const f = await fixture();
@@ -617,7 +663,7 @@ test('a legitimate conditional skipped dependency remains satisfied', async () =
         agentAttempts: [], reviewRounds: 0, reviewPaths: [], handoffRepairAttempts: [] },
     } });
     const result = await retry(f);
-    assert.equal(result.completedRounds, 1);
+    assert.equal(result.completedRounds, 0);
     assert.equal(result.orchestrator.snapshot().tasks[target]?.status, 'READY');
     assert.equal(result.orchestrator.snapshot().tasks.optional?.status, 'SKIPPED');
   } finally { await f.repository.dispose(); }

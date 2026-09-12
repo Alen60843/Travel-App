@@ -438,10 +438,15 @@ test('Phase-7-shaped v2 flow preserves the raw handoff through failed-salvage fi
   const proposal = await f.propose();
   assert.deepEqual(proposal.interpretationIds, [interpretation.id]);
   await f.authorize(proposal);
-  const result = await (await AgentOrchestrator.resume(f.runId, f.options)).execute();
+  const resumed = await AgentOrchestrator.resume(f.runId, f.options);
+  const result = await resumed.execute();
   assert.equal(result.status, 'COMPLETED');
   assert.equal(result.tasks.event!.status, 'SUCCEEDED');
+  assert.equal(result.tasks.event!.replan?.phase, 'RESOLVED');
   assert.equal(result.tasks[proposal.overlay.followup.id]!.status, 'SUCCEEDED');
+  assert.deepEqual(resumed.config.tasks.find((task) => task.id === 'phase-final')?.dependsOn, ['event', proposal.overlay.followup.id]);
+  const events = (await readFile(f.store.eventsPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as { name: string; taskId?: string; data?: Record<string, unknown> });
+  assert.deepEqual(events.filter((event) => event.name === 'REVIEW_STARTED' && event.taskId === 'phase-final').map((event) => event.data?.round), [1]);
   assert.deepEqual(await readFile(f.handoffPath), rawHandoff);
 });
 
