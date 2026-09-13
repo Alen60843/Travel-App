@@ -30,7 +30,8 @@
     "interpret-replan": "pnpm --silent run build && node dist/cli.js interpret-replan",
     "propose-replan": "pnpm --silent run build && node dist/cli.js propose-replan",
     "authorize-replan": "pnpm --silent run build && node dist/cli.js authorize-replan",
-    "authorize-review-correction": "pnpm --silent run build && node dist/cli.js authorize-review-correction"
+    "authorize-review-correction": "pnpm --silent run build && node dist/cli.js authorize-review-correction",
+    "repin-agent-executable": "pnpm --silent run build && node dist/cli.js repin-agent-executable"
   },
   "dependencies": {
     "yaml": "^2.8.1"

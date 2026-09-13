@@ -25,6 +25,7 @@ Usage:
   pnpm agents:metrics <run-id>
   pnpm agents:recover-handoffs <run-id>
   pnpm agents:retry-agent <run-id> <task-id>
+  pnpm agents:repin-agent-executable <run-id> <agent> <absolute-executable-path>
   pnpm agents:retry-review-output <run-id> <task-id>
   pnpm agents:retry-preflight <run-id> <task-id>
   pnpm agents:propose-replan <run-id> <task-id>
@@ -60,6 +61,9 @@ retry-agent authorizes one additional attempt only for a FAILED agent/process-la
 with no commit, accepted structured artifact, dirty work, or unsatisfied dependency. It
 archives the failure and reopens only dependency-blocked descendants attributable to that
 task. It never invokes an agent itself; run agents:resume afterward.
+repin-agent-executable records one explicit, SHA-bound migration from an unusable
+persisted provider executable. It invokes no agent and retries no task; inspect the
+record, then use retry-agent and resume separately.
 retry-review-output authorizes one bounded fresh invocation for a static read-only review or
 final_review task whose process succeeded but whose output failed strict review validation.
 It requires an unchanged pristine prepared worktree and dependency history, archives the
@@ -234,6 +238,23 @@ async function main(argv: readonly string[]): Promise<number> {
       archivedRecovery: result.recovery.recovery,
       reopenedTasks: result.reopenedTasks,
       manualNextStep: 'Run `pnpm agents:resume <run-id>` to execute the authorized retry.',
+    }, null, 2)}\n`);
+    return 0;
+  }
+  if (command === 'repin-agent-executable') {
+    const [agent, replacementPath] = extra;
+    if (argument === undefined || (agent !== 'codex' && agent !== 'claude')
+      || replacementPath === undefined || extra.length !== 2) {
+      process.stderr.write('Usage: repin-agent-executable <run-id> <codex|claude> <absolute-executable-path>\n');
+      return 1;
+    }
+    const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
+    const result = await AgentOrchestrator.repinAgentExecutable(argument, agent, replacementPath, { repositoryPath });
+    process.stdout.write(`${JSON.stringify({
+      runId: argument,
+      created: result.created,
+      repin: result.repin,
+      manualNextStep: 'Inspect the repin, then run retry-agent for the bound failed task; run resume afterward.',
     }, null, 2)}\n`);
     return 0;
   }

@@ -9,7 +9,14 @@ import {
   parseJsonOrNull,
   readBoundedStdoutText,
   resolveAgentExecutable,
+  assertAuthorizedAgentExecutables,
+  effectiveAgentExecutables,
+  executableRepinId,
+  inspectAgentExecutable,
+  unusableExecutableState,
   type Agent,
+  type AgentExecutableRepin,
+  type AgentExecutableRepinIdentity,
   type AgentRequest,
   type AgentResult,
   type ExecutableSource,
@@ -271,6 +278,12 @@ export interface ReviewCorrectionAuthorizationResult {
   readonly created: boolean;
 }
 
+export interface AgentExecutableRepinResult {
+  readonly orchestrator: AgentOrchestrator;
+  readonly repin: AgentExecutableRepin;
+  readonly created: boolean;
+}
+
 export async function planPhase(
   phaseFile: string,
   options: OrchestratorOptions,
@@ -520,6 +533,7 @@ export class AgentOrchestrator {
     runId: string,
     options: OrchestratorOptions,
     allowAdaptive = true,
+    verifyAuthorizedExecutables = true,
   ): Promise<AgentOrchestrator> {
     const git = options.git ?? new GitClient();
     const repositoryRoot = await git.repositoryRoot(resolve(options.repositoryPath));
@@ -536,6 +550,7 @@ export class AgentOrchestrator {
         details: { expected: state.repositoryRoot, actual: repositoryRoot },
       });
     }
+    if (verifyAuthorizedExecutables) await assertAuthorizedAgentExecutables(state);
     const phaseSnapshot = join(stateStore.runDirectory, 'phase.yaml');
     let adaptiveConfig: AdaptivePhaseConfig | undefined;
     let config: PhaseConfig;
@@ -625,7 +640,7 @@ export class AgentOrchestrator {
       // (agentExecutables undefined) and falls back to createAgents'/each
       // adapter's own bare command-name default, matching this orchestrator's
       // pre-existing behavior for that older state shape.
-      agents: createAgents(options.agents, loadedState.agentExecutables ?? {}),
+      agents: createAgents(options.agents, effectiveAgentExecutables(loadedState)),
       clock: options.clock ?? (() => new Date()),
       ...(adaptiveConfig === undefined ? {} : { adaptiveConfig }),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
@@ -689,10 +704,128 @@ export class AgentOrchestrator {
     });
   }
 
+  /** Persist one human-authorized executable migration without retrying or invoking an agent. */
+  static async repinAgentExecutable(
+    runId: string,
+    agent: AgentName,
+    replacementPath: string,
+    options: OrchestratorOptions,
+  ): Promise<AgentExecutableRepinResult> {
+    return AgentOrchestrator.withRunMutation(runId, options, async () => {
+      const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options, false, false);
+      const latest = orchestrator.state.agentExecutableRepins?.filter((entry) => entry.agent === agent).at(-1);
+      if (latest?.replacement.path === replacementPath) {
+        const inspected = await inspectAgentExecutable(replacementPath, agent);
+        if (inspected.sha256 !== latest.replacement.sha256) {
+          throw new OrchestratorError('TASK_STATE_INVALID', `Refusing executable repin for ${agent}: authorized replacement bytes changed`);
+        }
+        return { orchestrator, repin: latest, created: false };
+      }
+      const identity = await orchestrator.checkAgentExecutableRepinEligibility(agent, replacementPath);
+      // Close the practical validation/persistence TOCTOU window: the path,
+      // filesystem identity, executable bit, adapter/version, and bytes must
+      // still be identical immediately before the atomic state write.
+      const replacement = await inspectAgentExecutable(replacementPath, agent);
+      if (canonicalHash(replacement) !== canonicalHash(identity.replacement)
+        || await unusableExecutableState(identity.oldExecutablePath) !== identity.oldExecutableState) {
+        throw new OrchestratorError('TASK_STATE_INVALID', `Refusing executable repin for ${agent}: executable state changed during authorization`);
+      }
+      const repin: AgentExecutableRepin = {
+        id: executableRepinId(identity), ...identity, authorizedBy: 'human', authorizedAt: orchestrator.clock().toISOString(),
+      };
+      await orchestrator.mutate((state) => ({ ...state,
+        agentExecutableRepins: [...(state.agentExecutableRepins ?? []), repin],
+      }));
+      await orchestrator.event('AGENT_EXECUTABLE_REPIN_AUTHORIZED', identity.sourceFailure.taskId, {
+        repinId: repin.id, agent, oldExecutablePath: identity.oldExecutablePath,
+        oldExecutableState: identity.oldExecutableState, newExecutablePath: replacement.path,
+        newExecutableSha256: replacement.sha256, sourceAttempt: identity.sourceFailure.attempt,
+      });
+      return { orchestrator, repin, created: true };
+    });
+  }
+
   private static async withRunMutation<T>(runId: string, options: OrchestratorOptions, operation: () => Promise<T>): Promise<T> {
     const repositoryRoot = await (options.git ?? new GitClient()).repositoryRoot(resolve(options.repositoryPath));
     const store = new StateStore(resolve(options.runsRoot ?? join(repositoryRoot, 'tools/agent-orchestrator/runs')), runId);
     return store.withRunMutationLock(operation);
+  }
+
+  private async checkAgentExecutableRepinEligibility(
+    agent: AgentName,
+    replacementPath: string,
+  ): Promise<AgentExecutableRepinIdentity> {
+    const refuse = (reason: string): never => {
+      throw new OrchestratorError('TASK_STATE_INVALID', `Refusing executable repin for ${agent}: ${reason}`,
+        { details: { runId: this.state.runId, agent, reason } });
+    };
+    if (this.state.strategy !== undefined || this.state.adaptive !== undefined) refuse('only static runs are supported');
+    if (!['FAILED', 'BLOCKED'].includes(this.state.status)) refuse(`run status is ${this.state.status}, not terminal`);
+    if (Object.values(this.state.tasks).some((task) => ['PENDING', 'READY', 'RUNNING'].includes(task.status))) {
+      refuse('run contains non-terminal tasks');
+    }
+    const integration = this.state.integration;
+    if (integration.status !== 'PENDING' || integration.integratedTaskCommits.length !== 0
+      || (integration.integrationFixCommits?.length ?? 0) !== 0 || integration.worktreePath !== undefined
+      || integration.branch !== undefined || integration.headSha !== undefined || integration.currentCommand !== undefined
+      || integration.error !== undefined || integration.preparation !== undefined
+      || (this.state.integrationAttempts?.length ?? 0) !== 0) refuse('integration has started or has recovery state');
+    for (const task of Object.values(this.state.tasks)) {
+      for (const attempt of task.agentAttempts) {
+        if (attempt.finishedAt === undefined) refuse('an agent attempt is unfinished');
+        if (attempt.pid !== undefined && isProcessAlive(attempt.pid)) refuse('a recorded provider process is still alive');
+      }
+    }
+    const initial = this.state.agentExecutables?.[agent];
+    if (initial === undefined) refuse('the run has no persisted executable for this agent');
+    const oldExecutablePath = effectiveAgentExecutables(this.state)[agent]!;
+    const oldExecutableState = await unusableExecutableState(oldExecutablePath);
+    if (oldExecutableState === null) refuse('the currently effective executable is still usable');
+    if (replacementPath === oldExecutablePath) refuse('replacement path is the unusable effective executable');
+    const replacement = await inspectAgentExecutable(replacementPath, agent);
+
+    const candidates = this.config.tasks.filter((spec) => {
+      const task = this.state.tasks[spec.id];
+      const attempt = task?.agentAttempts.at(-1);
+      return spec.owner === agent && task?.status === 'FAILED' && task.error?.code === 'AGENT_FAILED'
+        && attempt?.agent === agent && attempt.outcome === 'failed' && attempt.finishedAt !== undefined
+        && task.error.message === `spawn ${oldExecutablePath} ENOENT`;
+    }).sort((left, right) => left.id.localeCompare(right.id));
+    if (candidates.length === 0) refuse('no failed task is bound to spawn ENOENT for the effective executable');
+    let sourceFailure: AgentExecutableRepinIdentity['sourceFailure'] | undefined;
+    let rejectedEvidence = '';
+    for (const spec of candidates) {
+      const task = this.state.tasks[spec.id]!;
+      const attempt = task.agentAttempts.at(-1)!;
+      if (task.commit !== undefined) { rejectedEvidence = 'the source task has a commit'; continue; }
+      if (task.handoffPath !== undefined || task.reviewPaths.length !== 0 || task.handoffOutcome !== undefined
+        || task.handoffRepairAttempts.length !== 0) { rejectedEvidence = 'the source task has accepted or evaluated structured output'; continue; }
+      if (task.worktreePath === undefined || task.branch === undefined || task.preparedHeadSha === undefined) {
+        rejectedEvidence = 'the source task has no complete preserved worktree checkpoint'; continue;
+      }
+      try {
+        const owned = await this.worktrees.assertRegistered(task.worktreePath);
+        if (owned.kind !== 'task' || owned.runId !== this.state.runId || owned.taskId !== task.id
+          || owned.branch !== task.branch || owned.baseSha !== this.state.baseSha) {
+          rejectedEvidence = 'the source task worktree registration does not match'; continue;
+        }
+        const listed = (await this.worktrees.listGitWorktrees()).find((worktree) => worktree.path === owned.path);
+        if (listed?.branch !== `refs/heads/${task.branch}`) {
+          rejectedEvidence = 'the source task worktree is missing or checked out on another branch'; continue;
+        }
+        const inspection = await inspectTaskCommits(this.git, owned.path, task.preparedHeadSha);
+        if (!inspection.clean || inspection.headSha !== task.preparedHeadSha || inspection.commits.length !== 0) {
+          rejectedEvidence = 'the source task worktree contains provider-produced or committed changes'; continue;
+        }
+      } catch (error) {
+        rejectedEvidence = `the source task worktree is invalid: ${errorText(error)}`; continue;
+      }
+      sourceFailure = { taskId: task.id, attempt: attempt.attempt, errorCode: 'AGENT_FAILED', errorMessage: task.error!.message };
+      break;
+    }
+    if (sourceFailure === undefined) refuse(rejectedEvidence || 'no failure has safe source evidence');
+    return { version: 1, runId: this.state.runId, agent, oldExecutablePath,
+      oldExecutableState: oldExecutableState!, replacement, sourceFailure: sourceFailure! };
   }
 
   private replanner(): StaticReplanner {

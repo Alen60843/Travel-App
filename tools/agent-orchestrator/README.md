@@ -20,6 +20,8 @@ For blocked static writers that request work outside their ownership, see [Stati
 
 For an accepted static final review that requests one narrow correction, see [Review correction continuation](REVIEW_CORRECTION_CONTINUATION.md).
 
+For an explicitly authorized migration from an unusable persisted Codex/Claude binary, see [Agent executable repin](AGENT_EXECUTABLE_REPIN.md).
+
 ## Requirements
 
 - Node.js 20.11 or newer and pnpm 9
@@ -51,6 +53,7 @@ pnpm agents:status <runId>
 pnpm agents:metrics <runId>
 pnpm agents:recover-handoffs <runId>
 pnpm agents:retry-agent <runId> <taskId>
+pnpm agents:repin-agent-executable <runId> <codex|claude> <absoluteExecutablePath>
 pnpm agents:retry-review-output <runId> <taskId>
 pnpm agents:authorize-review-correction <runId> <reviewTaskId> [requestIndex]
 pnpm agents:normalize-replan-evidence <runId> <taskId> <evidenceIndex> file

@@ -10,6 +10,7 @@ import {
 import { TASK_STATUSES, type TaskStatus } from '../tasks/scheduler';
 import type { AgentName, TaskSpec } from '../tasks/task-schema';
 import { parseReviewCorrectionContinuations, type ReviewCorrectionContinuation } from '../review/correction-continuation';
+import { parseAgentExecutableRepins, type AgentExecutableRepin } from '../agents/executable-repin';
 
 export const RUN_STATUSES = [
   'CREATED',
@@ -297,6 +298,8 @@ export interface RunState {
    * this phase's tasks.
    */
   readonly agentExecutables?: Readonly<Partial<Record<AgentName, string>>>;
+  /** Append-only, explicitly authorized executable migrations. */
+  readonly agentExecutableRepins?: readonly AgentExecutableRepin[];
   /** Optional adaptive topology. Static v1 run files remain valid without it. */
   readonly adaptive?: AdaptiveRunState;
   /**
@@ -341,6 +344,7 @@ export const RUN_EVENT_NAMES = [
   'REVIEW_CORRECTION_VERIFICATION_FINISHED',
   'REVIEW_CORRECTION_COMMITTED',
   'REVIEW_CORRECTION_REOPENED',
+  'AGENT_EXECUTABLE_REPIN_AUTHORIZED',
   'RUN_CREATED',
   'RUN_RESUMED',
   'TASK_READY',
@@ -1168,6 +1172,27 @@ export function validateRunState(value: unknown): RunState {
       agentExecutables[agentName] = string(path, `agentExecutables.${agentName}`);
     }
   }
+  const agentExecutableRepins = value.agentExecutableRepins === undefined
+    ? undefined
+    : parseAgentExecutableRepins(value.agentExecutableRepins);
+  if (agentExecutableRepins !== undefined) {
+    const effective = { ...(agentExecutables ?? {}) };
+    for (const repin of agentExecutableRepins) {
+      if (repin.runId !== runId) throw new OrchestratorError('STATE_CORRUPT', 'Agent executable repin run identity mismatch');
+      if (agentExecutables?.[repin.agent] === undefined) {
+        throw new OrchestratorError('STATE_CORRUPT', 'Agent executable repin has no initial pinned executable');
+      }
+      if (effective[repin.agent] !== repin.oldExecutablePath) {
+        throw new OrchestratorError('STATE_CORRUPT', 'Agent executable repin history is not contiguous');
+      }
+      effective[repin.agent] = repin.replacement.path;
+      const source = tasks[repin.sourceFailure.taskId];
+      if (source === undefined || !source.agentAttempts.some((attempt) =>
+        attempt.attempt === repin.sourceFailure.attempt && attempt.agent === repin.agent && attempt.outcome === 'failed')) {
+        throw new OrchestratorError('STATE_CORRUPT', 'Agent executable repin source failure is missing');
+      }
+    }
+  }
   const adaptive = value.adaptive === undefined
     ? undefined
     : parseAdaptiveRunState(value.adaptive);
@@ -1253,6 +1278,7 @@ export function validateRunState(value: unknown): RunState {
     ...(reviewCorrections === undefined ? {} : { reviewCorrections }),
     errors: value.errors.map((error, index) => parseStoredError(error, `errors[${index}]`)),
     ...(agentExecutables === undefined ? {} : { agentExecutables }),
+    ...(agentExecutableRepins === undefined ? {} : { agentExecutableRepins }),
     ...(adaptive === undefined ? {} : { adaptive }),
   };
 }

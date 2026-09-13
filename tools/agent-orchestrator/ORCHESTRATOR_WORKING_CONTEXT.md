@@ -28,7 +28,7 @@ Core goals:
 run-20260910100819-8ddbdc28
 phase: 7
 baseBranch: phase7/chat-realtime-design
-orchestrator development branch: orchestrator/review-correction-continuation-hardening
+orchestrator development branch: orchestrator/agent-executable-repin
 ```
 
 ### Current blocker: final review requested a narrow Presence correction
@@ -54,6 +54,14 @@ design: live/recovered reviews share one write-once round path, correction-reque
 identity always hashes schema-normalized defaults, prospective graphs validate before
 persistence, materiality is bound to the request's own finding evidence, and
 continuation exclusivity is scoped to the source review.
+
+The correction was subsequently authorized outside the implementation sessions, but
+its two Codex attempts failed before code work because the run's intentionally pinned
+VS Code-extension executable disappeared. The correction remains `FAILED` with no
+commit or accepted handoff, a clean worktree at prepared HEAD, untouched integration,
+and a valid continuation authorization. The `orchestrator/agent-executable-repin`
+branch adds an explicit SHA-bound migration record while preserving the original pin
+and requiring separate existing `retry-agent` and `resume` commands after inspection.
 
 Read-only assessment on 2026-09-13 confirmed the real run is structurally eligible:
 the artifact hash is `b2c6e4f661bd76cc40a0a7551cca56f5188cda2c80831b7cbeb8a296e65e60ff`,
