@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { constants } from 'node:fs';
-import { lstat, mkdir, open, readFile, realpath, rename, rm, stat } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, readlink, realpath, rename, rm, stat } from 'node:fs/promises';
 import { dirname, join, resolve, sep } from 'node:path';
 
 import {
@@ -36,6 +36,7 @@ import {
   integrateTaskCommits,
   integrationConflictError,
   resolveBaseSha,
+  taskCommitMessage,
   type IntegrationCommit,
   type OwnedWorktree,
 } from './git';
@@ -66,10 +67,18 @@ import {
   canonicalHash,
   correctionRequestHash,
   correctionTaskIdSeed,
+  correctionVerification,
+  legacyCorrectionVerification,
   validateCorrectionRequest,
   type ReviewCorrectionAuthorization,
   type ReviewCorrectionContinuation,
 } from './review/correction-continuation';
+import {
+  assertCorrectionVerificationEnvironment,
+  correctionVerificationRecoveryId,
+  type ReviewCorrectionVerificationRecovery,
+  type ReviewCorrectionVerificationRecoveryIdentity,
+} from './review/correction-verification-recovery';
 import {
   StateStore,
   assertResumeBaseUnmoved,
@@ -144,6 +153,8 @@ export interface OrchestratorOptions {
   readonly git?: GitClient;
   readonly clock?: () => Date;
   readonly signal?: AbortSignal;
+  /** Ephemeral host environment for correction verification; never persisted. */
+  readonly hostVerificationEnvironment?: NodeJS.ProcessEnv;
 }
 
 interface PreparedTask {
@@ -155,10 +166,39 @@ interface PreparedTask {
   readonly actualDependencyDiff: string;
 }
 
+interface CorrectionVerificationRecoveryEligibility {
+  readonly continuation: ReviewCorrectionContinuation;
+  readonly task: TaskSpec;
+  readonly taskState: TaskRunState;
+  readonly worktree: OwnedWorktree;
+  readonly handoff: StructuredHandoff;
+  readonly identity: ReviewCorrectionVerificationRecoveryIdentity;
+  readonly changedFiles: readonly string[];
+}
+
 const MAX_AGENT_DIFF_BYTES = 2 * 1024 * 1024;
 const INFRASTRUCTURE_FAILURES = new Set(['not_found', 'spawn_error', 'timed_out']);
 /** §6: bounded — a repair reformats existing text, it never does real work. */
 const HANDOFF_REPAIR_TIMEOUT_MS = 5 * 60 * 1000;
+
+/** Content/tree fingerprint stable across staging and the canonical commit. */
+async function correctionWorktreeFingerprint(worktreePath: string, paths: readonly string[]): Promise<string> {
+  const entries = [] as { path: string; kind: string; mode?: number; sha256?: string }[];
+  for (const path of [...paths].sort()) {
+    const absolute = join(worktreePath, path);
+    try {
+      const metadata = await lstat(absolute);
+      if (metadata.isDirectory()) throw new OrchestratorError('TASK_STATE_INVALID', `Correction changed path is a directory: ${path}`);
+      const bytes = metadata.isSymbolicLink() ? Buffer.from(await readlink(absolute), 'utf8') : await readFile(absolute);
+      entries.push({ path, kind: metadata.isSymbolicLink() ? 'symlink' : 'file', mode: metadata.mode & 0o777,
+        sha256: createHash('sha256').update(bytes).digest('hex') });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      entries.push({ path, kind: 'deleted' });
+    }
+  }
+  return canonicalHash(entries);
+}
 
 interface HandoffOutcomeRecord {
   readonly outcome: 'valid' | 'invalid';
@@ -284,6 +324,13 @@ export interface AgentExecutableRepinResult {
   readonly created: boolean;
 }
 
+export interface ReviewCorrectionVerificationRecoveryResult {
+  readonly orchestrator: AgentOrchestrator;
+  readonly recovery: ReviewCorrectionVerificationRecovery;
+  readonly createdCommit: boolean;
+  readonly verificationExecuted: boolean;
+}
+
 export async function planPhase(
   phaseFile: string,
   options: OrchestratorOptions,
@@ -378,6 +425,7 @@ export class AgentOrchestrator {
   private readonly clock: () => Date;
   private readonly signal: AbortSignal | undefined;
   private readonly adaptiveConfig: AdaptivePhaseConfig | undefined;
+  private readonly hostVerificationEnvironment: NodeJS.ProcessEnv;
   /** Resolved solely from the most recently authorized recovery-policy overlay — see loadRunForContinuation and resolveHandoffRepairExecutor. */
   private readonly recoveryExecutors: readonly RecoveryExecutorConfig[] | undefined;
   private stateQueue: Promise<void> = Promise.resolve();
@@ -395,6 +443,7 @@ export class AgentOrchestrator {
     readonly signal?: AbortSignal;
     readonly adaptiveConfig?: AdaptivePhaseConfig;
     readonly recoveryExecutors?: readonly RecoveryExecutorConfig[];
+    readonly hostVerificationEnvironment?: NodeJS.ProcessEnv;
   }) {
     this.config = options.config;
     this.repositoryRoot = options.repositoryRoot;
@@ -408,6 +457,7 @@ export class AgentOrchestrator {
     this.signal = options.signal;
     this.adaptiveConfig = options.adaptiveConfig;
     this.recoveryExecutors = options.recoveryExecutors;
+    this.hostVerificationEnvironment = options.hostVerificationEnvironment ?? process.env;
   }
 
   static async start(phaseFile: string, options: OrchestratorOptions): Promise<AgentOrchestrator> {
@@ -450,6 +500,7 @@ export class AgentOrchestrator {
       // fresh re-resolution — this is the plan/runtime agreement itself.
       agents: createAgents(options.agents, plan.resolvedAgentExecutables),
       clock: options.clock ?? (() => new Date()),
+      ...(options.hostVerificationEnvironment === undefined ? {} : { hostVerificationEnvironment: options.hostVerificationEnvironment }),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     });
     await orchestrator.event('RUN_CREATED', undefined, {
@@ -508,6 +559,7 @@ export class AgentOrchestrator {
       worktrees: await WorktreeManager.create({ repositoryPath: plan.repositoryRoot, git }),
       agents: createAgents(options.agents, resolved),
       clock,
+      ...(options.hostVerificationEnvironment === undefined ? {} : { hostVerificationEnvironment: options.hostVerificationEnvironment }),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     });
     await orchestrator.event('RUN_CREATED', undefined, {
@@ -642,6 +694,7 @@ export class AgentOrchestrator {
       // pre-existing behavior for that older state shape.
       agents: createAgents(options.agents, effectiveAgentExecutables(loadedState)),
       clock: options.clock ?? (() => new Date()),
+      ...(options.hostVerificationEnvironment === undefined ? {} : { hostVerificationEnvironment: options.hostVerificationEnvironment }),
       ...(adaptiveConfig === undefined ? {} : { adaptiveConfig }),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
       ...(latestRecoveryPolicy?.executors === undefined ? {} : { recoveryExecutors: latestRecoveryPolicy.executors }),
@@ -745,10 +798,273 @@ export class AgentOrchestrator {
     });
   }
 
+  /** Re-run only canonical host verification against an accepted correction worktree; never invokes a provider. */
+  static async retryReviewCorrectionVerification(
+    runId: string,
+    correctionTaskId: string,
+    options: OrchestratorOptions,
+  ): Promise<ReviewCorrectionVerificationRecoveryResult> {
+    return AgentOrchestrator.withRunMutation(runId, options, async () => {
+      const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options, false);
+      const existing = orchestrator.state.reviewCorrectionVerificationRecoveries?.find((entry) =>
+        entry.correctionTaskId === correctionTaskId);
+      if (existing?.correctionCommitSha !== undefined) {
+        return { orchestrator, recovery: existing, createdCommit: false, verificationExecuted: false };
+      }
+
+      // Fail before Jest (and before authorization persistence) when the host
+      // would otherwise fall through to apps/api/test/setup-env.ts defaults.
+      assertCorrectionVerificationEnvironment(orchestrator.hostVerificationEnvironment);
+      const checked = await orchestrator.checkCorrectionVerificationRecoveryEligibility(correctionTaskId, existing);
+      let recovery = existing;
+      if (recovery === undefined) {
+        recovery = {
+          id: correctionVerificationRecoveryId(checked.identity), ...checked.identity,
+          authorizedBy: 'human', authorizedAt: orchestrator.clock().toISOString(), attempts: [],
+        };
+        await orchestrator.mutate((state) => ({ ...state,
+          reviewCorrectionVerificationRecoveries: [
+            ...(state.reviewCorrectionVerificationRecoveries ?? []), recovery!,
+          ],
+        }));
+        await orchestrator.event('REVIEW_CORRECTION_VERIFICATION_RECOVERY_AUTHORIZED', correctionTaskId, {
+          recoveryId: recovery.id, correctionAuthorizationId: recovery.correctionAuthorizationId,
+          providerAttempt: recovery.providerAttempt, handoffSha256: recovery.handoffSha256,
+          preparedHeadSha: recovery.preparedHeadSha, worktreeDiffFingerprint: recovery.worktreeDiffFingerprint,
+          originalVerificationCommands: recovery.originalVerificationCommands,
+          normalizedVerificationCommands: recovery.normalizedVerificationCommands,
+        });
+      }
+
+      const passingAttempt = recovery.attempts.find((attempt) => attempt.result === 'passed');
+      let verificationExecuted = false;
+      if (passingAttempt === undefined) {
+        // Recheck every authorization binding immediately before execution.
+        await orchestrator.checkCorrectionVerificationRecoveryEligibility(correctionTaskId, recovery);
+        const startedAt = orchestrator.clock().toISOString();
+        const gate = await new IntegrationGate().run({
+          cwd: checked.worktree.path,
+          logsDirectory: join(orchestrator.stateStore.runDirectory, 'logs', correctionTaskId,
+            'review-correction-verification-recovery', `attempt-${recovery.attempts.length + 1}`),
+          commands: recovery.normalizedVerificationCommands,
+          env: orchestrator.hostVerificationEnvironment,
+          ...(orchestrator.signal === undefined ? {} : { signal: orchestrator.signal }),
+        });
+        verificationExecuted = true;
+        const postHandoffSha256 = createHash('sha256').update(await readFile(recovery.handoffPath)).digest('hex');
+        const postHeadSha = await orchestrator.git.resolveCommit(checked.worktree.path, 'HEAD');
+        const postChangedFiles = await changedCandidatePaths(orchestrator.git, checked.worktree.path, recovery.preparedHeadSha);
+        const postFingerprint = await correctionWorktreeFingerprint(checked.worktree.path, postChangedFiles);
+        const unchanged = postHandoffSha256 === recovery.handoffSha256
+          && postHeadSha === recovery.worktreeHeadSha
+          && postFingerprint === recovery.worktreeDiffFingerprint;
+        const attempt = {
+          attempt: recovery.attempts.length + 1,
+          startedAt,
+          finishedAt: orchestrator.clock().toISOString(),
+          result: gate.passed && unchanged ? 'passed' as const : 'failed' as const,
+          handoffSha256: postHandoffSha256,
+          worktreeHeadSha: postHeadSha,
+          worktreeDiffFingerprint: postFingerprint,
+          commands: gate.commands,
+        };
+        await orchestrator.mutate((state) => ({ ...state,
+          reviewCorrectionVerificationRecoveries: state.reviewCorrectionVerificationRecoveries!.map((entry) =>
+            entry.id === recovery!.id ? { ...entry, attempts: [...entry.attempts, attempt] } : entry),
+        }));
+        await orchestrator.event('REVIEW_CORRECTION_VERIFICATION_RECOVERY_FINISHED', correctionTaskId, {
+          recoveryId: recovery.id, attempt: attempt.attempt, result: attempt.result,
+          commands: attempt.commands,
+        });
+        recovery = orchestrator.state.reviewCorrectionVerificationRecoveries!.find((entry) => entry.id === recovery!.id)!;
+        if (attempt.result === 'failed') {
+          return { orchestrator, recovery, createdCommit: false, verificationExecuted };
+        }
+      }
+
+      const createdCommit = await orchestrator.finishCorrectionVerificationRecovery(correctionTaskId, recovery);
+      recovery = orchestrator.state.reviewCorrectionVerificationRecoveries!.find((entry) => entry.id === recovery!.id)!;
+      return { orchestrator, recovery, createdCommit, verificationExecuted };
+    });
+  }
+
   private static async withRunMutation<T>(runId: string, options: OrchestratorOptions, operation: () => Promise<T>): Promise<T> {
     const repositoryRoot = await (options.git ?? new GitClient()).repositoryRoot(resolve(options.repositoryPath));
     const store = new StateStore(resolve(options.runsRoot ?? join(repositoryRoot, 'tools/agent-orchestrator/runs')), runId);
     return store.withRunMutationLock(operation);
+  }
+
+  private async checkCorrectionVerificationRecoveryEligibility(
+    correctionTaskId: string,
+    existing?: ReviewCorrectionVerificationRecovery,
+  ): Promise<CorrectionVerificationRecoveryEligibility> {
+    const refuse = (reason: string): never => {
+      throw new OrchestratorError('TASK_STATE_INVALID',
+        `Refusing review correction verification recovery for ${correctionTaskId}: ${reason}`);
+    };
+    if (this.state.strategy !== undefined || this.state.adaptive !== undefined) refuse('only static runs are supported');
+    if (this.state.status !== 'BLOCKED') refuse(`run status is ${this.state.status}, not BLOCKED`);
+    if (Object.values(this.state.tasks).some((task) => ['READY', 'RUNNING'].includes(task.status))) refuse('run is not quiescent');
+    for (const task of Object.values(this.state.tasks)) {
+      for (const attempt of task.agentAttempts) {
+        if (attempt.finishedAt === undefined) refuse('an agent attempt is unfinished');
+        if (attempt.pid !== undefined) {
+          let dead = false;
+          try { process.kill(attempt.pid, 0); } catch (error) { dead = (error as NodeJS.ErrnoException).code === 'ESRCH'; }
+          if (!dead) refuse('a recorded provider process is still alive');
+        }
+      }
+    }
+    const integration = this.state.integration;
+    if (integration.status !== 'PENDING' || integration.integratedTaskCommits.length !== 0
+      || (integration.integrationFixCommits?.length ?? 0) !== 0 || integration.worktreePath !== undefined
+      || integration.branch !== undefined || integration.headSha !== undefined || integration.currentCommand !== undefined
+      || integration.preparation !== undefined || integration.error !== undefined) refuse('integration is not untouched');
+    const continuation = this.state.reviewCorrections?.find((entry) => entry.authorization.correctionTask.id === correctionTaskId);
+    if (continuation === undefined) refuse('task is not an authorized review correction');
+    const boundContinuation = continuation!;
+    if (boundContinuation.phase !== 'CORRECTION_RUNNING' || boundContinuation.correctionCommitSha !== undefined) {
+      refuse('correction continuation is not awaiting completion');
+    }
+    const task = this.config.tasks.find((entry) => entry.id === correctionTaskId);
+    const taskState = this.state.tasks[correctionTaskId];
+    if (task === undefined || taskState === undefined || task.mode !== 'correction' || !task.writer) refuse('correction task is missing');
+    const boundTask = task!;
+    const boundTaskState = taskState!;
+    if (boundTaskState.status !== 'BLOCKED' || boundTaskState.error?.code !== 'REVIEW_BLOCKED'
+      || boundTaskState.error.message !== 'Review correction host verification failed') {
+      refuse('task is not blocked specifically by correction host verification');
+    }
+    const providerAttempt = boundTaskState.agentAttempts.at(-1);
+    if (providerAttempt?.attempt === undefined || providerAttempt.outcome !== 'succeeded' || providerAttempt.finishedAt === undefined) {
+      refuse('latest provider attempt did not finish successfully');
+    }
+    if (boundTaskState.handoffOutcome !== 'valid' || boundTaskState.handoffPath === undefined) refuse('accepted provider handoff is missing');
+    if (boundTaskState.commit !== undefined) refuse('correction commit already exists');
+    if (boundTaskState.verification?.status !== 'FAILED' || boundTaskState.verification.commands.length === 0
+      || !boundTaskState.verification.commands.some((command) => command.required
+        && (command.exitCode !== 0 || command.termination !== null))) refuse('original host verification failure evidence is missing');
+    const originalVerification = boundTaskState.verification!;
+    const originalCommands = boundContinuation.authorization.correctionTask.verification ?? [];
+    if (originalVerification.commands.some((result, index) => {
+      const original = originalCommands[index];
+      return original === undefined || result.command !== original.command || result.required !== original.required
+        || result.timeoutMs !== (original.timeoutMs ?? result.timeoutMs);
+    })) refuse('original verification results do not match the authorized command prefix');
+
+    const artifact = await this.readAcceptedReviewArtifact(
+      boundContinuation.authorization.reviewTaskId, boundContinuation.authorization.reviewArtifactPath);
+    const request = validateCorrectionRequest(
+      artifact.review.additionalWorkRequests![boundContinuation.authorization.correctionRequestIndex],
+      boundContinuation.authorization.findingIds);
+    const legacyCommands = legacyCorrectionVerification(request);
+    const normalizedCommands = correctionVerification(request);
+    if (canonicalHash(originalCommands) !== canonicalHash(legacyCommands)) refuse('persisted verification is not the known legacy path contract');
+    if (canonicalHash(originalCommands) === canonicalHash(normalizedCommands)) refuse('persisted verification needs no path normalization');
+
+    const handoffBytes = await readFile(boundTaskState.handoffPath!);
+    const handoffSha256 = createHash('sha256').update(handoffBytes).digest('hex');
+    const handoff = parseHandoff(handoffBytes.toString('utf8'));
+    if (handoff.status !== 'complete') refuse('accepted correction handoff is not complete');
+    if (boundTaskState.worktreePath === undefined || boundTaskState.branch === undefined || boundTaskState.preparedHeadSha === undefined) {
+      refuse('preserved worktree checkpoint is incomplete');
+    }
+    const worktree = await this.worktrees.assertRegistered(boundTaskState.worktreePath!);
+    if (worktree.kind !== 'task' || worktree.runId !== this.state.runId || worktree.taskId !== correctionTaskId
+      || worktree.branch !== boundTaskState.branch || worktree.baseSha !== this.state.baseSha) refuse('worktree registration does not match');
+    const listed = (await this.worktrees.listGitWorktrees()).find((entry) => entry.path === worktree.path);
+    if (listed?.branch !== `refs/heads/${worktree.branch}`) refuse('worktree branch does not match');
+    const inspection = await inspectTaskCommits(this.git, worktree.path, boundTaskState.preparedHeadSha!);
+    const hasPassingCheckpoint = existing?.attempts.at(-1)?.result === 'passed';
+    if (inspection.commits.length === 0) {
+      if (inspection.headSha !== boundTaskState.preparedHeadSha || inspection.clean) refuse('preserved dirty tree is not at prepared HEAD');
+    } else if (!hasPassingCheckpoint || !inspection.clean || inspection.commits.length !== 1) {
+      refuse('worktree contains a non-reconcilable commit');
+    }
+    const changedFiles = [...await changedCandidatePaths(this.git, worktree.path, boundTaskState.preparedHeadSha!)].sort();
+    if (changedFiles.length === 0 || canonicalHash(changedFiles) !== canonicalHash([...handoff.filesChanged].sort())) {
+      refuse('current diff does not match handoff filesChanged evidence');
+    }
+    assertChangedFileOwnership(correctionTaskId, changedFiles, boundTask.files);
+    const diffCheck = await this.git.run(worktree.path, ['diff', '--check', boundTaskState.preparedHeadSha!], { allowFailure: true });
+    if (diffCheck.exitCode !== 0) refuse('worktree fails git diff --check');
+    const worktreeDiffFingerprint = await correctionWorktreeFingerprint(worktree.path, changedFiles);
+    const identity: ReviewCorrectionVerificationRecoveryIdentity = {
+      version: 1, runId: this.state.runId, correctionTaskId,
+      correctionAuthorizationId: boundContinuation.authorization.id,
+      providerAttempt: providerAttempt!.attempt,
+      handoffPath: boundTaskState.handoffPath!, handoffSha256,
+      preparedHeadSha: boundTaskState.preparedHeadSha!, worktreeHeadSha: inspection.headSha,
+      worktreeDiffFingerprint, originalVerificationCommands: originalCommands,
+      originalVerificationResults: originalVerification.commands,
+      normalizedVerificationCommands: normalizedCommands,
+    };
+    if (existing !== undefined) {
+      const stableIdentity = inspection.commits.length === 1 ? { ...identity, worktreeHeadSha: existing.worktreeHeadSha } : identity;
+      if (correctionVerificationRecoveryId(stableIdentity) !== existing.id
+        || handoffSha256 !== existing.handoffSha256 || worktreeDiffFingerprint !== existing.worktreeDiffFingerprint) {
+        refuse('handoff or worktree changed after recovery authorization');
+      }
+    }
+    return { continuation: boundContinuation, task: boundTask, taskState: boundTaskState, worktree, handoff, identity, changedFiles };
+  }
+
+  private async finishCorrectionVerificationRecovery(
+    correctionTaskId: string,
+    recovery: ReviewCorrectionVerificationRecovery,
+  ): Promise<boolean> {
+    const checked = await this.checkCorrectionVerificationRecoveryEligibility(correctionTaskId, recovery);
+    const passing = recovery.attempts.at(-1);
+    if (passing?.result !== 'passed' || passing.handoffSha256 !== recovery.handoffSha256
+      || passing.worktreeDiffFingerprint !== recovery.worktreeDiffFingerprint
+      || passing.worktreeHeadSha !== recovery.worktreeHeadSha) {
+      throw new OrchestratorError('TASK_STATE_INVALID', 'Recovery has no unchanged passing verification checkpoint');
+    }
+    const ensured = await ensureTaskCommit(this.git, {
+      worktreePath: checked.worktree.path,
+      baseSha: recovery.preparedHeadSha,
+      agent: checked.task.owner,
+      taskId: correctionTaskId,
+      summary: checked.handoff.summary,
+      allowEmpty: false,
+    });
+    if (ensured.commits.length !== 1 || ensured.changedFiles.length !== checked.changedFiles.length
+      || canonicalHash([...ensured.changedFiles].sort()) !== canonicalHash([...checked.changedFiles].sort())) {
+      throw new OrchestratorError('TASK_STATE_INVALID', 'Canonical correction commit changed the authorized file set');
+    }
+    const [parent, message] = await Promise.all([
+      this.git.resolveCommit(checked.worktree.path, `${ensured.commitSha}^`),
+      this.git.run(checked.worktree.path, ['show', '-s', '--format=%B', ensured.commitSha]),
+    ]);
+    if (parent !== recovery.preparedHeadSha
+      || message.stdout.trim() !== taskCommitMessage(checked.task.owner, correctionTaskId, checked.handoff.summary)
+      || await correctionWorktreeFingerprint(checked.worktree.path, checked.changedFiles) !== recovery.worktreeDiffFingerprint) {
+      throw new OrchestratorError('TASK_STATE_INVALID', 'Canonical correction commit does not match the verified checkpoint');
+    }
+    const commit: TaskCommitState = {
+      sha: ensured.commitSha, parentSha: recovery.preparedHeadSha, changedFiles: ensured.changedFiles,
+    };
+    await this.mutate((state) => {
+      const current = state.tasks[correctionTaskId]!;
+      const { error: _error, ...withoutError } = current;
+      return { ...state, status: 'RUNNING', tasks: { ...state.tasks, [correctionTaskId]: {
+        ...withoutError, status: 'SUCCEEDED', commit, handoffPath: recovery.handoffPath,
+        verification: {
+          status: 'SUCCEEDED', worktreePath: checked.worktree.path, headSha: recovery.worktreeHeadSha,
+          commands: passing.commands, startedAt: passing.startedAt, finishedAt: passing.finishedAt,
+        }, finishedAt: this.clock().toISOString(),
+      } }, reviewCorrectionVerificationRecoveries: state.reviewCorrectionVerificationRecoveries!.map((entry) =>
+        entry.id === recovery.id ? { ...entry, correctionCommitSha: ensured.commitSha } : entry) };
+    });
+    await this.event('TASK_COMMITTED', correctionTaskId, { commitSha: ensured.commitSha, changedFiles: ensured.changedFiles });
+    await this.event('TASK_SUCCEEDED', correctionTaskId, {
+      recoveryMode: 'review_correction_verification', commitSha: ensured.commitSha, handoffPath: recovery.handoffPath,
+    });
+    await this.event('REVIEW_CORRECTION_VERIFICATION_RECOVERY_COMMITTED', correctionTaskId, {
+      recoveryId: recovery.id, commitSha: ensured.commitSha,
+    });
+    await this.reconcileReviewCorrectionContinuations();
+    return ensured.created;
   }
 
   private async checkAgentExecutableRepinEligibility(
@@ -982,7 +1298,18 @@ export class AgentOrchestrator {
     const expectedTask = buildCorrectionTask(this.config,
       { ...spec, dependsOn: spec.dependsOn.filter((id) => id !== auth.correctionTask.id) }, request,
       correctionTaskIdSeed(auth.reviewTaskId, auth.correctionRequestHash));
-    if (canonicalHash(expectedTask) !== canonicalHash(auth.correctionTask)) throw new OrchestratorError('STATE_CORRUPT', 'Review correction task widens or differs from the authorized request');
+    const legacyTask = { ...expectedTask, verification: legacyCorrectionVerification(request) };
+    if (canonicalHash(expectedTask) !== canonicalHash(auth.correctionTask)
+      && canonicalHash(legacyTask) !== canonicalHash(auth.correctionTask)) {
+      throw new OrchestratorError('STATE_CORRUPT', 'Review correction task widens or differs from the authorized request');
+    }
+    const recovery = this.state.reviewCorrectionVerificationRecoveries?.find((entry) =>
+      entry.correctionAuthorizationId === auth.id);
+    if (recovery !== undefined && (canonicalHash(recovery.normalizedVerificationCommands)
+      !== canonicalHash(correctionVerification(request))
+      || canonicalHash(recovery.originalVerificationCommands) !== canonicalHash(auth.correctionTask.verification))) {
+      throw new OrchestratorError('STATE_CORRUPT', 'Review correction verification recovery is not canonical');
+    }
   }
 
   private async reconcileReviewCorrectionContinuations(): Promise<void> {
@@ -3419,6 +3746,17 @@ export class AgentOrchestrator {
     const changed = await changedCandidatePaths(this.git, prepared.worktree.path, prepared.preparedHeadSha);
     assertChangedFileOwnership(prepared.task.id, changed, prepared.task.files);
     const startedAt = this.clock().toISOString();
+    try {
+      assertCorrectionVerificationEnvironment(this.hostVerificationEnvironment);
+    } catch (error) {
+      const finishedAt = this.clock().toISOString();
+      await this.mutate((state) => updateTask(state, prepared.task.id, (task) => ({ ...task, verification: {
+        status: 'FAILED', worktreePath: prepared.worktree.path, headSha: beforeHead,
+        commands: [], startedAt, finishedAt,
+      } })));
+      await this.failTask(prepared.task.id, new OrchestratorError('REVIEW_BLOCKED', errorText(error)), 'BLOCKED', handoffPath);
+      return false;
+    }
     await this.mutate((state) => updateTask(state, prepared.task.id, (task) => ({ ...task, verification: {
       status: 'RUNNING', worktreePath: prepared.worktree.path, headSha: beforeHead,
       commands: [], startedAt,
@@ -3427,6 +3765,7 @@ export class AgentOrchestrator {
       cwd: prepared.worktree.path,
       logsDirectory: join(this.stateStore.runDirectory, 'logs', prepared.task.id, 'review-correction-verification'),
       commands,
+      env: this.hostVerificationEnvironment,
       ...(this.signal === undefined ? {} : { signal: this.signal }),
       onCommandFinished: async (command) => {
         await this.mutate((state) => updateTask(state, prepared.task.id, (task) => ({ ...task,

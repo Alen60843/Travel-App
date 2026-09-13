@@ -181,16 +181,43 @@ export function validateCorrectionRequest(requestValue: unknown, findingIds: rea
   return request;
 }
 
-export function correctionVerification(request: WorkRequestDraft): readonly IntegrationCommand[] {
+/** Convert one safe repository path to the path context of a filtered package command. */
+export function repositoryPathToPackageRelative(repositoryPath: string, packageRoot: string): string {
+  const normalizedPath = normalizeRepositoryPath(repositoryPath);
+  const normalizedRoot = normalizeRepositoryPath(packageRoot);
+  const prefix = `${normalizedRoot}/`;
+  if (!normalizedPath.startsWith(prefix) || normalizedPath.length === prefix.length) {
+    refuse(`${repositoryPath} is not inside package ${packageRoot}`);
+  }
+  return normalizedPath.slice(prefix.length);
+}
+
+function focusedCorrectionSpecs(request: WorkRequestDraft): readonly string[] {
   const focused = [...new Set((request.evidence ?? []).flatMap((evidence) => {
     if (evidence.kind !== 'file' && evidence.kind !== 'test') return [];
     const path = /^(.+):([1-9][0-9]*)$/.exec(evidence.reference)?.[1] ?? evidence.reference;
     return /\.spec\.ts$/.test(path) ? [path] : [];
   }))];
+  return focused;
+}
+
+/** The pre-fix command shape is retained only to validate old persisted authorizations. */
+export function legacyCorrectionVerification(request: WorkRequestDraft): readonly IntegrationCommand[] {
+  const focused = focusedCorrectionSpecs(request);
   return [
     { command: 'pnpm --filter @tripwith/api typecheck', required: true, timeoutMs: 600_000 },
     ...focused.map((path) => ({ command: `pnpm --filter @tripwith/api test -- --runInBand --runTestsByPath ${path}`, required: true, timeoutMs: 900_000 })),
     { command: 'pnpm --filter @tripwith/api test -- --runInBand --testPathPatterns=apps/api/src/chat/presence/.*\\.int-spec\\.ts$', required: true, timeoutMs: 1_800_000 },
+    { command: 'pnpm --filter @tripwith/api test -- --runInBand', required: true, timeoutMs: 1_800_000 },
+  ];
+}
+
+export function correctionVerification(request: WorkRequestDraft): readonly IntegrationCommand[] {
+  const focused = focusedCorrectionSpecs(request).map((path) => repositoryPathToPackageRelative(path, 'apps/api'));
+  return [
+    { command: 'pnpm --filter @tripwith/api typecheck', required: true, timeoutMs: 600_000 },
+    ...focused.map((path) => ({ command: `pnpm --filter @tripwith/api test -- --runInBand --runTestsByPath ${path}`, required: true, timeoutMs: 900_000 })),
+    { command: 'pnpm --filter @tripwith/api test -- --runInBand --testPathPatterns=src/chat/presence/.*\\.int-spec\\.ts$', required: true, timeoutMs: 1_800_000 },
     { command: 'pnpm --filter @tripwith/api test -- --runInBand', required: true, timeoutMs: 1_800_000 },
   ];
 }

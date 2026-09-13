@@ -26,6 +26,7 @@ Usage:
   pnpm agents:recover-handoffs <run-id>
   pnpm agents:retry-agent <run-id> <task-id>
   pnpm agents:repin-agent-executable <run-id> <agent> <absolute-executable-path>
+  pnpm agents:retry-review-correction-verification <run-id> <correction-task-id>
   pnpm agents:retry-review-output <run-id> <task-id>
   pnpm agents:retry-preflight <run-id> <task-id>
   pnpm agents:propose-replan <run-id> <task-id>
@@ -64,6 +65,10 @@ task. It never invokes an agent itself; run agents:resume afterward.
 repin-agent-executable records one explicit, SHA-bound migration from an unusable
 persisted provider executable. It invokes no agent and retries no task; inspect the
 record, then use retry-agent and resume separately.
+retry-review-correction-verification is a host-only recovery for an accepted static
+review correction blocked by the legacy filtered-package path defect. It regenerates
+only the canonical corrected command list, requires an explicit test database target,
+invokes no provider, and commits/reopens the existing review only after verification.
 retry-review-output authorizes one bounded fresh invocation for a static read-only review or
 final_review task whose process succeeded but whose output failed strict review validation.
 It requires an unchanged pristine prepared worktree and dependency history, archives the
@@ -255,6 +260,26 @@ async function main(argv: readonly string[]): Promise<number> {
       created: result.created,
       repin: result.repin,
       manualNextStep: 'Inspect the repin, then run retry-agent for the bound failed task; run resume afterward.',
+    }, null, 2)}\n`);
+    return 0;
+  }
+  if (command === 'retry-review-correction-verification') {
+    const [taskId] = extra;
+    if (argument === undefined || taskId === undefined || extra.length !== 1) {
+      process.stderr.write('Usage: retry-review-correction-verification <run-id> <correction-task-id>\n');
+      return 1;
+    }
+    const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
+    const result = await AgentOrchestrator.retryReviewCorrectionVerification(argument, taskId, { repositoryPath });
+    process.stdout.write(`${JSON.stringify({
+      runId: argument,
+      recoveryId: result.recovery.id,
+      verificationExecuted: result.verificationExecuted,
+      correctionCommitSha: result.recovery.correctionCommitSha,
+      createdCommit: result.createdCommit,
+      manualNextStep: result.recovery.correctionCommitSha === undefined
+        ? 'Corrected host verification remains blocked; inspect the persisted logs and evidence.'
+        : `Inspect the correction commit, then run pnpm agents:resume ${argument} for round-2 review.`,
     }, null, 2)}\n`);
     return 0;
   }

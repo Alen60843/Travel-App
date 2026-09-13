@@ -135,7 +135,13 @@ async function fixture(roundTwo: 'approved' | 'changes_requested' = 'approved', 
   return { repository, runsRoot, orchestrator, agents };
 }
 
-const options = (value: Fixture) => ({ repositoryPath: value.repository.repository, runsRoot: value.runsRoot, agents: value.agents });
+const testDatabaseEnvironment = {
+  ...process.env,
+  TEST_DB_HOST: '127.0.0.1', TEST_DB_PORT: '5432', TEST_DB_USER: 'tripwith',
+  TEST_DB_PASSWORD: 'fixture-only-secret', TEST_DB_NAME: 'tripwith',
+};
+const options = (value: Fixture) => ({ repositoryPath: value.repository.repository, runsRoot: value.runsRoot,
+  agents: value.agents, hostVerificationEnvironment: testDatabaseEnvironment });
 
 async function events(value: Fixture): Promise<RunEvent[]> {
   return (await readFile(value.orchestrator.stateStore.eventsPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as RunEvent);

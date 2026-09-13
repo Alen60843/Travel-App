@@ -44,6 +44,7 @@ export interface IntegrationGateOptions {
   readonly defaultTimeoutMs?: number;
   readonly terminationGraceMs?: number;
   readonly signal?: AbortSignal;
+  readonly env?: NodeJS.ProcessEnv;
   readonly onCommandFinished?: (result: IntegrationCommandResult, index: number) => void | Promise<void>;
 }
 
@@ -162,7 +163,7 @@ export class IntegrationGate {
   private async runOne(
     spec: NormalizedIntegrationCommand,
     index: number,
-    options: Pick<IntegrationGateOptions, 'cwd' | 'logsDirectory' | 'signal'>,
+    options: Pick<IntegrationGateOptions, 'cwd' | 'logsDirectory' | 'signal' | 'env'>,
     terminationGraceMs: number,
   ): Promise<IntegrationCommandResult> {
     const [executable, ...args] = parseCommand(spec.command);
@@ -190,7 +191,7 @@ export class IntegrationGate {
 
     const child = spawn(executable, args, {
       cwd: options.cwd,
-      env: process.env,
+      env: options.env ?? process.env,
       shell: false,
       detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -232,7 +233,7 @@ export class IntegrationGate {
       const message = (spawnError as NodeJS.ErrnoException).message;
       stderr.push(Buffer.from(`${stderr.length > 0 ? '\n' : ''}${message}`, 'utf8'));
     }
-    const redactionSecrets = collectRedactionSecrets(process.env);
+    const redactionSecrets = collectRedactionSecrets(options.env ?? process.env);
     await Promise.all([
       secureWrite(
         stdoutPath,

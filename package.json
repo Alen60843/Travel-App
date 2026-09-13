@@ -41,7 +41,8 @@
     "agents:propose-replan": "pnpm --filter @tripwith/agent-orchestrator propose-replan",
     "agents:authorize-replan": "pnpm --filter @tripwith/agent-orchestrator authorize-replan",
     "agents:authorize-review-correction": "pnpm --filter @tripwith/agent-orchestrator authorize-review-correction",
-    "agents:repin-agent-executable": "pnpm --filter @tripwith/agent-orchestrator repin-agent-executable"
+    "agents:repin-agent-executable": "pnpm --filter @tripwith/agent-orchestrator repin-agent-executable",
+    "agents:retry-review-correction-verification": "pnpm --filter @tripwith/agent-orchestrator retry-review-correction-verification"
   },
   "devDependencies": {
     "turbo": "^2.1.3",

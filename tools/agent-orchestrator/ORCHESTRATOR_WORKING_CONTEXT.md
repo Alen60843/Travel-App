@@ -28,7 +28,7 @@ Core goals:
 run-20260910100819-8ddbdc28
 phase: 7
 baseBranch: phase7/chat-realtime-design
-orchestrator development branch: orchestrator/agent-executable-repin
+orchestrator development branch: orchestrator/review-correction-verification-recovery
 ```
 
 ### Current blocker: final review requested a narrow Presence correction
@@ -55,20 +55,27 @@ identity always hashes schema-normalized defaults, prospective graphs validate b
 persistence, materiality is bound to the request's own finding evidence, and
 continuation exclusivity is scoped to the source review.
 
-The correction was subsequently authorized outside the implementation sessions, but
-its two Codex attempts failed before code work because the run's intentionally pinned
-VS Code-extension executable disappeared. The correction remains `FAILED` with no
-commit or accepted handoff, a clean worktree at prepared HEAD, untouched integration,
-and a valid continuation authorization. The `orchestrator/agent-executable-repin`
-branch adds an explicit SHA-bound migration record while preserving the original pin
-and requiring separate existing `retry-agent` and `resume` commands after inspection.
+The executable was subsequently repinned and the existing explicit retry was run outside
+the implementation sessions. Codex attempt 3 succeeded with a valid handoff and only the
+three authorized Presence changes, but host verification used repository-relative Jest
+paths inside `pnpm --filter @tripwith/api` and blocked before a commit. Independent host
+verification passed the Presence unit suite (26 tests), Presence integration suites
+(11 tests), full API suite (661 tests), and the existing Phase 7 composed suite.
 
-Read-only assessment on 2026-09-13 confirmed the real run is structurally eligible:
+The `orchestrator/review-correction-verification-recovery` branch fixes the canonical
+filtered-package path context, adds an explicit fail-closed test-database environment
+preflight, and provides a hash-bound host-only recovery of the preserved provider work.
+It never reruns the correction provider, keeps integration pending, and reopens the same
+final review for round 2 only after one canonical correction commit.
+
+Read-only assessment on 2026-09-13 confirmed the real run is structurally eligible for
+correction-verification recovery:
 the artifact hash is `b2c6e4f661bd76cc40a0a7551cca56f5188cda2c80831b7cbeb8a296e65e60ff`,
 the review worktree is clean at its persisted prepared HEAD, ordered code-input
 history matches, both replans are `RESOLVED`, integration is untouched `PENDING`,
-the provider PID is dead, and exactly one of two review rounds remains. No real
-authorization, resume, recovery, or replan command was executed.
+the successful provider PID is dead, the accepted handoff matches the three authorized
+dirty paths, and exactly one of two review rounds remains. No real recovery or resume
+command was executed by this implementation work.
 
 ### Major Phase 7 milestone: first static scope replan succeeded
 

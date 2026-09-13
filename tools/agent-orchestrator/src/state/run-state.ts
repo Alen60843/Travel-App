@@ -9,7 +9,11 @@ import {
 } from '../recovery/policy';
 import { TASK_STATUSES, type TaskStatus } from '../tasks/scheduler';
 import type { AgentName, TaskSpec } from '../tasks/task-schema';
-import { parseReviewCorrectionContinuations, type ReviewCorrectionContinuation } from '../review/correction-continuation';
+import { canonicalHash as canonicalReviewHash, parseReviewCorrectionContinuations, type ReviewCorrectionContinuation } from '../review/correction-continuation';
+import {
+  parseReviewCorrectionVerificationRecoveries,
+  type ReviewCorrectionVerificationRecovery,
+} from '../review/correction-verification-recovery';
 import { parseAgentExecutableRepins, type AgentExecutableRepin } from '../agents/executable-repin';
 
 export const RUN_STATUSES = [
@@ -319,6 +323,8 @@ export interface RunState {
   readonly replanAuthorizations?: readonly import('../replan/model').ReplanAuthorization[];
   /** Human-authorized, hash-bound static review correction continuations. */
   readonly reviewCorrections?: readonly ReviewCorrectionContinuation[];
+  /** Hash-bound host-only recovery evidence for failed correction verification. */
+  readonly reviewCorrectionVerificationRecoveries?: readonly ReviewCorrectionVerificationRecovery[];
 }
 
 /** One authorized, hashed recovery-policy overlay snapshot — see RunState.recoveryPolicyHistory. */
@@ -342,6 +348,9 @@ export const RUN_EVENT_NAMES = [
   'REVIEW_CORRECTION_AUTHORIZED',
   'REVIEW_CORRECTION_TASK_CREATED',
   'REVIEW_CORRECTION_VERIFICATION_FINISHED',
+  'REVIEW_CORRECTION_VERIFICATION_RECOVERY_AUTHORIZED',
+  'REVIEW_CORRECTION_VERIFICATION_RECOVERY_FINISHED',
+  'REVIEW_CORRECTION_VERIFICATION_RECOVERY_COMMITTED',
   'REVIEW_CORRECTION_COMMITTED',
   'REVIEW_CORRECTION_REOPENED',
   'AGENT_EXECUTABLE_REPIN_AUTHORIZED',
@@ -1250,6 +1259,30 @@ export function validateRunState(value: unknown): RunState {
       }
     }
   }
+  const reviewCorrectionVerificationRecoveries = value.reviewCorrectionVerificationRecoveries === undefined
+    ? undefined
+    : parseReviewCorrectionVerificationRecoveries(value.reviewCorrectionVerificationRecoveries);
+  if (reviewCorrectionVerificationRecoveries !== undefined) {
+    for (const recovery of reviewCorrectionVerificationRecoveries) {
+      const continuation = reviewCorrections?.find((entry) =>
+        entry.authorization.id === recovery.correctionAuthorizationId
+        && entry.authorization.correctionTask.id === recovery.correctionTaskId);
+      const correction = tasks[recovery.correctionTaskId];
+      const providerAttempt = correction?.agentAttempts.find((attempt) => attempt.attempt === recovery.providerAttempt);
+      if (recovery.runId !== runId || continuation === undefined || correction === undefined
+        || providerAttempt?.outcome !== 'succeeded' || providerAttempt.finishedAt === undefined
+        || canonicalReviewHash(recovery.originalVerificationCommands)
+          !== canonicalReviewHash(continuation.authorization.correctionTask.verification)) {
+        throw new OrchestratorError('STATE_CORRUPT', 'Review correction verification recovery identity mismatch');
+      }
+      if ((recovery.correctionCommitSha !== undefined) !== (correction.status === 'SUCCEEDED')
+        || (recovery.correctionCommitSha !== undefined
+          && (correction.commit?.sha !== recovery.correctionCommitSha
+            || correction.commit.parentSha !== recovery.preparedHeadSha))) {
+        throw new OrchestratorError('STATE_CORRUPT', 'Review correction verification recovery commit mismatch');
+      }
+    }
+  }
   assertReplanState({ runId, tasks, ...(strategy === undefined ? {} : { strategy }),
     ...(replanEvidenceNormalizations === undefined ? {} : { replanEvidenceNormalizations }),
     ...(replanInterpretations === undefined ? {} : { replanInterpretations }),
@@ -1276,6 +1309,7 @@ export function validateRunState(value: unknown): RunState {
     ...(replanProposals === undefined ? {} : { replanProposals }),
     ...(replanAuthorizations === undefined ? {} : { replanAuthorizations }),
     ...(reviewCorrections === undefined ? {} : { reviewCorrections }),
+    ...(reviewCorrectionVerificationRecoveries === undefined ? {} : { reviewCorrectionVerificationRecoveries }),
     errors: value.errors.map((error, index) => parseStoredError(error, `errors[${index}]`)),
     ...(agentExecutables === undefined ? {} : { agentExecutables }),
     ...(agentExecutableRepins === undefined ? {} : { agentExecutableRepins }),
