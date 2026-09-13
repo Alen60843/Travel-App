@@ -29,7 +29,8 @@
     "normalize-replan-evidence": "pnpm --silent run build && node dist/cli.js normalize-replan-evidence",
     "interpret-replan": "pnpm --silent run build && node dist/cli.js interpret-replan",
     "propose-replan": "pnpm --silent run build && node dist/cli.js propose-replan",
-    "authorize-replan": "pnpm --silent run build && node dist/cli.js authorize-replan"
+    "authorize-replan": "pnpm --silent run build && node dist/cli.js authorize-replan",
+    "authorize-review-correction": "pnpm --silent run build && node dist/cli.js authorize-review-correction"
   },
   "dependencies": {
     "yaml": "^2.8.1"

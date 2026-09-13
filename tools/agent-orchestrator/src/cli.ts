@@ -12,6 +12,7 @@ import { loadAnyPhaseConfig } from './workflow/solver-verifier';
 import { loadAdaptivePhaseConfig, runtimePhaseConfig } from './adaptive';
 import { applyRecoveryPolicyOverlay } from './recovery/policy';
 import { applyReplanOverlays } from './replan/model';
+import { applyReviewCorrectionOverlays } from './review/correction-continuation';
 
 const USAGE = `TripWith local agent orchestrator
 
@@ -28,6 +29,7 @@ Usage:
   pnpm agents:retry-preflight <run-id> <task-id>
   pnpm agents:propose-replan <run-id> <task-id>
   pnpm agents:authorize-replan <run-id> <proposal-id>
+  pnpm agents:authorize-review-correction <run-id> <review-task-id> [request-index]
   pnpm agents:normalize-replan-evidence <run-id> <task-id> <evidence-index> file
   pnpm agents:interpret-replan <run-id> <task-id> <interpretation-file>
   pnpm agents:salvage-task <run-id> <task-id>
@@ -66,6 +68,9 @@ retry-preflight rechecks only a static pre-invocation review-round guard failure
 zero agent attempts and no accepted output. It requires a quiescent terminal run,
 the current condition and review limit to pass, and any prepared worktree to be pristine.
 It reopens scheduler state without running agents; inspect, then run agents:resume.
+authorize-review-correction grants exactly one hash-bound correction request from an
+accepted changes_requested review. It invokes no provider, preserves the original review,
+and materializes one narrowly owned correction task; run agents:resume afterward.
 verify-blocked-task explicitly verifies a valid blocked writer from the host CLI using
 salvage.verify in its preserved worktree, retaining the original blocked handoff. It
 invokes no agent, rejects adaptive runs, and requires agents:resume afterward.
@@ -124,6 +129,20 @@ async function main(argv: readonly string[]): Promise<number> {
     process.stdout.write(`${JSON.stringify({ proposal, manualNextStep: command === 'propose-replan'
       ? `Inspect the complete proposal, then explicitly authorize with pnpm agents:authorize-replan ${argument} ${proposal.id}`
       : `Run pnpm agents:resume ${argument} to execute the authorized follow-up` }, null, 2)}\n`);
+    return 0;
+  }
+  if (command === 'authorize-review-correction') {
+    const [taskId, requestIndexText = '0'] = extra;
+    if (argument === undefined || taskId === undefined || extra.length > 2 || !/^(0|[1-9][0-9]*)$/.test(requestIndexText)) {
+      process.stderr.write('Usage: authorize-review-correction <run-id> <review-task-id> [request-index]\n');
+      return 1;
+    }
+    const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
+    const result = await AgentOrchestrator.authorizeReviewCorrection(argument, taskId, Number(requestIndexText), { repositoryPath });
+    process.stdout.write(`${JSON.stringify({ runId: argument, created: result.created,
+      continuation: result.continuation,
+      manualNextStep: `Inspect the authorization, then run pnpm agents:resume ${argument}`,
+    }, null, 2)}\n`);
     return 0;
   }
   if (command === 'normalize-replan-evidence') {
@@ -354,7 +373,8 @@ async function main(argv: readonly string[]): Promise<number> {
       ? runtimePhaseConfig(await loadAdaptivePhaseConfig(join(store.runDirectory, 'phase.yaml')), state.adaptive!)
       : await loadAnyPhaseConfig(join(store.runDirectory, 'phase.yaml'));
     const recoveredConfig = applyRecoveryPolicyOverlay(baseConfig, state.recoveryPolicyHistory?.at(-1)?.policy);
-    const config = state.strategy === 'adaptive' ? recoveredConfig : applyReplanOverlays(recoveredConfig, state);
+    const config = state.strategy === 'adaptive' ? recoveredConfig
+      : applyReviewCorrectionOverlays(applyReplanOverlays(recoveredConfig, state), state);
     const metrics = await computeRunMetrics(store.runDirectory, state, config);
     process.stdout.write(`${JSON.stringify(metrics, null, 2)}\n`);
     return 0;

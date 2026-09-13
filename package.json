@@ -39,7 +39,8 @@
     "verify": "pnpm run check:enums && pnpm run test && pnpm run db:verify",
     "test": "pnpm --filter @tripwith/shared test",
     "agents:propose-replan": "pnpm --filter @tripwith/agent-orchestrator propose-replan",
-    "agents:authorize-replan": "pnpm --filter @tripwith/agent-orchestrator authorize-replan"
+    "agents:authorize-replan": "pnpm --filter @tripwith/agent-orchestrator authorize-replan",
+    "agents:authorize-review-correction": "pnpm --filter @tripwith/agent-orchestrator authorize-review-correction"
   },
   "devDependencies": {
     "turbo": "^2.1.3",

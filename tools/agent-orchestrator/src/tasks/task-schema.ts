@@ -1,4 +1,5 @@
 import { OrchestratorError } from '../errors';
+import type { IntegrationCommand } from '../config';
 import { FINDING_SEVERITIES, REVIEW_STATUSES, type FindingSeverity, type ReviewStatus } from '../review/findings';
 
 export const AGENT_NAMES = ['codex', 'claude'] as const;
@@ -77,6 +78,8 @@ export interface TaskSpec {
   readonly condition?: TaskCondition;
   /** Trusted RunState overlay only; intentionally not accepted in phase YAML. */
   readonly checkpointInputs?: readonly { readonly proposalId: string; readonly sourceTaskId: string }[];
+  /** Trusted review-correction overlay only; intentionally not accepted in phase YAML. */
+  readonly verification?: readonly IntegrationCommand[];
 }
 
 const TASK_KEYS = new Set([

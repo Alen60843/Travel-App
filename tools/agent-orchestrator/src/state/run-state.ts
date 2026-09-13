@@ -9,6 +9,7 @@ import {
 } from '../recovery/policy';
 import { TASK_STATUSES, type TaskStatus } from '../tasks/scheduler';
 import type { AgentName, TaskSpec } from '../tasks/task-schema';
+import { parseReviewCorrectionContinuations, type ReviewCorrectionContinuation } from '../review/correction-continuation';
 
 export const RUN_STATUSES = [
   'CREATED',
@@ -132,6 +133,8 @@ export interface TaskRunState {
   /** HEAD after dependency commits are prepared, before this task agent starts. */
   readonly preparedHeadSha?: string;
   readonly preparation?: IntegrationPreparationState;
+  /** Host verification for an authorized dynamic review-correction task. */
+  readonly verification?: IntegrationPreparationState;
   readonly commit?: TaskCommitState;
   readonly agentAttempts: readonly AgentAttemptState[];
   /** Task-local review completions (including reconciled verdicts), not the lineage's round number. */
@@ -311,6 +314,8 @@ export interface RunState {
   readonly replanInterpretations?: readonly import('../replan/model').ReplanInterpretation[];
   readonly replanProposals?: readonly import('../replan/model').ReplanProposal[];
   readonly replanAuthorizations?: readonly import('../replan/model').ReplanAuthorization[];
+  /** Human-authorized, hash-bound static review correction continuations. */
+  readonly reviewCorrections?: readonly ReviewCorrectionContinuation[];
 }
 
 /** One authorized, hashed recovery-policy overlay snapshot — see RunState.recoveryPolicyHistory. */
@@ -331,6 +336,11 @@ export const RUN_EVENT_NAMES = [
   'REPLAN_CHECKPOINT_READY',
   'REPLAN_COMPOSED_VERIFIED',
   'REPLAN_RESOLVED',
+  'REVIEW_CORRECTION_AUTHORIZED',
+  'REVIEW_CORRECTION_TASK_CREATED',
+  'REVIEW_CORRECTION_VERIFICATION_FINISHED',
+  'REVIEW_CORRECTION_COMMITTED',
+  'REVIEW_CORRECTION_REOPENED',
   'RUN_CREATED',
   'RUN_RESUMED',
   'TASK_READY',
@@ -1012,6 +1022,9 @@ function parseTask(value: unknown, key: string): TaskRunState {
     ...(value.preparation === undefined
       ? {}
       : { preparation: parseTaskPreparation(value.preparation, `${path}.preparation`) }),
+    ...(value.verification === undefined
+      ? {}
+      : { verification: parseTaskPreparation(value.verification, `${path}.verification`) }),
     agentAttempts: value.agentAttempts.map((attempt, index) =>
       parseAttempt(attempt, `${path}.agentAttempts[${index}]`),
     ),
@@ -1196,6 +1209,22 @@ export function validateRunState(value: unknown): RunState {
   const replanInterpretations = value.replanInterpretations === undefined ? undefined : parseReplanInterpretations(value.replanInterpretations);
   const replanProposals = value.replanProposals === undefined ? undefined : parseReplanProposals(value.replanProposals);
   const replanAuthorizations = value.replanAuthorizations === undefined ? undefined : parseReplanAuthorizations(value.replanAuthorizations);
+  const reviewCorrections = value.reviewCorrections === undefined ? undefined : parseReviewCorrectionContinuations(value.reviewCorrections);
+  if (reviewCorrections !== undefined) {
+    if (strategy === 'adaptive') throw new OrchestratorError('STATE_CORRUPT', 'Adaptive runs cannot contain static review corrections');
+    for (const continuation of reviewCorrections) {
+      const auth = continuation.authorization;
+      if (auth.runId !== runId || tasks[auth.reviewTaskId] === undefined) {
+        throw new OrchestratorError('STATE_CORRUPT', 'Review correction run/source identity mismatch');
+      }
+      const correction = tasks[auth.correctionTask.id];
+      if (continuation.phase === 'CORRECTION_SUCCEEDED' || continuation.phase === 'REVIEW_REOPENED') {
+        if (correction?.status !== 'SUCCEEDED' || correction.commit?.sha !== continuation.correctionCommitSha) {
+          throw new OrchestratorError('STATE_CORRUPT', 'Review correction completion checkpoint mismatch');
+        }
+      }
+    }
+  }
   assertReplanState({ runId, tasks, ...(strategy === undefined ? {} : { strategy }),
     ...(replanEvidenceNormalizations === undefined ? {} : { replanEvidenceNormalizations }),
     ...(replanInterpretations === undefined ? {} : { replanInterpretations }),
@@ -1221,6 +1250,7 @@ export function validateRunState(value: unknown): RunState {
     ...(replanInterpretations === undefined ? {} : { replanInterpretations }),
     ...(replanProposals === undefined ? {} : { replanProposals }),
     ...(replanAuthorizations === undefined ? {} : { replanAuthorizations }),
+    ...(reviewCorrections === undefined ? {} : { reviewCorrections }),
     errors: value.errors.map((error, index) => parseStoredError(error, `errors[${index}]`)),
     ...(agentExecutables === undefined ? {} : { agentExecutables }),
     ...(adaptive === undefined ? {} : { adaptive }),

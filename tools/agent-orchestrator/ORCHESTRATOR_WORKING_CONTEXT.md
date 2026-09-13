@@ -4,7 +4,7 @@
 >
 > Read this file first in any future session, but **always inspect live persisted run state/events/worktree state before mutating anything**.
 
-Last updated: 2026-09-12
+Last updated: 2026-09-13
 
 ## Project priority
 
@@ -28,8 +28,33 @@ Core goals:
 run-20260910100819-8ddbdc28
 phase: 7
 baseBranch: phase7/chat-realtime-design
-orchestrator development branch: orchestrator/claude-readonly-review-retry
+orchestrator development branch: orchestrator/review-correction-continuation
 ```
+
+### Current blocker: final review requested a narrow Presence correction
+
+The lineage fix at `73d24e0` allowed the real final review to run. Its accepted
+structured result is `changes_requested`, with one medium correctness finding
+(`F001`) proving that `PresenceService.authorize` still rejects every EVENT room
+after both callers pass `ChatService` authorization. The review contains exactly
+one correction request:
+
+```text
+write apps/api/src/chat/presence/**
+read  apps/api/src/chat/chat.service.ts
+```
+
+The bounded implementation on `orchestrator/review-correction-continuation` adds
+explicit `agents:authorize-review-correction`, one hash-bound dynamic correction
+writer, deterministic host verification, immutable round artifacts, and same-task
+round-2 reopening without resetting the lineage budget.
+
+Read-only assessment on 2026-09-13 confirmed the real run is structurally eligible:
+the artifact hash is `b2c6e4f661bd76cc40a0a7551cca56f5188cda2c80831b7cbeb8a296e65e60ff`,
+the review worktree is clean at its persisted prepared HEAD, ordered code-input
+history matches, both replans are `RESOLVED`, integration is untouched `PENDING`,
+the provider PID is dead, and exactly one of two review rounds remains. No real
+authorization, resume, recovery, or replan command was executed.
 
 ### Major Phase 7 milestone: first static scope replan succeeded
 
@@ -138,7 +163,7 @@ ORCHESTRATOR_DEFECT
     └── STRUCTURED_OUTPUT_FAILURE
 ```
 
-### Current blocker: Phase 7 composed verification exposed two independent defects
+### Prior blocker: Phase 7 composed verification exposed two independent defects
 
 `phase7-composed-verification` ran after Event review succeeded. Codex added seven composed integration cases inside its declared ownership and blocked with `REVIEW_BLOCKED` because live verification could not complete inside its sandbox.
 

@@ -18,6 +18,8 @@ The orchestrator never implements Phase 5 merely because the example file exists
 
 For blocked static writers that request work outside their ownership, see [Static scope-gap replanning](STATIC_SCOPE_REPLANNING.md). `agents:normalize-replan-evidence` retains the v1 single-evidence correction. `agents:interpret-replan` records bounded v2 request selection, exact claim removal, line-reference normalization, and file-shaped evidence interpretation without editing the handoff. `agents:finalize-failed-salvage` records a terminal legacy failure only from exact event and command-log evidence. `agents:propose-replan` persists an inspectable proposal, `agents:authorize-replan` explicitly grants the checkpoint/follow-up overlay, and normal `agents:resume` executes and verifies the composed result.
 
+For an accepted static final review that requests one narrow correction, see [Review correction continuation](REVIEW_CORRECTION_CONTINUATION.md).
+
 ## Requirements
 
 - Node.js 20.11 or newer and pnpm 9
@@ -50,6 +52,7 @@ pnpm agents:metrics <runId>
 pnpm agents:recover-handoffs <runId>
 pnpm agents:retry-agent <runId> <taskId>
 pnpm agents:retry-review-output <runId> <taskId>
+pnpm agents:authorize-review-correction <runId> <reviewTaskId> [requestIndex]
 pnpm agents:normalize-replan-evidence <runId> <taskId> <evidenceIndex> file
 pnpm agents:interpret-replan <runId> <taskId> <interpretationFile>
 pnpm agents:finalize-failed-salvage <runId> <taskId>
