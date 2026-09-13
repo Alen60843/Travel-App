@@ -49,6 +49,20 @@ export function authorizationId(value: Omit<ReviewCorrectionAuthorization, 'id' 
   return canonicalHash(value);
 }
 
+/** The sole normalization boundary for persisted correction-request identity. */
+export function canonicalCorrectionRequest(value: unknown): WorkRequestDraft {
+  return parseWorkRequestDraft(value);
+}
+
+/** Never bind authorization to the optional-field shape emitted by an LLM. */
+export function correctionRequestHash(value: unknown): string {
+  return canonicalHash(canonicalCorrectionRequest(value));
+}
+
+export function correctionTaskIdSeed(reviewTaskId: string, requestHash: string): string {
+  return canonicalHash({ reviewTaskId, correctionRequestHash: requestHash });
+}
+
 function refuse(message: string): never {
   throw new OrchestratorError('TASK_STATE_INVALID', `Review correction: ${message}`);
 }
@@ -146,7 +160,7 @@ export function parseReviewCorrectionContinuations(value: unknown): ReviewCorrec
 }
 
 export function validateCorrectionRequest(requestValue: unknown, findingIds: readonly string[]): WorkRequestDraft {
-  const request = parseWorkRequestDraft(requestValue);
+  const request = canonicalCorrectionRequest(requestValue);
   if (request.role !== 'correction') refuse('selected work request must have role correction');
   if ((request.dependencies?.length ?? 0) !== 0) refuse('v1 correction request dependencies must be empty');
   const claims = request.resourceClaims ?? [];

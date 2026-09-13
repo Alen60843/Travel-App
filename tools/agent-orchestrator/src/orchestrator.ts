@@ -57,6 +57,8 @@ import {
   authorizationId,
   buildCorrectionTask,
   canonicalHash,
+  correctionRequestHash,
+  correctionTaskIdSeed,
   validateCorrectionRequest,
   type ReviewCorrectionAuthorization,
   type ReviewCorrectionContinuation,
@@ -754,7 +756,9 @@ export class AgentOrchestrator {
     const sourceBranch = task.branch!;
     if (attempt === undefined) refuse('source review attempt is missing');
     const sourceAttempt = attempt!;
-    if ((this.state.reviewCorrections?.length ?? 0) !== 0) refuse('a correction continuation already exists');
+    if (this.state.reviewCorrections?.some((entry) => entry.authorization.reviewTaskId === taskId)) {
+      refuse('a correction continuation already exists for this review task');
+    }
     if (this.state.integration.status !== 'PENDING' || this.state.integration.integratedTaskCommits.length !== 0
       || Object.keys(this.state.integration).some((key) => !['status', 'integratedTaskCommits'].includes(key))
       || (this.state.integrationAttempts?.length ?? 0) !== 0) refuse('integration has started');
@@ -780,11 +784,15 @@ export class AgentOrchestrator {
     const artifactPath = task.reviewPaths.at(-1)!;
     const artifact = await this.readAcceptedReviewArtifact(taskId, artifactPath);
     if (artifact.review.status !== 'changes_requested') refuse(`accepted review status is ${artifact.review.status}`);
-    if (!artifact.review.findings.some((finding) => finding.severity !== 'low')) refuse('accepted review has no material finding');
     const requests = artifact.review.additionalWorkRequests ?? [];
     if (requests.length !== 1 || requestIndex !== 0) refuse('v1 requires exactly one correction request at index 0');
     const findingIds = artifact.review.findings.map((finding) => finding.id);
     const request = validateCorrectionRequest(requests[requestIndex], findingIds);
+    const referencedFindings = new Set((request.evidence ?? [])
+      .filter((evidence) => evidence.kind === 'finding').map((evidence) => evidence.reference));
+    if (!artifact.review.findings.some((finding) => referencedFindings.has(finding.id) && finding.severity !== 'low')) {
+      refuse('selected correction request references no material finding');
+    }
     const sourceRound = Math.max(task.reviewRounds, task.reviewPaths.length);
     const ancestorRounds = completedReviewRounds(spec, new TaskGraph(this.config.tasks),
       (candidate) => this.state.tasks[candidate]?.status === 'SUCCEEDED');
@@ -800,17 +808,25 @@ export class AgentOrchestrator {
     } catch (error) {
       refuse(`reviewed dependency/code inputs drifted: ${errorText(error)}`);
     }
-    const correctionRequestHash = canonicalHash(request);
-    const correctionTask = buildCorrectionTask(this.config, spec, request, correctionRequestHash);
+    const requestHash = correctionRequestHash(requests[requestIndex]);
+    const correctionTask = buildCorrectionTask(this.config, spec, request, correctionTaskIdSeed(taskId, requestHash));
     const identity = {
       version: 1 as const, runId: this.state.runId, reviewTaskId: taskId,
       reviewArtifactPath: artifactPath, reviewArtifactSha256: artifact.sha256, findingIds,
-      correctionRequestIndex: requestIndex, correctionRequestHash,
+      correctionRequestIndex: requestIndex, correctionRequestHash: requestHash,
       reviewedHeadSha, reviewedCodeInputs,
       reviewedCodeInputsHash: canonicalHash(reviewedCodeInputs), sourceAttempt: sourceAttempt.attempt,
       sourceRound, correctionTask,
     };
-    return { id: authorizationId(identity), ...identity, authorizedBy: 'human', authorizedAt: this.clock().toISOString() };
+    const authorization = { id: authorizationId(identity), ...identity, authorizedBy: 'human' as const,
+      authorizedAt: this.clock().toISOString() };
+    // Validate the exact prospective effective graph before authorization is
+    // durable. This includes task IDs/dependencies/cycles and parallel writer
+    // ownership; a refusal therefore leaves run.json and events untouched.
+    applyReviewCorrectionOverlays(this.config, {
+      reviewCorrections: [{ authorization, phase: 'AUTHORIZED' }],
+    });
+    return authorization;
   }
 
   private async assertReviewCorrectionBinding(continuation: ReviewCorrectionContinuation): Promise<void> {
@@ -822,7 +838,7 @@ export class AgentOrchestrator {
     }
     const artifact = await this.readAcceptedReviewArtifact(auth.reviewTaskId, auth.reviewArtifactPath);
     if (artifact.sha256 !== auth.reviewArtifactSha256 || artifact.review.status !== 'changes_requested'
-      || canonicalHash(artifact.review.additionalWorkRequests?.[auth.correctionRequestIndex]) !== auth.correctionRequestHash
+      || correctionRequestHash(artifact.review.additionalWorkRequests?.[auth.correctionRequestIndex]) !== auth.correctionRequestHash
       || canonicalHash(auth.reviewedCodeInputs) !== auth.reviewedCodeInputsHash
       || source.agentAttempts.some((attempt) => attempt.attempt === auth.sourceAttempt && attempt.outcome === 'succeeded') !== true) {
       throw new OrchestratorError('STATE_CORRUPT', 'Review correction identity binding no longer validates');
@@ -830,7 +846,9 @@ export class AgentOrchestrator {
     const findingIds = artifact.review.findings.map((finding) => finding.id);
     if (canonicalHash(findingIds) !== canonicalHash(auth.findingIds)) throw new OrchestratorError('STATE_CORRUPT', 'Review correction finding binding mismatch');
     const request = validateCorrectionRequest(artifact.review.additionalWorkRequests![auth.correctionRequestIndex], findingIds);
-    const expectedTask = buildCorrectionTask(this.config, { ...spec, dependsOn: spec.dependsOn.filter((id) => id !== auth.correctionTask.id) }, request, auth.correctionRequestHash);
+    const expectedTask = buildCorrectionTask(this.config,
+      { ...spec, dependsOn: spec.dependsOn.filter((id) => id !== auth.correctionTask.id) }, request,
+      correctionTaskIdSeed(auth.reviewTaskId, auth.correctionRequestHash));
     if (canonicalHash(expectedTask) !== canonicalHash(auth.correctionTask)) throw new OrchestratorError('STATE_CORRUPT', 'Review correction task widens or differs from the authorized request');
   }
 
@@ -3615,6 +3633,34 @@ export class AgentOrchestrator {
   }
 
   /**
+   * One logical review round has one path in both the live and crash paths.
+   * Round 1 retains the historical `<task>.json` name.
+   */
+  private reviewArtifactPath(taskId: string): string {
+    const task = this.state.tasks[taskId]!;
+    const round = Math.max(task.reviewRounds, task.reviewPaths.length) + 1;
+    return join(this.stateStore.runDirectory, 'reviews',
+      round === 1 ? `${taskId}.json` : `${taskId}.round-${round}.json`);
+  }
+
+  /** Write-once artifact persistence makes replay of the same crashed round idempotent. */
+  private async persistReviewArtifact(taskId: string, review: StructuredReview): Promise<string> {
+    const path = this.reviewArtifactPath(taskId);
+    const expected = `${JSON.stringify(review, null, 2)}\n`;
+    try {
+      const existing = await readFile(path, 'utf8');
+      if (existing !== expected) {
+        throw new OrchestratorError('STATE_CORRUPT', `Review artifact path already contains different evidence: ${path}`);
+      }
+      return path;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    await atomicArtifactWrite(path, review);
+    return path;
+  }
+
+  /**
    * Recover an approved verdict with material findings by changing only its
    * status and revalidating, then fall back to the existing framing recovery.
    * All other semantic errors remain blocked; no review repair invokes an agent.
@@ -3666,13 +3712,7 @@ export class AgentOrchestrator {
    * (recoverHandoffFailures) goes through IDENTICAL gates.
    */
   private async finishParsedReview(prepared: PreparedTask, review: StructuredReview): Promise<void> {
-    const priorPaths = this.state.tasks[prepared.task.id]!.reviewPaths;
-    const reviewPath = join(
-      this.stateStore.runDirectory,
-      'reviews',
-      priorPaths.length === 0 ? `${prepared.task.id}.json` : `${prepared.task.id}.round-${priorPaths.length + 1}.json`,
-    );
-    await atomicArtifactWrite(reviewPath, review);
+    const reviewPath = await this.persistReviewArtifact(prepared.task.id, review);
     for (const finding of review.findings) {
       await this.event('FINDING_REPORTED', prepared.task.id, {
         id: finding.id,
@@ -3739,7 +3779,7 @@ export class AgentOrchestrator {
         ...withoutError,
         status: 'SUCCEEDED',
         reviewRounds: task.reviewRounds + 1,
-        reviewPaths: [...task.reviewPaths, reviewPath],
+        reviewPaths: task.reviewPaths.includes(reviewPath) ? task.reviewPaths : [...task.reviewPaths, reviewPath],
         finishedAt: this.clock().toISOString(),
       };
     }));
@@ -4166,7 +4206,7 @@ export class AgentOrchestrator {
         ...(handoffPath === undefined ? {} : { handoffPath }),
         ...(reviewPath === undefined
           ? {}
-          : { reviewPaths: [...task.reviewPaths, reviewPath] }),
+          : { reviewPaths: task.reviewPaths.includes(reviewPath) ? task.reviewPaths : [...task.reviewPaths, reviewPath] }),
         ...(consumeReviewRound ? { reviewRounds: task.reviewRounds + 1 } : {}),
         finishedAt: this.clock().toISOString(),
         error: normalized,
@@ -5107,12 +5147,7 @@ export class AgentOrchestrator {
             }
             if (REVIEW_MODES.has(task.mode)) {
               const review = parseReview(source);
-              const reviewPath = join(
-                this.stateStore.runDirectory,
-                'reviews',
-                `${task.id}.json`,
-              );
-              await atomicArtifactWrite(reviewPath, review);
+              const reviewPath = await this.persistReviewArtifact(task.id, review);
               observation.review = review;
               observation.reviewPath = reviewPath;
             } else {

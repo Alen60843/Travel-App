@@ -30,12 +30,19 @@ hash, source provider attempt, consumed source round, reviewed prepared HEAD, an
 ordered code-input commits/hash. The generated correction task is also inside the
 authorization digest. Repeating the command for the same latest artifact is
 idempotent; a later artifact cannot use it to create a fresh review root.
+Optional request fields are normalized through the work-request schema before every
+identity calculation, so omitted defaults and their explicit equivalents replay with
+the same hash. The prospective effective graph and parallel ownership are validated
+before the authorization, event, dynamic task, or worktree can be persisted.
 
 The task is owned by Codex in `correction` mode. Its write globs are exactly the
 request's write claims; read claims are prompt context, not write authority. File
 evidence uses the existing repository-path rules, including removal of a terminal
 `:line` suffix, and `finding` evidence must name an exact finding in the accepted
-review. Multiple requests are refused rather than unioned.
+review. At least one finding referenced by the selected request must itself be
+material; an unrelated material finding elsewhere in the review grants nothing.
+Multiple requests are refused rather than unioned. Exclusivity is per source review,
+while unrelated review tasks may carry independent non-overlapping continuations.
 
 Host verification is deterministic: API typecheck, every structured `.spec.ts`
 evidence path, EVENT presence integration coverage inside the authorized Presence
@@ -50,6 +57,10 @@ review task—not a new root—is reopened with all earlier attempts and artifac
 intact. Its existing clean worktree receives the correction commit as the next code
 input. With `maxReviewRounds: 2`, round 1 is consumed, round 2 is permitted, and no
 third authorization or unlinked root can be created.
+
+The same round-to-path derivation and write-once persistence is used for live review
+completion and stdout crash reconciliation. Replaying a recovered round reuses the
+same bytes/path without duplicating `reviewPaths`; it can never overwrite round 1.
 
 Crash checkpoints are healed on every locked load:
 

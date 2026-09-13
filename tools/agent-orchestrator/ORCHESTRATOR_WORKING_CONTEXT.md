@@ -28,7 +28,7 @@ Core goals:
 run-20260910100819-8ddbdc28
 phase: 7
 baseBranch: phase7/chat-realtime-design
-orchestrator development branch: orchestrator/review-correction-continuation
+orchestrator development branch: orchestrator/review-correction-continuation-hardening
 ```
 
 ### Current blocker: final review requested a narrow Presence correction
@@ -48,6 +48,12 @@ The bounded implementation on `orchestrator/review-correction-continuation` adds
 explicit `agents:authorize-review-correction`, one hash-bound dynamic correction
 writer, deterministic host verification, immutable round artifacts, and same-task
 round-2 reopening without resetting the lineage budget.
+
+The hardening branch fixes the adversarial follow-up findings without changing that
+design: live/recovered reviews share one write-once round path, correction-request
+identity always hashes schema-normalized defaults, prospective graphs validate before
+persistence, materiality is bound to the request's own finding evidence, and
+continuation exclusivity is scoped to the source review.
 
 Read-only assessment on 2026-09-13 confirmed the real run is structurally eligible:
 the artifact hash is `b2c6e4f661bd76cc40a0a7551cca56f5188cda2c80831b7cbeb8a296e65e60ff`,

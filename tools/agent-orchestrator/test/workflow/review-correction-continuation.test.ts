@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -6,7 +7,13 @@ import test from 'node:test';
 import type { Agent, AgentName, AgentRequest, AgentResult } from '../../src/agents';
 import { isOrchestratorError } from '../../src/errors';
 import { AgentOrchestrator } from '../../src/orchestrator';
-import { authorizationId, canonicalHash, validateCorrectionRequest } from '../../src/review/correction-continuation';
+import {
+  authorizationId,
+  canonicalHash,
+  canonicalCorrectionRequest,
+  correctionRequestHash,
+  validateCorrectionRequest,
+} from '../../src/review/correction-continuation';
 import type { RunEvent, RunState } from '../../src/state';
 import { createTemporaryRepository, type TemporaryRepository } from '../git/helpers';
 
@@ -33,9 +40,9 @@ const request = {
 
 class ContinuationAgent implements Agent {
   readonly requests: AgentRequest[] = [];
-  private reviews = 0;
+  private readonly reviews = new Map<string, number>();
   constructor(readonly name: AgentName, private readonly roundTwo: 'approved' | 'changes_requested' = 'approved',
-    public violateCorrection = false) {}
+    public violateCorrection = false, public crashAfterRoundTwoOutput = false) {}
 
   async run(agentRequest: AgentRequest): Promise<AgentResult> {
     this.requests.push(agentRequest);
@@ -46,6 +53,11 @@ class ContinuationAgent implements Agent {
       await writeFile(join(directory, 'presence.service.ts'), 'export const stale = true;\n');
       await writeFile(join(directory, 'presence.spec.ts'), 'export {};\n');
       output = handoff(['apps/api/src/chat/presence/presence.service.ts', 'apps/api/src/chat/presence/presence.spec.ts']);
+    } else if (agentRequest.taskId === 'parallel-writer') {
+      const directory = join(agentRequest.worktreePath, 'apps/api/src/chat/presence');
+      await mkdir(directory, { recursive: true });
+      await writeFile(join(directory, 'parallel.ts'), 'export const parallel = true;\n');
+      output = handoff(['apps/api/src/chat/presence/parallel.ts']);
     } else if (agentRequest.role === 'correction') {
       await writeFile(join(agentRequest.worktreePath, 'apps/api/src/chat/presence/presence.service.ts'), 'export const stale = false;\n');
       if (this.violateCorrection) await writeFile(join(agentRequest.worktreePath, 'apps/api/src/chat/chat.service.ts'), 'export const widened = true;\n');
@@ -55,15 +67,25 @@ class ContinuationAgent implements Agent {
         evidence: 'Guard removed.', fix: 'Removed stale guard.', verification: 'Host verification required.',
       })) };
     } else {
-      this.reviews += 1;
-      output = this.reviews === 1 || this.roundTwo === 'changes_requested'
-        ? { status: 'changes_requested', findings: [finding], additionalWorkRequests: [request] }
+      const reviewRound = (this.reviews.get(agentRequest.taskId) ?? 0) + 1;
+      this.reviews.set(agentRequest.taskId, reviewRound);
+      const emittedRequest = agentRequest.taskId === 'final-review-b' ? { ...request, resourceClaims: [
+        { kind: 'repository_path' as const, key: 'apps/api/src/other/**', mode: 'write' as const },
+      ] } : request;
+      output = reviewRound === 1 || this.roundTwo === 'changes_requested'
+        ? { status: 'changes_requested', findings: [finding], additionalWorkRequests: [emittedRequest] }
         : { status: 'approved', findings: [] };
+    }
+    const stdoutPath = join(agentRequest.artifactsDirectory,
+      `${agentRequest.runId}.${agentRequest.taskId}.${this.name}.attempt-${agentRequest.attempt}.stdout.log`);
+    await writeFile(stdoutPath, JSON.stringify(output));
+    if (agentRequest.role === 'final_review' && this.reviews.get(agentRequest.taskId) === 2 && this.crashAfterRoundTwoOutput) {
+      throw new Error('simulated crash after round-2 provider output');
     }
     const timestamp = new Date().toISOString();
     return { agent: this.name, runId: agentRequest.runId, taskId: agentRequest.taskId,
       status: 'succeeded', failureCode: null, exitCode: 0, signal: null,
-      stdoutPath: join(agentRequest.artifactsDirectory, 'stdout'), stderrPath: join(agentRequest.artifactsDirectory, 'stderr'),
+      stdoutPath, stderrPath: join(agentRequest.artifactsDirectory, 'stderr'),
       structuredHandoff: output, rawStdout: JSON.stringify(output), changedFiles: [], gitDiffSummary: null,
       testsReported: [], unresolvedQuestions: [], startedAt: timestamp, endedAt: timestamp, durationMs: 1,
       timedOut: false, aborted: false, errorMessage: null };
@@ -76,7 +98,8 @@ function handoff(filesChanged: string[]) {
 
 interface Fixture { repository: TemporaryRepository; runsRoot: string; orchestrator: AgentOrchestrator; agents: { codex: ContinuationAgent; claude: ContinuationAgent } }
 
-async function fixture(roundTwo: 'approved' | 'changes_requested' = 'approved'): Promise<Fixture> {
+async function fixture(roundTwo: 'approved' | 'changes_requested' = 'approved', parallelWriter = false,
+  sequentialReviews = false): Promise<Fixture> {
   const repository = await createTemporaryRepository();
   await mkdir(join(repository.repository, 'apps/api/src/chat'), { recursive: true });
   await writeFile(join(repository.repository, 'apps/api/src/chat/chat.service.ts'), 'export {};\n');
@@ -91,12 +114,16 @@ async function fixture(roundTwo: 'approved' | 'changes_requested' = 'approved'):
   const phase = join(repository.container, 'phase.yaml');
   await writeFile(phase, JSON.stringify({
     phase: 'review-correction', name: 'review correction', baseBranch: repository.baseBranch,
-    canonicalDesignDocument: 'design.md', maxReviewRounds: 2, concurrency: 1,
+    canonicalDesignDocument: 'design.md', maxReviewRounds: 2, concurrency: sequentialReviews ? 2 : 1,
     tasks: [
       { id: 'implementation', title: 'implementation', owner: 'codex', mode: 'implementation', writer: true,
         files: ['apps/api/src/chat/presence/**'], dependsOn: [] },
-      { id: 'final-review', title: 'final review', owner: 'claude', mode: 'final_review', writer: false,
+      ...(parallelWriter ? [{ id: 'parallel-writer', title: 'parallel writer', owner: 'codex', mode: 'implementation', writer: true,
+        files: ['apps/api/src/chat/presence/**'], dependsOn: ['implementation'] }] : []),
+      { id: sequentialReviews ? 'final-review-a' : 'final-review', title: 'final review', owner: 'claude', mode: 'final_review', writer: false,
         files: [], dependsOn: ['implementation'] },
+      ...(sequentialReviews ? [{ id: 'final-review-b', title: 'second final review', owner: 'claude', mode: 'final_review', writer: false,
+        files: [], dependsOn: ['implementation'] }] : []),
     ], integration: { commands: ['node -e "process.exit(0)"'] },
   }));
   const agents = { codex: new ContinuationAgent('codex'), claude: new ContinuationAgent('claude', roundTwo) };
@@ -104,7 +131,7 @@ async function fixture(roundTwo: 'approved' | 'changes_requested' = 'approved'):
   const orchestrator = await AgentOrchestrator.start(phase, { repositoryPath: repository.repository, runsRoot, agents });
   const blocked = await orchestrator.execute();
   assert.equal(blocked.status, 'BLOCKED');
-  assert.equal(blocked.tasks['final-review']?.reviewRounds, 1);
+  assert.equal(blocked.tasks[sequentialReviews ? 'final-review-a' : 'final-review']?.reviewRounds, 1);
   return { repository, runsRoot, orchestrator, agents };
 }
 
@@ -148,6 +175,121 @@ test('authorized review correction executes as a narrow writer and reruns the sa
     const reviewStarts = (await events(value)).filter((event) => event.name === 'REVIEW_STARTED' && event.taskId === 'final-review');
     assert.deepEqual(reviewStarts.map((event) => event.data?.round), [1, 2]);
     assert.equal(completed.integration.status, 'SUCCEEDED');
+  } finally { await value.repository.dispose(); }
+});
+
+test('round-2 stdout crash recovery preserves round 1 and records one distinct artifact exactly once', async () => {
+  const value = await fixture();
+  try {
+    const runId = value.orchestrator.snapshot().runId;
+    const roundOnePath = value.orchestrator.snapshot().tasks['final-review']!.reviewPaths[0]!;
+    const roundOneBytes = await readFile(roundOnePath);
+    const roundOneSha = createHash('sha256').update(roundOneBytes).digest('hex');
+    const authorized = await AgentOrchestrator.authorizeReviewCorrection(runId, 'final-review', 0, options(value));
+    assert.equal(authorized.continuation.authorization.reviewArtifactSha256, roundOneSha);
+    value.agents.claude.crashAfterRoundTwoOutput = true;
+    const crashing = await AgentOrchestrator.resume(runId, options(value));
+    const interrupted = await crashing.execute();
+    const interruptedReview = interrupted.tasks['final-review']!;
+    assert.equal(interruptedReview.status, 'FAILED');
+    // execute() deliberately converts thrown agent-layer errors into a
+    // terminal task. Recreate the exact durable crash window after stdout
+    // exists and the provider attempt completed, but before parsed-review
+    // state/artifact persistence.
+    const { error: _error, finishedAt: _finishedAt, ...runningReview } = interruptedReview;
+    await crashing.stateStore.save({ ...interrupted, status: 'RUNNING', tasks: { ...interrupted.tasks,
+      'final-review': { ...runningReview, status: 'RUNNING', agentAttempts: runningReview.agentAttempts.map((attempt, index, attempts) =>
+        index === attempts.length - 1 ? { ...attempt, finishedAt: new Date().toISOString(), outcome: 'succeeded' as const } : attempt) },
+    } });
+
+    value.agents.claude.crashAfterRoundTwoOutput = false;
+    const recovered = await AgentOrchestrator.resume(runId, options(value));
+    const recoveredTask = recovered.snapshot().tasks['final-review']!;
+    assert.equal(recoveredTask.reviewRounds, 2);
+    assert.equal(recoveredTask.reviewPaths.length, 2);
+    assert.equal(recoveredTask.reviewPaths[0], roundOnePath);
+    assert.match(recoveredTask.reviewPaths[1]!, /\.round-2\.json$/);
+    assert.notEqual(recoveredTask.reviewPaths[1], roundOnePath);
+    assert.deepEqual(await readFile(roundOnePath), roundOneBytes);
+    assert.equal(createHash('sha256').update(await readFile(roundOnePath)).digest('hex'), roundOneSha);
+    const roundTwoBytes = await readFile(recoveredTask.reviewPaths[1]!);
+    assert.deepEqual(roundTwoBytes, Buffer.from(`${JSON.stringify({ status: 'approved', findings: [] }, null, 2)}\n`));
+    assert.equal(createHash('sha256').update(roundTwoBytes).digest('hex'),
+      createHash('sha256').update(Buffer.from(`${JSON.stringify({ status: 'approved', findings: [] }, null, 2)}\n`)).digest('hex'));
+
+    const repeated = await AgentOrchestrator.resume(runId, options(value));
+    assert.deepEqual(repeated.snapshot().tasks['final-review']!.reviewPaths, recoveredTask.reviewPaths);
+    assert.equal(repeated.snapshot().reviewCorrections?.length, 1, 'continuation binding still loads');
+  } finally { await value.repository.dispose(); }
+});
+
+test('correction request identity always hashes normalized optional defaults', async () => {
+  const expanded = { ...request, dependencies: [], capabilities: [], risk: 'medium' as const, priority: 50 };
+  const optionalKeys = ['dependencies', 'capabilities', 'risk', 'priority', 'estimatedCostUnits'] as const;
+  const omissionCases: readonly (readonly (typeof optionalKeys)[number][])[] = [
+    ...optionalKeys.map((key) => [key] as const), optionalKeys,
+  ];
+  for (const omittedKeys of omissionCases) {
+    const raw: Record<string, unknown> = { ...expanded, estimatedCostUnits: undefined };
+    for (const key of omittedKeys) delete raw[key];
+    assert.equal(correctionRequestHash(raw), correctionRequestHash(expanded), `omitting ${omittedKeys.join(', ')}`);
+    const value = await fixture();
+    try {
+      const state = value.orchestrator.snapshot();
+      const artifactPath = state.tasks['final-review']!.reviewPaths[0]!;
+      await writeFile(artifactPath, JSON.stringify({ status: 'changes_requested', findings: [finding], additionalWorkRequests: [raw] }));
+      const authorized = await AgentOrchestrator.authorizeReviewCorrection(state.runId, 'final-review', 0, options(value));
+      assert.equal(authorized.continuation.authorization.correctionRequestHash, correctionRequestHash(expanded));
+      const replayed = await AgentOrchestrator.resume(state.runId, options(value));
+      assert.equal(replayed.snapshot().reviewCorrections?.[0]?.authorization.correctionRequestHash,
+        correctionRequestHash(expanded));
+    } finally { await value.repository.dispose(); }
+  }
+  const combined = { ...expanded } as Record<string, unknown>;
+  for (const key of optionalKeys) delete combined[key];
+  assert.equal(correctionRequestHash(combined), correctionRequestHash(expanded));
+  assert.deepEqual(canonicalCorrectionRequest(combined), canonicalCorrectionRequest(expanded));
+  assert.notEqual(correctionRequestHash({ ...expanded, objective: 'Semantically different correction.' }),
+    correctionRequestHash(expanded));
+});
+
+test('overlapping prospective correction graph refuses before any durable mutation', async () => {
+  const value = await fixture('approved', true);
+  try {
+    const state = value.orchestrator.snapshot();
+    const runBytes = await readFile(value.orchestrator.stateStore.statePath);
+    const eventBytes = await readFile(value.orchestrator.stateStore.eventsPath);
+    const worktrees = (await value.repository.git.run(value.repository.repository, ['worktree', 'list', '--porcelain'])).stdout;
+    const invocations = value.agents.codex.requests.length + value.agents.claude.requests.length;
+    await assert.rejects(AgentOrchestrator.authorizeReviewCorrection(state.runId, 'final-review', 0, options(value)),
+      (error) => isOrchestratorError(error, 'OWNERSHIP_OVERLAP'));
+    assert.deepEqual(await readFile(value.orchestrator.stateStore.statePath), runBytes);
+    assert.deepEqual(await readFile(value.orchestrator.stateStore.eventsPath), eventBytes);
+    assert.equal((await value.repository.git.run(value.repository.repository, ['worktree', 'list', '--porcelain'])).stdout, worktrees);
+    assert.equal(value.agents.codex.requests.length + value.agents.claude.requests.length, invocations);
+    const unchanged = JSON.parse(runBytes.toString('utf8')) as RunState;
+    assert.equal(unchanged.reviewCorrections, undefined);
+    assert.equal(Object.keys(unchanged.tasks).some((id) => id.startsWith('review-correction-')), false);
+  } finally { await value.repository.dispose(); }
+});
+
+test('completed continuation for one review does not block a later unrelated review', async () => {
+  const value = await fixture('approved', false, true);
+  try {
+    const runId = value.orchestrator.snapshot().runId;
+    const first = await AgentOrchestrator.authorizeReviewCorrection(runId, 'final-review-a', 0, options(value));
+    const firstCorrectionId = first.continuation.authorization.correctionTask.id;
+    const resumed = await AgentOrchestrator.resume(runId, options(value));
+    const secondBlocked = await resumed.execute();
+    assert.equal(secondBlocked.tasks['final-review-a']?.status, 'SUCCEEDED');
+    assert.equal(secondBlocked.tasks['final-review-b']?.status, 'BLOCKED', JSON.stringify(secondBlocked, null, 2));
+    assert.equal(secondBlocked.tasks['final-review-b']?.error?.code, 'BLOCKED_FOR_HUMAN_REVIEW', JSON.stringify(secondBlocked.tasks['final-review-b'], null, 2));
+    assert.equal(secondBlocked.tasks['final-review-b']?.agentAttempts.at(-1)?.outcome, 'succeeded');
+    assert.equal(secondBlocked.tasks['final-review-b']?.handoffOutcome, 'valid');
+    const second = await AgentOrchestrator.authorizeReviewCorrection(runId, 'final-review-b', 0, options(value));
+    assert.equal(second.created, true);
+    assert.equal(second.orchestrator.snapshot().reviewCorrections?.length, 2);
+    assert.notEqual(second.continuation.authorization.correctionTask.id, firstCorrectionId);
   } finally { await value.repository.dispose(); }
 });
 
@@ -272,5 +414,21 @@ test('changes_requested with only low findings is not materially eligible', asyn
     await writeFile(path, JSON.stringify({ status: 'changes_requested', findings: [low], additionalWorkRequests: [request] }));
     await assert.rejects(AgentOrchestrator.authorizeReviewCorrection(state.runId, 'final-review', 0, options(value)),
       (error) => isOrchestratorError(error, 'TASK_STATE_INVALID') && /no material finding/.test(error.message));
+  } finally { await value.repository.dispose(); }
+});
+
+test('an unrelated material finding cannot authorize a request that references only a low finding', async () => {
+  const value = await fixture();
+  try {
+    const state = value.orchestrator.snapshot();
+    const path = state.tasks['final-review']!.reviewPaths[0]!;
+    const low = { ...finding, id: 'F002', severity: 'low' as const };
+    const lowRequest = { ...request, evidence: request.evidence.map((entry) =>
+      entry.kind === 'finding' ? { ...entry, reference: 'F002' } : entry) };
+    await writeFile(path, JSON.stringify({ status: 'changes_requested', findings: [
+      { ...finding, severity: 'high' as const }, low,
+    ], additionalWorkRequests: [lowRequest] }));
+    await assert.rejects(AgentOrchestrator.authorizeReviewCorrection(state.runId, 'final-review', 0, options(value)),
+      (error) => isOrchestratorError(error, 'TASK_STATE_INVALID') && /references no material finding/.test(error.message));
   } finally { await value.repository.dispose(); }
 });
