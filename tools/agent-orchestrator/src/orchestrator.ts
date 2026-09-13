@@ -63,12 +63,14 @@ import { completedReviewRounds, REVIEW_MODES } from './review/lineage';
 import {
   applyReviewCorrectionOverlays,
   authorizationId,
+  baseCorrectionTask,
   buildCorrectionTask,
   canonicalHash,
   correctionRequestHash,
   correctionTaskIdSeed,
   correctionVerification,
   legacyCorrectionVerification,
+  supportsCanonicalApiCorrectionVerification,
   validateCorrectionRequest,
   type ReviewCorrectionAuthorization,
   type ReviewCorrectionContinuation,
@@ -1295,12 +1297,14 @@ export class AgentOrchestrator {
     const findingIds = artifact.review.findings.map((finding) => finding.id);
     if (canonicalHash(findingIds) !== canonicalHash(auth.findingIds)) throw new OrchestratorError('STATE_CORRUPT', 'Review correction finding binding mismatch');
     const request = validateCorrectionRequest(artifact.review.additionalWorkRequests![auth.correctionRequestIndex], findingIds);
-    const expectedTask = buildCorrectionTask(this.config,
+    const baseTask = baseCorrectionTask(this.config,
       { ...spec, dependsOn: spec.dependsOn.filter((id) => id !== auth.correctionTask.id) }, request,
       correctionTaskIdSeed(auth.reviewTaskId, auth.correctionRequestHash));
-    const legacyTask = { ...expectedTask, verification: legacyCorrectionVerification(request) };
-    if (canonicalHash(expectedTask) !== canonicalHash(auth.correctionTask)
-      && canonicalHash(legacyTask) !== canonicalHash(auth.correctionTask)) {
+    const legacyTask = { ...baseTask, verification: legacyCorrectionVerification(request) };
+    const legacyMatches = canonicalHash(legacyTask) === canonicalHash(auth.correctionTask);
+    const canonicalMatches = supportsCanonicalApiCorrectionVerification(request)
+      && canonicalHash({ ...baseTask, verification: correctionVerification(request) }) === canonicalHash(auth.correctionTask);
+    if (!canonicalMatches && !legacyMatches) {
       throw new OrchestratorError('STATE_CORRUPT', 'Review correction task widens or differs from the authorized request');
     }
     const recovery = this.state.reviewCorrectionVerificationRecoveries?.find((entry) =>

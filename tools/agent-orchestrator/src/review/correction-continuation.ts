@@ -201,6 +201,14 @@ function focusedCorrectionSpecs(request: WorkRequestDraft): readonly string[] {
   return focused;
 }
 
+/** Whether the API-filtered canonical generator owns every focused test path. */
+export function supportsCanonicalApiCorrectionVerification(request: WorkRequestDraft): boolean {
+  return focusedCorrectionSpecs(request).every((path) => {
+    const normalized = normalizeRepositoryPath(path);
+    return normalized.startsWith('apps/api/') && normalized.length > 'apps/api/'.length;
+  });
+}
+
 /** The pre-fix command shape is retained only to validate old persisted authorizations. */
 export function legacyCorrectionVerification(request: WorkRequestDraft): readonly IntegrationCommand[] {
   const focused = focusedCorrectionSpecs(request);
@@ -222,7 +230,8 @@ export function correctionVerification(request: WorkRequestDraft): readonly Inte
   ];
 }
 
-export function buildCorrectionTask(config: PhaseConfig, review: TaskSpec, request: WorkRequestDraft, idSeed: string): TaskSpec {
+/** Construct correction identity/ownership without crossing a verification-generation boundary. */
+export function baseCorrectionTask(config: PhaseConfig, review: TaskSpec, request: WorkRequestDraft, idSeed: string): TaskSpec {
   const writes = (request.resourceClaims ?? []).filter((claim) => claim.mode === 'write').map((claim) => claim.key);
   const reads = (request.resourceClaims ?? []).filter((claim) => claim.mode === 'read').map((claim) => claim.key);
   const task: TaskSpec = {
@@ -234,11 +243,22 @@ export function buildCorrectionTask(config: PhaseConfig, review: TaskSpec, reque
       'Address only the accepted review findings and authorized write scope. Do not widen ownership.',
       'Add focused EVENT presence integration coverage inside the authorized presence scope; retain caller/target denial and bidirectional block cases.',
       'Do not edit the separate Phase 7 composed-test tree unless it is explicitly in write ownership; report any remaining scope gap.'].join('\n'),
-    verification: correctionVerification(request),
   };
-  const { verification: _verification, ...phaseShape } = task;
-  parseTaskSpec(phaseShape, 0);
+  parseTaskSpec(task, 0);
   return task;
+}
+
+
+export function buildCorrectionTask(config: PhaseConfig, review: TaskSpec, request: WorkRequestDraft, idSeed: string): TaskSpec {
+  const task = baseCorrectionTask(config, review, request, idSeed);
+  // Before the API package-relative generator existed, safe evidence in
+  // another repository package was valid and received the legacy contract.
+  // Retain only that explicit compatibility case; direct canonical API
+  // generation remains strict and still rejects such paths.
+  const verification = supportsCanonicalApiCorrectionVerification(request)
+    ? correctionVerification(request)
+    : legacyCorrectionVerification(request);
+  return { ...task, verification };
 }
 
 export function applyReviewCorrectionOverlays(config: PhaseConfig, state: Pick<RunState, 'reviewCorrections'>): PhaseConfig {
