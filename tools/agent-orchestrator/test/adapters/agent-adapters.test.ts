@@ -15,11 +15,14 @@ import { join } from 'node:path';
 import { afterEach, test } from 'node:test';
 
 import {
+  CLAUDE_REVIEW_OUTPUT_SCHEMA,
   ClaudeAgent,
   CodexAgent,
   type AgentRequest,
   sanitizeText,
 } from '../../src/agents';
+import { isOrchestratorError } from '../../src/errors';
+import { parseReview } from '../../src/review/findings';
 
 const temporaryDirectories: string[] = [];
 
@@ -65,6 +68,7 @@ test('Codex adapter runs in the assigned cwd, sends the prompt over stdin, and p
   assert.deepEqual(argumentValue(record.args, '-s'), 'workspace-write');
   assert.deepEqual(argumentValue(record.args, '-a'), 'never');
   assert.equal(record.args.includes(taskText), false, 'the prompt must not appear in argv');
+  assert.equal(record.args.includes('--json-schema'), false);
   assert.match(record.stdin, /Allowed file ownership/);
   assert.match(record.stdin, /Never modify a path outside/);
   assert.match(record.stdin, /shell-interpolation-must-not-exist/);
@@ -113,7 +117,18 @@ test('Claude adapter uses non-interactive safe mode, maps extra_high to xhigh, a
   assert.ok(record.args.includes('-p'));
   assert.ok(record.args.includes('--safe-mode'));
   assert.ok(record.args.includes('--no-session-persistence'));
-  assert.equal(argumentValue(record.args, '--output-format'), 'text');
+  assert.equal(argumentValue(record.args, '--output-format'), 'json');
+  const providerSchema = JSON.parse(argumentValue(record.args, '--json-schema')!) as unknown;
+  assert.deepEqual(providerSchema, CLAUDE_REVIEW_OUTPUT_SCHEMA);
+  assert.notDeepEqual(
+    providerSchema,
+    (request.taskSpecification as { responseSchema: unknown }).responseSchema,
+    'the prompt-facing example is not a provider JSON Schema',
+  );
+  assert.deepEqual(
+    (providerSchema as { properties: { status: { enum: unknown } } }).properties.status.enum,
+    ['approved', 'changes_requested', 'blocked'],
+  );
   assert.equal(argumentValue(record.args, '--effort'), 'xhigh');
   assert.equal(argumentValue(record.args, '--permission-mode'), 'dontAsk');
   assert.equal(argumentValue(record.args, '--tools'), 'Read,Glob,Grep');
@@ -138,9 +153,67 @@ test('Claude read-only headless invocation can return structured review output w
 
   assert.equal(result.status, 'succeeded');
   assert.deepEqual(result.structuredHandoff, { status: 'approved', findings: [] });
+  const expectedEnvelope = claudeEnvelope({ status: 'approved', findings: [] });
+  assert.equal(result.rawStdout, JSON.stringify(expectedEnvelope));
+  assert.equal(await readFile(result.stdoutPath, 'utf8'), `${JSON.stringify(expectedEnvelope)}\n`);
   const record = await readRecord(fixture.recordPath);
+  assert.equal(argumentValue(record.args, '--output-format'), 'json');
+  assert.ok(argumentValue(record.args, '--json-schema') !== undefined);
   assert.equal(argumentValue(record.args, '--permission-mode'), 'dontAsk');
   assert.equal(argumentValue(record.args, '--tools'), 'Read,Glob,Grep');
+});
+
+test('Claude synthesis uses the same structured review transport as its canonical review validator', async () => {
+  const fixture = await createFixture('claude-review');
+  const agent = new ClaudeAgent({ executable: fixture.executable, environment: fixture.environment });
+
+  const result = await agent.run(makeRequest(fixture, {
+    role: 'synthesis', access: 'read_only',
+  }));
+
+  assert.deepEqual(result.structuredHandoff, { status: 'approved', findings: [] });
+  const record = await readRecord(fixture.recordPath);
+  assert.equal(argumentValue(record.args, '--output-format'), 'json');
+  assert.ok(argumentValue(record.args, '--json-schema') !== undefined);
+});
+
+for (const [mode, label] of [
+  ['claude-malformed-envelope', 'malformed JSON envelope'],
+  ['claude-missing-structured', 'missing structured payload'],
+  ['claude-unexpected-envelope', 'unexpected provider envelope'],
+  ['claude-prose', 'prose-only stdout'],
+] as const) {
+  test(`Claude structured reviews fail closed for ${label}`, async () => {
+    const fixture = await createFixture(mode);
+    const agent = new ClaudeAgent({ executable: fixture.executable, environment: fixture.environment });
+
+    const result = await agent.run(makeRequest(fixture, {
+      role: 'review', access: 'read_only',
+    }));
+
+    assert.equal(result.status, 'succeeded', 'provider exit status remains independently recorded');
+    assert.equal(result.structuredHandoff, null);
+    assert.throws(
+      () => parseReview(result.structuredHandoff),
+      (error) => isOrchestratorError(error, 'REVIEW_BLOCKED'),
+    );
+  });
+}
+
+test('Claude envelope extraction does not replace strict semantic review validation', async () => {
+  const fixture = await createFixture('claude-semantic-invalid');
+  const agent = new ClaudeAgent({ executable: fixture.executable, environment: fixture.environment });
+
+  const result = await agent.run(makeRequest(fixture, {
+    role: 'final_review', access: 'read_only',
+  }));
+
+  assert.deepEqual(result.structuredHandoff, { status: 'changes_requested', findings: [] });
+  assert.throws(
+    () => parseReview(result.structuredHandoff),
+    (error) => isOrchestratorError(error, 'REVIEW_BLOCKED')
+      && /changes_requested requires at least one finding/.test(error.message),
+  );
 });
 
 test('Claude writer requests keep acceptEdits, default tools, model, and effort without bypassing permissions', async () => {
@@ -159,6 +232,8 @@ test('Claude writer requests keep acceptEdits, default tools, model, and effort 
   assert.equal(argumentValue(record.args, '--tools'), 'default');
   assert.equal(argumentValue(record.args, '--effort'), 'medium');
   assert.equal(argumentValue(record.args, '--model'), 'claude-opus-4-1');
+  assert.equal(argumentValue(record.args, '--output-format'), 'text');
+  assert.equal(record.args.includes('--json-schema'), false);
   assert.equal(record.args.includes('--dangerously-skip-permissions'), false);
 });
 
@@ -494,8 +569,20 @@ function successfulHandoff(): Record<string, unknown> {
   };
 }
 
+function claudeEnvelope(structuredOutput: unknown): Record<string, unknown> {
+  return {
+    type: 'result',
+    subtype: 'success',
+    is_error: false,
+    result: '',
+    structured_output: structuredOutput,
+  };
+}
+
 function fakeExecutableSource(): string {
   const handoff = JSON.stringify(successfulHandoff());
+  const approvedReview = JSON.stringify(claudeEnvelope({ status: 'approved', findings: [] }));
+  const invalidReview = JSON.stringify(claudeEnvelope({ status: 'changes_requested', findings: [] }));
   return `#!/usr/bin/env node
 'use strict';
 const fs = require('node:fs');
@@ -545,7 +632,28 @@ process.stdin.on('end', () => {
       process.stdout.write('I completed the review but cannot exit plan mode.\\n');
       return;
     }
-    process.stdout.write(JSON.stringify({ status: 'approved', findings: [] }) + '\\n');
+    process.stdout.write(${JSON.stringify(approvedReview)} + '\\n');
+    return;
+  }
+  if (mode === 'claude-malformed-envelope') {
+    process.stdout.write('{"type":"result"');
+    return;
+  }
+  if (mode === 'claude-missing-structured') {
+    process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: '' }) + '\\n');
+    return;
+  }
+  if (mode === 'claude-unexpected-envelope') {
+    process.stdout.write(JSON.stringify({ type: 'assistant', subtype: 'success', is_error: false,
+      structured_output: { status: 'approved', findings: [] } }) + '\\n');
+    return;
+  }
+  if (mode === 'claude-prose') {
+    process.stdout.write('Review complete: approved.\\n');
+    return;
+  }
+  if (mode === 'claude-semantic-invalid') {
+    process.stdout.write(${JSON.stringify(invalidReview)} + '\\n');
     return;
   }
   process.stdout.write(${JSON.stringify(handoff)} + '\\n');

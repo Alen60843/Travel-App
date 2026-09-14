@@ -58,6 +58,14 @@ export abstract class ProcessAgent implements Agent {
 
   protected abstract buildInvocation(request: AgentRequest): AgentInvocation;
 
+  /** Provider-specific adapters may unwrap a verified stdout protocol here. */
+  protected extractStructuredHandoff(
+    _request: AgentRequest,
+    rawStdout: string | null,
+  ): unknown | null {
+    return parseJsonOrNull(rawStdout);
+  }
+
   async run(request: AgentRequest): Promise<AgentResult> {
     validateRequest(request);
 
@@ -217,7 +225,7 @@ export abstract class ProcessAgent implements Agent {
 
     const classification = classifyCompletion(processResult, terminationCause);
     const rawStdout = await readBoundedStdoutText(stdoutPath);
-    const structuredHandoff = parseJsonOrNull(rawStdout);
+    const structuredHandoff = this.extractStructuredHandoff(request, rawStdout);
     const projected = projectHandoff(structuredHandoff);
     const endedAtMs = Date.now();
 

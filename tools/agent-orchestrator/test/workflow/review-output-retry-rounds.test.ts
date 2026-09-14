@@ -1,12 +1,21 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { appendFile, mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { appendFile, mkdir, readFile, realpath, unlink, writeFile } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
-import type { Agent, AgentName, AgentRequest, AgentResult } from '../../src/agents';
+import {
+  CLAUDE_STRUCTURED_REVIEW_OUTPUT_CONTRACT_ID,
+  CLAUDE_TEXT_REVIEW_OUTPUT_CONTRACT_ID,
+  type Agent,
+  type AgentName,
+  type AgentRequest,
+  type AgentResult,
+} from '../../src/agents';
 import { isOrchestratorError } from '../../src/errors';
 import { AgentOrchestrator } from '../../src/orchestrator';
+import { canonicalHash } from '../../src/review/correction-continuation';
 import type { RunEvent } from '../../src/state';
 import { createTemporaryRepository, type TemporaryRepository } from '../git/helpers';
 
@@ -107,7 +116,12 @@ function options(value: Omit<Fixture, 'correctionTaskId'>) {
     hostVerificationEnvironment: databaseEnvironment };
 }
 
-async function fixture(roundOneRecovery = false): Promise<Fixture> {
+async function fixture(
+  roundOneRecovery = false,
+  doubleMalformedRoundTwo = false,
+  useRepositoryRuns = false,
+  postFixResult: 'approved' | 'prose' = 'approved',
+): Promise<Fixture> {
   const repository = await createTemporaryRepository();
   await mkdir(join(repository.repository, 'apps/api/src/chat'), { recursive: true });
   await writeFile(join(repository.repository, 'apps/api/src/chat/chat.service.ts'), 'export {};\n');
@@ -131,9 +145,11 @@ async function fixture(roundOneRecovery = false): Promise<Fixture> {
     ], integration: { commands: ['node -e "process.exit(0)"'] },
   }));
   const agents = { codex: new RoundAwareAgent('codex'), claude: new RoundAwareAgent('claude', roundOneRecovery
-    ? ['prose', 'changes_requested', 'prose', 'approved']
-    : ['changes_requested', 'prose', 'approved']) };
-  const runsRoot = join(repository.container, 'runs');
+    ? ['prose', 'changes_requested', 'prose', ...(doubleMalformedRoundTwo ? ['prose' as const] : []), postFixResult]
+    : ['changes_requested', 'prose', ...(doubleMalformedRoundTwo ? ['prose' as const] : []), postFixResult]) };
+  const runsRoot = useRepositoryRuns
+    ? join(await realpath(repository.repository), 'tools/agent-orchestrator/runs')
+    : join(repository.container, 'runs');
   const orchestrator = await AgentOrchestrator.start(phase, { repositoryPath: repository.repository, runsRoot, agents });
   let first = await orchestrator.execute();
   if (roundOneRecovery) {
@@ -160,6 +176,21 @@ async function fixture(roundOneRecovery = false): Promise<Fixture> {
 async function events(value: Fixture): Promise<RunEvent[]> {
   return (await readFile(value.orchestrator.stateStore.eventsPath, 'utf8')).trim().split('\n')
     .map((line) => JSON.parse(line) as RunEvent);
+}
+
+async function doubleMalformedRoundTwoFixture(
+  useRepositoryRuns = false,
+  postFixResult: 'approved' | 'prose' = 'approved',
+): Promise<Fixture> {
+  const value = await fixture(false, true, useRepositoryRuns, postFixResult);
+  await AgentOrchestrator.retryReviewOutput(value.runId, reviewTaskId, options(value));
+  const resumed = await AgentOrchestrator.resume(value.runId, options(value));
+  const failed = await resumed.execute();
+  assert.equal(failed.status, 'FAILED');
+  assert.equal(failed.tasks[reviewTaskId]?.reviewRounds, 1);
+  assert.equal(failed.tasks[reviewTaskId]?.agentAttempts.length, 3);
+  assert.equal(failed.tasks[reviewTaskId]?.reviewOutputRecoveries?.length, 1);
+  return { ...value, orchestrator: resumed };
 }
 
 test('accepted round 1 plus malformed round 2 authorizes only the current round without executing work', async () => {
@@ -240,6 +271,167 @@ test('round-2 retry authorization is concurrency-safe and bounded to one entry f
       ? task.reviewOutputRecoveries[0].reviewRound : undefined, 2);
   } finally { await value.repository.dispose(); }
 });
+
+test('Claude contract continuation binds the consumed round-2 retry and both malformed attempts without invoking a provider', async () => {
+  const value = await doubleMalformedRoundTwoFixture();
+  try {
+    const before = value.orchestrator.snapshot();
+    const invocations = value.agents.codex.requests.length + value.agents.claude.requests.length;
+    const consumed = before.tasks[reviewTaskId]!.reviewOutputRecoveries![0]!;
+    const correction = before.tasks[value.correctionTaskId]!;
+    await assert.rejects(
+      AgentOrchestrator.retryReviewOutput(value.runId, reviewTaskId, options(value)),
+      (error) => isOrchestratorError(error, 'TASK_STATE_INVALID') && /budget.*exhausted/.test(error.message),
+    );
+
+    const authorized = await AgentOrchestrator.continueClaudeReviewAfterOutputContractFix(
+      value.runId,
+      reviewTaskId,
+      options(value),
+    );
+
+    assert.equal(authorized.created, true);
+    assert.equal(authorized.recovery.version, 3);
+    assert.equal(authorized.recovery.reviewRound, 2);
+    assert.equal(authorized.recovery.taskReviewRound, 2);
+    assert.equal(authorized.recovery.consumedRecovery, 1);
+    assert.equal(authorized.recovery.consumedRecoverySha256, canonicalHash(consumed));
+    assert.deepEqual(authorized.recovery.malformedAttempts, [2, 3]);
+    assert.equal(authorized.recovery.oldContractId, CLAUDE_TEXT_REVIEW_OUTPUT_CONTRACT_ID);
+    assert.equal(authorized.recovery.newContractId, CLAUDE_STRUCTURED_REVIEW_OUTPUT_CONTRACT_ID);
+    assert.deepEqual(authorized.recovery.dependencyCommits, [{
+      taskId: 'implementation',
+      commitSha: before.tasks.implementation!.commit!.sha,
+    }, {
+      taskId: value.correctionTaskId,
+      commitSha: correction.commit!.sha,
+    }]);
+    assert.ok(authorized.recovery.promptArtifacts.length > 0);
+    assert.equal(value.agents.codex.requests.length + value.agents.claude.requests.length, invocations);
+    const state = authorized.orchestrator.snapshot();
+    assert.equal(state.status, 'RUNNING');
+    assert.equal(state.tasks[reviewTaskId]?.status, 'READY');
+    assert.equal(state.tasks[reviewTaskId]?.reviewRounds, 1);
+    assert.equal(state.tasks[reviewTaskId]?.agentAttempts.length, 3);
+    assert.deepEqual(state.tasks[value.correctionTaskId], correction);
+    assert.equal(state.integration.status, 'PENDING');
+  } finally { await value.repository.dispose(); }
+});
+
+test('Claude contract continuation is idempotent before resume and permits exactly one post-fix invocation', async () => {
+  const value = await doubleMalformedRoundTwoFixture();
+  try {
+    const first = await AgentOrchestrator.continueClaudeReviewAfterOutputContractFix(
+      value.runId, reviewTaskId, options(value),
+    );
+    const invocationCount = value.agents.claude.requests.length;
+    const eventBytes = await readFile(value.orchestrator.stateStore.eventsPath);
+    const repeated = await AgentOrchestrator.continueClaudeReviewAfterOutputContractFix(
+      value.runId, reviewTaskId, options(value),
+    );
+    assert.equal(repeated.created, false);
+    assert.deepEqual(repeated.recovery, first.recovery);
+    assert.equal(value.agents.claude.requests.length, invocationCount);
+    assert.deepEqual(await readFile(value.orchestrator.stateStore.eventsPath), eventBytes);
+
+    const resumed = await AgentOrchestrator.resume(value.runId, options(value));
+    const completed = await resumed.execute();
+    assert.equal(completed.status, 'COMPLETED');
+    assert.equal(completed.tasks[reviewTaskId]?.agentAttempts.length, 4);
+    assert.equal(completed.tasks[reviewTaskId]?.reviewRounds, 2);
+    assert.equal(value.agents.claude.requests.length, invocationCount + 1);
+    await (await AgentOrchestrator.resume(value.runId, options(value))).execute();
+    assert.equal(value.agents.claude.requests.length, invocationCount + 1);
+  } finally { await value.repository.dispose(); }
+});
+
+test('continue-claude-review-output CLI authorizes no provider and reports the manual resume boundary', async () => {
+  const value = await doubleMalformedRoundTwoFixture(true);
+  try {
+    const invocations = value.agents.codex.requests.length + value.agents.claude.requests.length;
+    const cli = resolve(__dirname, '../../src/cli.js');
+    const result = spawnSync(
+      process.execPath,
+      [cli, 'continue-claude-review-output', value.runId, reviewTaskId],
+      { cwd: value.repository.repository, encoding: 'utf8' },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    const output = JSON.parse(result.stdout) as Record<string, unknown>;
+    assert.equal(output.runId, value.runId);
+    assert.equal(output.runStatus, 'RUNNING');
+    assert.equal(output.taskId, reviewTaskId);
+    assert.equal(output.created, true);
+    assert.deepEqual(output.malformedAttempts, [2, 3]);
+    assert.equal(output.oldContractId, CLAUDE_TEXT_REVIEW_OUTPUT_CONTRACT_ID);
+    assert.equal(output.newContractId, CLAUDE_STRUCTURED_REVIEW_OUTPUT_CONTRACT_ID);
+    assert.match(String(output.manualNextStep), /agents:resume/);
+    assert.equal(value.agents.codex.requests.length + value.agents.claude.requests.length, invocations);
+  } finally { await value.repository.dispose(); }
+});
+
+test('a failed post-contract-fix output cannot authorize or execute another provider attempt', async () => {
+  const value = await doubleMalformedRoundTwoFixture(false, 'prose');
+  try {
+    await AgentOrchestrator.continueClaudeReviewAfterOutputContractFix(
+      value.runId, reviewTaskId, options(value),
+    );
+    const resumed = await AgentOrchestrator.resume(value.runId, options(value));
+    const failed = await resumed.execute();
+    assert.equal(failed.status, 'FAILED');
+    assert.equal(failed.tasks[reviewTaskId]?.agentAttempts.length, 4);
+    const invocations = value.agents.claude.requests.length;
+
+    const repeated = await AgentOrchestrator.continueClaudeReviewAfterOutputContractFix(
+      value.runId, reviewTaskId, options(value),
+    );
+    assert.equal(repeated.created, false);
+    assert.equal(repeated.orchestrator.snapshot().tasks[reviewTaskId]?.status, 'FAILED');
+    await assert.rejects(
+      AgentOrchestrator.retryReviewOutput(value.runId, reviewTaskId, options(value)),
+      (error) => isOrchestratorError(error, 'TASK_STATE_INVALID'),
+    );
+    await (await AgentOrchestrator.resume(value.runId, options(value))).execute();
+    assert.equal(value.agents.claude.requests.length, invocations);
+  } finally { await value.repository.dispose(); }
+});
+
+for (const evidence of [
+  'first-malformed-stdout',
+  'second-malformed-stdout',
+  'prompt-artifact',
+  'prepared-head-binding',
+  'dependency-binding',
+] as const) {
+  test(`Claude contract continuation fails closed when ${evidence} changes after authorization`, async () => {
+    const value = await doubleMalformedRoundTwoFixture();
+    try {
+      const authorized = await AgentOrchestrator.continueClaudeReviewAfterOutputContractFix(
+        value.runId, reviewTaskId, options(value),
+      );
+      if (evidence === 'prepared-head-binding' || evidence === 'dependency-binding') {
+        const state = await value.orchestrator.stateStore.load();
+        await value.orchestrator.stateStore.save({ ...state, tasks: { ...state.tasks,
+          ...(evidence === 'prepared-head-binding'
+            ? { [reviewTaskId]: { ...state.tasks[reviewTaskId]!, preparedHeadSha: state.baseSha } }
+            : { implementation: { ...state.tasks.implementation!, commit: {
+              ...state.tasks.implementation!.commit!, sha: state.baseSha,
+            } } }),
+        } });
+      } else {
+        const source = evidence === 'first-malformed-stdout'
+          ? value.orchestrator.snapshot().tasks[reviewTaskId]!.reviewOutputRecoveries![0]!.stdoutPath
+          : evidence === 'second-malformed-stdout'
+            ? authorized.recovery.stdoutPath
+            : authorized.recovery.promptArtifacts[0]!.path;
+        await appendFile(source, 'tampered\n');
+      }
+      await assert.rejects(
+        AgentOrchestrator.resume(value.runId, options(value)),
+        (error) => isOrchestratorError(error, 'STATE_CORRUPT'),
+      );
+    } finally { await value.repository.dispose(); }
+  });
+}
 
 test('an already materialized round-2 artifact refuses authorization without changing state', async () => {
   const value = await fixture();

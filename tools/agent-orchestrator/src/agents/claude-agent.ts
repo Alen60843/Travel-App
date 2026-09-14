@@ -9,6 +9,11 @@ import {
   type AgentInvocation,
   type ProcessAgentOptions,
 } from './process-agent';
+import {
+  CLAUDE_REVIEW_OUTPUT_SCHEMA,
+  extractClaudeStructuredReviewOutput,
+  usesClaudeStructuredReviewOutput,
+} from './claude-review-output';
 
 const CLAUDE_EFFORT: Readonly<Record<AgentEffort, string>> = {
   medium: 'medium',
@@ -26,6 +31,7 @@ export class ClaudeAgent extends ProcessAgent {
 
   protected buildInvocation(request: AgentRequest): AgentInvocation {
     const access = request.access ?? defaultAccessForRole(request.role);
+    const structuredReview = usesClaudeStructuredReviewOutput(request.role);
     // Claude Code 2.1.71 documents workflow permission modes independently
     // from --tools. `dontAsk` keeps headless reviews in normal execution while
     // the explicit tool list supplies the read-only capability boundary.
@@ -34,7 +40,7 @@ export class ClaudeAgent extends ProcessAgent {
       '--safe-mode',
       '--no-session-persistence',
       '--output-format',
-      'text',
+      structuredReview ? 'json' : 'text',
       '--effort',
       CLAUDE_EFFORT[request.requestedEffort],
       '--permission-mode',
@@ -42,6 +48,10 @@ export class ClaudeAgent extends ProcessAgent {
       '--tools',
       access === 'read_only' ? 'Read,Glob,Grep' : 'default',
     ];
+
+    if (structuredReview) {
+      args.push('--json-schema', JSON.stringify(CLAUDE_REVIEW_OUTPUT_SCHEMA));
+    }
 
     // `claude --help` documents `--model <model>` as a real, independent flag
     // (accepting an alias or a full model name) alongside --effort, verified
@@ -56,5 +66,14 @@ export class ClaudeAgent extends ProcessAgent {
       args,
       prompt: buildAgentPrompt(request),
     };
+  }
+
+  protected override extractStructuredHandoff(
+    request: AgentRequest,
+    rawStdout: string | null,
+  ): unknown | null {
+    return usesClaudeStructuredReviewOutput(request.role)
+      ? extractClaudeStructuredReviewOutput(rawStdout)
+      : super.extractStructuredHandoff(request, rawStdout);
   }
 }

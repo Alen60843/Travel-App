@@ -5,7 +5,10 @@ import { dirname, join, resolve, sep } from 'node:path';
 
 import {
   ClaudeAgent,
+  CLAUDE_STRUCTURED_REVIEW_OUTPUT_CONTRACT_ID,
+  CLAUDE_TEXT_REVIEW_OUTPUT_CONTRACT_ID,
   CodexAgent,
+  extractClaudeStructuredReviewOutput,
   parseJsonOrNull,
   readBoundedStdoutText,
   resolveAgentExecutable,
@@ -93,6 +96,9 @@ import {
   type AgentFailureRecoveryState,
   type HandoffRepairAttemptRecord,
   type ReviewOutputRecoveryState,
+  type ReviewOutputRecoveryV2State,
+  type ReviewOutputRecoveryV3State,
+  type ReviewInputArtifactState,
   type RecoveryPolicySnapshot,
   type RunEventName,
   type RunState,
@@ -292,6 +298,15 @@ export interface ReviewOutputRetryResult {
   readonly taskId: string;
   readonly recovery: ReviewOutputRecoveryState;
   readonly reopenedTasks: readonly string[];
+}
+
+/** Result of the one-time Claude review transport-contract continuation. */
+export interface ReviewOutputContractContinuationResult {
+  readonly orchestrator: AgentOrchestrator;
+  readonly taskId: string;
+  readonly recovery: ReviewOutputRecoveryV3State;
+  readonly reopenedTasks: readonly string[];
+  readonly created: boolean;
 }
 
 interface ReviewAttemptEventBinding {
@@ -712,6 +727,7 @@ export class AgentOrchestrator {
       ...(latestRecoveryPolicy?.executors === undefined ? {} : { recoveryExecutors: latestRecoveryPolicy.executors }),
     });
     await orchestrator.assertReviewOutputRecoveryBindings();
+    await orchestrator.assertReviewOutputContractContinuationBindings();
     // §15 crash safety: heal any adaptive unit left stale by a recovery
     // whose TaskRunState write landed but whose adaptive mirror didn't (see
     // reconcileRecoveredAdaptiveUnits) — evidence-gated, so a genuinely
@@ -1620,6 +1636,154 @@ export class AgentOrchestrator {
         recoveryMode: 'structured_review_output_retry', taskId, reopenedTasks,
       });
       return { orchestrator, taskId, recovery, reopenedTasks };
+    });
+  }
+
+  /**
+   * Authorize one post-fix Claude invocation after the ordinary retry for the
+   * same review round also failed under the superseded prompt-only contract.
+   * Authorization is state-only; normal resume performs the sole invocation.
+   */
+  static async continueClaudeReviewAfterOutputContractFix(
+    runId: string,
+    taskId: string,
+    options: OrchestratorOptions,
+  ): Promise<ReviewOutputContractContinuationResult> {
+    const repositoryRoot = await (options.git ?? new GitClient()).repositoryRoot(resolve(options.repositoryPath));
+    const store = new StateStore(resolve(options.runsRoot ?? join(repositoryRoot, 'tools/agent-orchestrator/runs')), runId);
+    return store.withRunMutationLock(async () => {
+      const persisted = await store.load();
+      if (persisted.strategy === 'adaptive' || persisted.adaptive !== undefined) {
+        throw new OrchestratorError('TASK_STATE_INVALID', 'Claude review contract continuation supports static runs only');
+      }
+      const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options);
+      const existing = orchestrator.state.tasks[taskId]?.reviewOutputRecoveries?.find(
+        (entry): entry is ReviewOutputRecoveryV3State => entry.version === 3,
+      );
+      if (existing !== undefined) {
+        return {
+          orchestrator,
+          taskId,
+          recovery: existing,
+          reopenedTasks: existing.reopenedTaskIds,
+          created: false,
+        };
+      }
+      const checked = await orchestrator.checkReviewOutputRetryEligibility(taskId, true);
+      const refuse = (reason: string): never => {
+        throw new OrchestratorError(
+          'TASK_STATE_INVALID',
+          `Refusing Claude review contract continuation for ${taskId}: ${reason}`,
+          { details: { runId, taskId, reason } },
+        );
+      };
+      const eligibility = checked.eligible === true ? checked : refuse(checked.reason);
+
+      const spec = orchestrator.config.tasks.find((candidate) => candidate.id === taskId)!;
+      const previous = orchestrator.state.tasks[taskId]!;
+      if (spec.owner !== 'claude') refuse('task owner is not Claude');
+      if (eligibility.reviewRound !== 2 || eligibility.taskReviewRound !== 2) {
+        refuse('only the unaccepted second review round is supported');
+      }
+      const sameRound = (previous.reviewOutputRecoveries ?? []).filter(
+        (entry): entry is ReviewOutputRecoveryV2State =>
+          entry.version === 2 && entry.reviewRound === eligibility.reviewRound,
+      );
+      if (sameRound.length !== 1) refuse('the same round is not bound to exactly one consumed v2 retry');
+      const consumed = sameRound[0]!;
+      const currentAttempt = previous.agentAttempts.at(-1)!;
+      if (currentAttempt.attempt !== consumed.attempt.attempt + 1
+        || currentAttempt.agent !== 'claude' || consumed.attempt.agent !== 'claude') {
+        refuse('the two malformed Claude attempts are not consecutive');
+      }
+      const currentStdout = await readFile(eligibility.stdoutPath);
+      const consumedStdout = await readFile(consumed.stdoutPath);
+      if (createHash('sha256').update(consumedStdout).digest('hex') !== consumed.stdoutSha256) {
+        refuse('the consumed retry stdout evidence changed');
+      }
+      for (const [label, bytes] of [['consumed retry', consumedStdout], ['latest attempt', currentStdout]] as const) {
+        const raw = bytes.toString('utf8').trim();
+        if (raw.length === 0 || parseJsonOrNull(raw) !== null
+          || extractClaudeStructuredReviewOutput(raw) !== null) {
+          refuse(`${label} is not a prompt-only prose output-contract failure`);
+        }
+      }
+      const reopenedTasks = orchestrator.dependencyOnlyDescendantsToReopen(taskId);
+      for (const id of reopenedTasks) {
+        const descendant = orchestrator.state.tasks[id]!;
+        if (descendant.reviewRounds !== 0 || descendant.preparation !== undefined
+          || descendant.salvage !== undefined || descendant.replan !== undefined
+          || (descendant.agentFailureRecoveries?.length ?? 0) > 0
+          || (descendant.reviewOutputRecoveries?.length ?? 0) > 0) {
+          refuse(`dependency-blocked task ${id} contains execution or recovery evidence`);
+        }
+      }
+      const recovery = {
+        version: 3,
+        runId,
+        taskId,
+        reviewRound: eligibility.reviewRound,
+        taskReviewRound: eligibility.taskReviewRound,
+        preparedHeadSha: previous.preparedHeadSha!,
+        acceptedReviewArtifacts: eligibility.acceptedReviewArtifacts,
+        recovery: (previous.reviewOutputRecoveries?.length ?? 0) + 1,
+        authorizedAt: orchestrator.clock().toISOString(),
+        previousRunStatus: orchestrator.state.status as 'FAILED' | 'BLOCKED',
+        previousTaskStatus: 'FAILED',
+        error: previous.error!,
+        attempt: currentAttempt,
+        previousHandoffOutcome: 'invalid',
+        stdoutPath: eligibility.stdoutPath,
+        stdoutSha256: eligibility.stdoutSha256,
+        reopenedTaskIds: reopenedTasks,
+        consumedRecovery: consumed.recovery,
+        consumedRecoverySha256: canonicalHash(consumed),
+        malformedAttempts: [consumed.attempt.attempt, currentAttempt.attempt],
+        oldContractId: CLAUDE_TEXT_REVIEW_OUTPUT_CONTRACT_ID,
+        newContractId: CLAUDE_STRUCTURED_REVIEW_OUTPUT_CONTRACT_ID,
+        dependencyCommits: orchestrator.dependencyCommits(spec),
+        promptArtifacts: await orchestrator.reviewPromptArtifactEvidence(spec),
+        authorizedBy: 'human',
+      } satisfies ReviewOutputRecoveryV3State;
+
+      await orchestrator.mutate((state) => {
+        const tasks = { ...state.tasks };
+        const target = tasks[taskId]!;
+        const {
+          error: _error,
+          finishedAt: _finishedAt,
+          startedAt: _startedAt,
+          handoffOutcome: _handoffOutcome,
+          skipReason: _skipReason,
+          ...retryable
+        } = target;
+        tasks[taskId] = {
+          ...retryable,
+          status: 'READY',
+          reviewOutputRecoveries: [...(target.reviewOutputRecoveries ?? []), recovery],
+        };
+        for (const id of reopenedTasks) {
+          const { error: _dependencyError, finishedAt: _dependencyFinishedAt, ...descendant } = tasks[id]!;
+          tasks[id] = { ...descendant, status: 'PENDING' };
+        }
+        return { ...state, status: 'RUNNING', tasks };
+      });
+      await orchestrator.event('REVIEW_OUTPUT_CONTRACT_CONTINUATION_AUTHORIZED', taskId, {
+        recovery: recovery.recovery,
+        reviewRound: recovery.reviewRound,
+        malformedAttempts: recovery.malformedAttempts,
+        consumedRecovery: recovery.consumedRecovery,
+        oldContractId: recovery.oldContractId,
+        newContractId: recovery.newContractId,
+        reopenedTasks,
+      });
+      for (const id of reopenedTasks) {
+        await orchestrator.event('TASK_DEPENDENCY_REOPENED', id, { recoveredDependency: taskId });
+      }
+      await orchestrator.event('RUN_RESUMED', undefined, {
+        recoveryMode: 'claude_review_output_contract_continuation', taskId, reopenedTasks,
+      });
+      return { orchestrator, taskId, recovery, reopenedTasks, created: true };
     });
   }
 
@@ -3387,6 +3551,21 @@ export class AgentOrchestrator {
         `Task ${task.id} worktree is dirty before invocation; preserving it for inspection`,
       );
     }
+    const contractContinuation = current.reviewOutputRecoveries?.find(
+      (entry): entry is ReviewOutputRecoveryV3State => entry.version === 3,
+    );
+    if (contractContinuation !== undefined) {
+      if (inspection.headSha !== contractContinuation.preparedHeadSha) {
+        throw new OrchestratorError('TASK_STATE_INVALID', 'Claude review contract continuation prepared HEAD changed');
+      }
+      await assertCodeInputHistory(
+        this.git,
+        worktree.path,
+        this.state.baseSha,
+        inspection.headSha,
+        contractContinuation.dependencyCommits,
+      );
+    }
     const preparationReusable = canReuseIntegrationPreparation(
       this.state.tasks[task.id]?.preparation,
       worktree.path,
@@ -3587,9 +3766,15 @@ export class AgentOrchestrator {
       return;
     }
     const taskState = this.state.tasks[prepared.task.id]!;
+    const contractContinuation = taskState.reviewOutputRecoveries?.find(
+      (entry): entry is ReviewOutputRecoveryV3State => entry.version === 3,
+    );
+    const contractFixInvocationConsumed = contractContinuation !== undefined
+      && taskState.agentAttempts.some((attempt) => attempt.attempt > contractContinuation.attempt.attempt);
     const retryAvailable =
       INFRASTRUCTURE_FAILURES.has(result.status)
-      && taskState.agentAttempts.length <= this.config.agentRetries;
+      && taskState.agentAttempts.length <= this.config.agentRetries
+      && !contractFixInvocationConsumed;
     const inspection = await inspectTaskCommits(
       this.git,
       prepared.worktree.path,
@@ -4911,10 +5096,37 @@ export class AgentOrchestrator {
     return bindings;
   }
 
+  private async reviewPromptArtifactEvidence(task: TaskSpec): Promise<ReviewInputArtifactState[]> {
+    const graph = new TaskGraph(this.config.tasks);
+    const ancestors = ancestorTasks(task, graph);
+    const authorizedReviewPath = this.state.reviewCorrections?.find(
+      (entry) => entry.authorization.correctionTask.id === task.id,
+    )?.authorization.reviewArtifactPath;
+    const paths = [...new Set([
+      ...ancestors.flatMap((ancestor) => {
+        const state = this.state.tasks[ancestor.id];
+        return [
+          ...(state?.handoffPath === undefined ? [] : [state.handoffPath]),
+          ...(state?.reviewPaths ?? []),
+        ];
+      }),
+      ...(authorizedReviewPath === undefined ? [] : [authorizedReviewPath]),
+    ])].sort();
+    return Promise.all(paths.map(async (path) => {
+      const details = await lstat(path).catch((error) => {
+        throw new OrchestratorError('TASK_STATE_INVALID', `Review prompt artifact is unavailable: ${path}`, { cause: error });
+      });
+      if (!details.isFile() || details.isSymbolicLink()) {
+        throw new OrchestratorError('TASK_STATE_INVALID', `Review prompt artifact is not a regular file: ${path}`);
+      }
+      return { path, sha256: createHash('sha256').update(await readFile(path)).digest('hex') };
+    }));
+  }
+
   /** Revalidate every v2 retry authorization before any resumed work can execute. */
   private async assertReviewOutputRecoveryBindings(): Promise<void> {
     for (const [taskId, task] of Object.entries(this.state.tasks)) {
-      const recoveries = (task.reviewOutputRecoveries ?? []).filter((entry) => entry.version === 2);
+      const recoveries = (task.reviewOutputRecoveries ?? []).filter((entry) => entry.version !== undefined);
       if (recoveries.length === 0) continue;
       const spec = this.config.tasks.find((entry) => entry.id === taskId);
       if (spec === undefined || !REVIEW_MODES.has(spec.mode) || spec.writer) {
@@ -4966,8 +5178,58 @@ export class AgentOrchestrator {
     }
   }
 
+  /** Revalidate the v3 contract migration before any post-fix invocation. */
+  private async assertReviewOutputContractContinuationBindings(): Promise<void> {
+    for (const [taskId, task] of Object.entries(this.state.tasks)) {
+      const recovery = task.reviewOutputRecoveries?.find(
+        (entry): entry is ReviewOutputRecoveryV3State => entry.version === 3,
+      );
+      if (recovery === undefined) continue;
+      const spec = this.config.tasks.find((entry) => entry.id === taskId);
+      const prior = task.reviewOutputRecoveries?.find(
+        (entry): entry is ReviewOutputRecoveryV2State => entry.version === 2
+          && entry.recovery === recovery.consumedRecovery,
+      );
+      if (spec === undefined || spec.owner !== 'claude' || spec.writer
+        || !['review', 'final_review'].includes(spec.mode)
+        || prior === undefined || canonicalHash(prior) !== recovery.consumedRecoverySha256
+        || recovery.oldContractId !== CLAUDE_TEXT_REVIEW_OUTPUT_CONTRACT_ID
+        || recovery.newContractId !== CLAUDE_STRUCTURED_REVIEW_OUTPUT_CONTRACT_ID
+        || recovery.preparedHeadSha !== task.preparedHeadSha
+        || JSON.stringify(this.dependencyCommits(spec)) !== JSON.stringify(recovery.dependencyCommits)
+        || recovery.malformedAttempts[0] !== prior.attempt.attempt
+        || recovery.malformedAttempts[1] !== recovery.attempt.attempt) {
+        throw new OrchestratorError('STATE_CORRUPT', `Claude review contract continuation ${taskId} binding changed`);
+      }
+      const promptArtifacts = await this.reviewPromptArtifactEvidence(spec).catch((error) => {
+        throw new OrchestratorError('STATE_CORRUPT', `Claude review contract continuation ${taskId} prompt evidence is invalid`, { cause: error });
+      });
+      if (JSON.stringify(promptArtifacts) !== JSON.stringify(recovery.promptArtifacts)) {
+        throw new OrchestratorError('STATE_CORRUPT', `Claude review contract continuation ${taskId} prompt artifacts changed`);
+      }
+      for (const source of [prior, recovery]) {
+        const raw = (await readFile(source.stdoutPath)).toString('utf8').trim();
+        if (raw.length === 0 || parseJsonOrNull(raw) !== null
+          || extractClaudeStructuredReviewOutput(raw) !== null) {
+          throw new OrchestratorError('STATE_CORRUPT', `Claude review contract continuation ${taskId} source output is not the bound prompt-only failure`);
+        }
+      }
+      const postFixAttempts = task.agentAttempts.filter(
+        (attempt) => attempt.attempt > recovery.attempt.attempt,
+      );
+      if (postFixAttempts.length > 1
+        || postFixAttempts.some((attempt) => attempt.agent !== 'claude')
+        || (task.status === 'READY' && postFixAttempts.length !== 0)) {
+        throw new OrchestratorError('STATE_CORRUPT', `Claude review contract continuation ${taskId} exceeded its one-invocation budget`);
+      }
+    }
+  }
+
   /** Fail-closed eligibility for one bounded structured-review retry per review round. */
-  private async checkReviewOutputRetryEligibility(taskId: string): Promise<
+  private async checkReviewOutputRetryEligibility(
+    taskId: string,
+    allowConsumedRound = false,
+  ): Promise<
     | { readonly eligible: true; readonly stdoutPath: string; readonly stdoutSha256: string;
       readonly reviewRound: number; readonly taskReviewRound: number;
       readonly acceptedReviewArtifacts: readonly AcceptedReviewArtifactState[] }
@@ -5085,15 +5347,17 @@ export class AgentOrchestrator {
       return refuse(`last provider attempt is not durably bound to unaccepted review round ${reviewRound}`);
     }
     for (const recovery of task.reviewOutputRecoveries ?? []) {
-      const legacyBinding = recovery.version === 2 ? undefined : attemptBindings.get(recovery.attempt.attempt);
-      const recoveredRound = recovery.version === 2 ? recovery.reviewRound : legacyBinding?.round;
+      const legacyBinding = recovery.version === undefined ? attemptBindings.get(recovery.attempt.attempt) : undefined;
+      const recoveredRound = recovery.version === undefined ? legacyBinding?.round : recovery.reviewRound;
       if (recoveredRound === undefined) {
         return refuse(`historical structured-review retry ${recovery.recovery} has no provable round`);
       }
-      if (recovery.version !== 2 && (legacyBinding?.repairRejected !== true || legacyBinding.reviewBlocked !== true)) {
+      if (recovery.version === undefined && (legacyBinding?.repairRejected !== true || legacyBinding.reviewBlocked !== true)) {
         return refuse(`historical structured-review retry ${recovery.recovery} lacks rejected-output evidence`);
       }
-      if (recoveredRound === reviewRound) return refuse(`structured-review retry budget for round ${reviewRound} is exhausted`);
+      if (recoveredRound === reviewRound && !allowConsumedRound) {
+        return refuse(`structured-review retry budget for round ${reviewRound} is exhausted`);
+      }
     }
     const unsatisfied = spec.dependsOn.filter((id) => {
       const status = this.state.tasks[id]?.status;

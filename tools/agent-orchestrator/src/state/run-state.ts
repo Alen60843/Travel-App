@@ -119,6 +119,16 @@ export interface AcceptedReviewArtifactState {
   readonly sha256: string;
 }
 
+export interface ReviewInputArtifactState {
+  readonly path: string;
+  readonly sha256: string;
+}
+
+export interface ReviewDependencyCommitState {
+  readonly taskId: string;
+  readonly commitSha: string;
+}
+
 interface ReviewOutputRecoveryBaseState {
   readonly recovery: number;
   readonly authorizedAt: string;
@@ -153,7 +163,34 @@ export interface ReviewOutputRecoveryV2State extends ReviewOutputRecoveryBaseSta
   readonly acceptedReviewArtifacts: readonly AcceptedReviewArtifactState[];
 }
 
-export type ReviewOutputRecoveryState = ReviewOutputRecoveryV1State | ReviewOutputRecoveryV2State;
+/**
+ * One explicit continuation after the v2 retry for the same round proved the
+ * superseded Claude prompt-only transport contract was defective. This is not
+ * another per-round retry budget: it is a one-time migration to a distinct,
+ * hash-identified adapter contract.
+ */
+export interface ReviewOutputRecoveryV3State extends ReviewOutputRecoveryBaseState {
+  readonly version: 3;
+  readonly runId: string;
+  readonly taskId: string;
+  readonly reviewRound: number;
+  readonly taskReviewRound: number;
+  readonly preparedHeadSha: string;
+  readonly acceptedReviewArtifacts: readonly AcceptedReviewArtifactState[];
+  readonly consumedRecovery: number;
+  readonly consumedRecoverySha256: string;
+  readonly malformedAttempts: readonly [number, number];
+  readonly oldContractId: string;
+  readonly newContractId: string;
+  readonly dependencyCommits: readonly ReviewDependencyCommitState[];
+  readonly promptArtifacts: readonly ReviewInputArtifactState[];
+  readonly authorizedBy: 'human';
+}
+
+export type ReviewOutputRecoveryState =
+  | ReviewOutputRecoveryV1State
+  | ReviewOutputRecoveryV2State
+  | ReviewOutputRecoveryV3State;
 
 export interface TaskRunState {
   readonly id: string;
@@ -392,6 +429,7 @@ export const RUN_EVENT_NAMES = [
   'HANDOFF_REPAIR_ATTEMPTED',
   'AGENT_RETRY_AUTHORIZED',
   'REVIEW_OUTPUT_RETRY_AUTHORIZED',
+  'REVIEW_OUTPUT_CONTRACT_CONTINUATION_AUTHORIZED',
   'PREFLIGHT_RETRY_AUTHORIZED',
   'TASK_DEPENDENCY_REOPENED',
   'REVIEW_STARTED',
@@ -730,15 +768,20 @@ function parseReviewOutputRecovery(
     stdoutSha256,
     reopenedTaskIds: stringArray(value.reopenedTaskIds, `${path}.reopenedTaskIds`),
   };
-  const v2Fields = ['runId', 'taskId', 'reviewRound', 'taskReviewRound', 'preparedHeadSha', 'acceptedReviewArtifacts'] as const;
+  const versionedFields = [
+    'runId', 'taskId', 'reviewRound', 'taskReviewRound', 'preparedHeadSha',
+    'acceptedReviewArtifacts', 'consumedRecovery', 'consumedRecoverySha256',
+    'malformedAttempts', 'oldContractId', 'newContractId', 'dependencyCommits',
+    'promptArtifacts', 'authorizedBy',
+  ] as const;
   if (value.version === undefined) {
-    if (v2Fields.some((field) => value[field] !== undefined)) {
-      throw new OrchestratorError('STATE_CORRUPT', `${path} cannot mix v1 and v2 fields`);
+    if (versionedFields.some((field) => value[field] !== undefined)) {
+      throw new OrchestratorError('STATE_CORRUPT', `${path} cannot mix v1 and versioned fields`);
     }
     return common;
   }
-  if (value.version !== 2) {
-    throw new OrchestratorError('STATE_CORRUPT', `${path}.version must be 2 when present`);
+  if (value.version !== 2 && value.version !== 3) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path}.version must be 2 or 3 when present`);
   }
   const preparedHeadSha = string(value.preparedHeadSha, `${path}.preparedHeadSha`);
   assertFullSha(preparedHeadSha, `${path}.preparedHeadSha`);
@@ -770,15 +813,69 @@ function parseReviewOutputRecovery(
       `${path}.acceptedReviewArtifacts must bind every accepted task-local round before taskReviewRound`,
     );
   }
-  return {
+  const versioned = {
     ...common,
-    version: 2,
     runId: string(value.runId, `${path}.runId`),
     taskId: string(value.taskId, `${path}.taskId`),
     reviewRound,
     taskReviewRound,
     preparedHeadSha,
     acceptedReviewArtifacts,
+  };
+  if (value.version === 2) {
+    const v3Only = versionedFields.slice(6);
+    if (v3Only.some((field) => value[field] !== undefined)) {
+      throw new OrchestratorError('STATE_CORRUPT', `${path} cannot mix v2 and v3 fields`);
+    }
+    return { ...versioned, version: 2 };
+  }
+  const digest = (input: unknown, field: string): string => {
+    const result = string(input, `${path}.${field}`);
+    if (!/^[0-9a-f]{64}$/.test(result)) {
+      throw new OrchestratorError('STATE_CORRUPT', `${path}.${field} must be a lowercase sha256 digest`);
+    }
+    return result;
+  };
+  if (value.authorizedBy !== 'human') {
+    throw new OrchestratorError('STATE_CORRUPT', `${path}.authorizedBy must be human`);
+  }
+  if (!Array.isArray(value.malformedAttempts) || value.malformedAttempts.length !== 2) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path}.malformedAttempts must contain exactly two attempts`);
+  }
+  const malformedAttempts = value.malformedAttempts.map((attempt, index) =>
+    integer(attempt, `${path}.malformedAttempts[${index}]`, 1));
+  if (malformedAttempts[0]! >= malformedAttempts[1]!) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path}.malformedAttempts must be strictly increasing`);
+  }
+  const parseArtifacts = (input: unknown, field: string): ReviewInputArtifactState[] => {
+    if (!Array.isArray(input)) throw new OrchestratorError('STATE_CORRUPT', `${path}.${field} must be an array`);
+    return input.map((entry, index) => {
+      const itemPath = `${path}.${field}[${index}]`;
+      if (!isObject(entry)) throw new OrchestratorError('STATE_CORRUPT', `${itemPath} must be an object`);
+      return { path: string(entry.path, `${itemPath}.path`), sha256: digest(entry.sha256, `${field}[${index}].sha256`) };
+    });
+  };
+  if (!Array.isArray(value.dependencyCommits)) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path}.dependencyCommits must be an array`);
+  }
+  const dependencyCommits = value.dependencyCommits.map((entry, index) => {
+    const itemPath = `${path}.dependencyCommits[${index}]`;
+    if (!isObject(entry)) throw new OrchestratorError('STATE_CORRUPT', `${itemPath} must be an object`);
+    const commitSha = string(entry.commitSha, `${itemPath}.commitSha`);
+    assertFullSha(commitSha, `${itemPath}.commitSha`);
+    return { taskId: string(entry.taskId, `${itemPath}.taskId`), commitSha };
+  });
+  return {
+    ...versioned,
+    version: 3,
+    consumedRecovery: integer(value.consumedRecovery, `${path}.consumedRecovery`, 1),
+    consumedRecoverySha256: digest(value.consumedRecoverySha256, 'consumedRecoverySha256'),
+    malformedAttempts: malformedAttempts as unknown as readonly [number, number],
+    oldContractId: digest(value.oldContractId, 'oldContractId'),
+    newContractId: digest(value.newContractId, 'newContractId'),
+    dependencyCommits,
+    promptArtifacts: parseArtifacts(value.promptArtifacts, 'promptArtifacts'),
+    authorizedBy: 'human',
   };
 }
 
@@ -1199,16 +1296,29 @@ export function validateRunState(value: unknown): RunState {
     Object.entries(value.tasks).map(([key, task]) => [key, parseTask(task, key)]),
   );
   for (const [taskId, task] of Object.entries(tasks)) {
-    const explicitRounds = new Set<number>();
+    const explicitRounds = new Map<number, ReviewOutputRecoveryState>();
+    let contractContinuations = 0;
     for (const recovery of task.reviewOutputRecoveries ?? []) {
-      if (recovery.version !== 2) continue;
+      if (recovery.version === undefined) continue;
       if (recovery.runId !== runId || recovery.taskId !== taskId) {
         throw new OrchestratorError('STATE_CORRUPT', `tasks.${taskId}.reviewOutputRecoveries identity mismatch`);
       }
-      if (explicitRounds.has(recovery.reviewRound)) {
-        throw new OrchestratorError('STATE_CORRUPT', `tasks.${taskId}.reviewOutputRecoveries duplicates review round ${recovery.reviewRound}`);
+      const prior = explicitRounds.get(recovery.reviewRound);
+      if (prior !== undefined && (recovery.version !== 3 || prior.version !== 2
+        || recovery.consumedRecovery !== prior.recovery
+        || recovery.consumedRecoverySha256 !== canonicalReviewHash(prior)
+        || recovery.malformedAttempts[0] !== prior.attempt.attempt
+        || recovery.malformedAttempts[1] !== recovery.attempt.attempt)) {
+        throw new OrchestratorError('STATE_CORRUPT', `tasks.${taskId}.reviewOutputRecoveries has an invalid duplicate round ${recovery.reviewRound}`);
       }
-      explicitRounds.add(recovery.reviewRound);
+      if (prior === undefined && recovery.version === 3) {
+        throw new OrchestratorError('STATE_CORRUPT', `tasks.${taskId}.reviewOutputRecoveries contract continuation lacks its v2 source`);
+      }
+      if (recovery.version === 3
+        && (++contractContinuations > 1 || recovery.reviewRound !== 2 || recovery.taskReviewRound !== 2)) {
+        throw new OrchestratorError('STATE_CORRUPT', `tasks.${taskId}.reviewOutputRecoveries has an invalid contract continuation scope`);
+      }
+      explicitRounds.set(recovery.reviewRound, recovery);
       if (!task.agentAttempts.some((attempt) => JSON.stringify(attempt) === JSON.stringify(recovery.attempt))) {
         throw new OrchestratorError('STATE_CORRUPT', `tasks.${taskId}.reviewOutputRecoveries source attempt is missing`);
       }

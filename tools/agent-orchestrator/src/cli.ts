@@ -28,6 +28,7 @@ Usage:
   pnpm agents:repin-agent-executable <run-id> <agent> <absolute-executable-path>
   pnpm agents:retry-review-correction-verification <run-id> <correction-task-id>
   pnpm agents:retry-review-output <run-id> <task-id>
+  pnpm agents:continue-claude-review-output <run-id> <task-id>
   pnpm agents:retry-preflight <run-id> <task-id>
   pnpm agents:propose-replan <run-id> <task-id>
   pnpm agents:authorize-replan <run-id> <proposal-id>
@@ -73,6 +74,11 @@ retry-review-output authorizes one bounded fresh invocation for a static read-on
 final_review task whose process succeeded but whose output failed strict review validation.
 It requires an unchanged pristine prepared worktree and dependency history, archives the
 original error/attempt/stdout hash, and invokes no provider. Run agents:resume afterward.
+continue-claude-review-output is the narrower one-time continuation for a Claude review round
+whose ordinary structured-review retry was already consumed under the superseded prompt-only
+text contract. It binds both malformed successful attempts, the consumed recovery, old/new
+adapter contract identities, prepared HEAD, dependencies, and prompt artifacts. Authorization
+invokes no provider; one later resume may invoke Claude at most once under the repaired contract.
 retry-preflight rechecks only a static pre-invocation review-round guard failure with
 zero agent attempts and no accepted output. It requires a quiescent terminal run,
 the current condition and review limit to pass, and any prepared worktree to be pristine.
@@ -300,6 +306,34 @@ async function main(argv: readonly string[]): Promise<number> {
       originalStdoutSha256: result.recovery.stdoutSha256,
       reopenedTasks: result.reopenedTasks,
       manualNextStep: 'Run `pnpm agents:resume <run-id>` to execute the authorized review retry.',
+    }, null, 2)}\n`);
+    return 0;
+  }
+  if (command === 'continue-claude-review-output') {
+    const [taskId] = extra;
+    if (argument === undefined || taskId === undefined || extra.length !== 1) {
+      process.stderr.write('Usage: continue-claude-review-output <run-id> <task-id>\n');
+      return 1;
+    }
+    const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
+    const result = await AgentOrchestrator.continueClaudeReviewAfterOutputContractFix(
+      argument,
+      taskId,
+      { repositoryPath },
+    );
+    process.stdout.write(`${JSON.stringify({
+      runId: result.orchestrator.snapshot().runId,
+      runStatus: result.orchestrator.snapshot().status,
+      taskId: result.taskId,
+      created: result.created,
+      archivedRecovery: result.recovery.recovery,
+      reviewRound: result.recovery.reviewRound,
+      malformedAttempts: result.recovery.malformedAttempts,
+      consumedRecovery: result.recovery.consumedRecovery,
+      oldContractId: result.recovery.oldContractId,
+      newContractId: result.recovery.newContractId,
+      reopenedTasks: result.reopenedTasks,
+      manualNextStep: 'Inspect the contract continuation, then run `pnpm agents:resume <run-id>` for its sole post-fix invocation.',
     }, null, 2)}\n`);
     return 0;
   }
