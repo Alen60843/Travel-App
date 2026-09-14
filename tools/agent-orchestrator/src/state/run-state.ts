@@ -113,11 +113,13 @@ export interface AgentFailureRecoveryState {
   readonly reopenedTaskIds: readonly string[];
 }
 
-/**
- * Append-only authorization evidence for one bounded retry after a read-only
- * review process succeeded but its output failed strict review validation.
- */
-export interface ReviewOutputRecoveryState {
+export interface AcceptedReviewArtifactState {
+  readonly round: number;
+  readonly path: string;
+  readonly sha256: string;
+}
+
+interface ReviewOutputRecoveryBaseState {
   readonly recovery: number;
   readonly authorizedAt: string;
   readonly previousRunStatus: 'FAILED' | 'BLOCKED';
@@ -129,6 +131,29 @@ export interface ReviewOutputRecoveryState {
   readonly stdoutSha256: string;
   readonly reopenedTaskIds: readonly string[];
 }
+
+/** Historical task-global structured-review retry authorization. */
+export interface ReviewOutputRecoveryV1State extends ReviewOutputRecoveryBaseState {
+  readonly version?: undefined;
+}
+
+/**
+ * Append-only authorization evidence for one bounded retry of one explicit,
+ * attempted-but-unaccepted review round.
+ */
+export interface ReviewOutputRecoveryV2State extends ReviewOutputRecoveryBaseState {
+  readonly version: 2;
+  readonly runId: string;
+  readonly taskId: string;
+  /** Lineage round emitted by REVIEW_STARTED. */
+  readonly reviewRound: number;
+  /** Task-local round used by the canonical review artifact path. */
+  readonly taskReviewRound: number;
+  readonly preparedHeadSha: string;
+  readonly acceptedReviewArtifacts: readonly AcceptedReviewArtifactState[];
+}
+
+export type ReviewOutputRecoveryState = ReviewOutputRecoveryV1State | ReviewOutputRecoveryV2State;
 
 export interface TaskRunState {
   readonly id: string;
@@ -169,7 +194,7 @@ export interface TaskRunState {
   readonly handoffRepairAttempts: readonly HandoffRepairAttemptRecord[];
   /** Explicit agent/process failure recoveries, oldest first; never rewritten or removed. */
   readonly agentFailureRecoveries?: readonly AgentFailureRecoveryState[];
-  /** Explicit structured-review retries, oldest first; v1 permits one entry. */
+  /** Explicit structured-review retries, oldest first; v2 permits one entry per review round. */
   readonly reviewOutputRecoveries?: readonly ReviewOutputRecoveryState[];
   /**
    * Crash-safety checkpoints for salvaging a timed-out writer's dirty
@@ -693,7 +718,7 @@ function parseReviewOutputRecovery(
       `${path}.stdoutSha256 must be a lowercase sha256 digest`,
     );
   }
-  return {
+  const common: ReviewOutputRecoveryBaseState = {
     recovery,
     authorizedAt: timestamp(value.authorizedAt, `${path}.authorizedAt`),
     previousRunStatus,
@@ -704,6 +729,56 @@ function parseReviewOutputRecovery(
     stdoutPath: string(value.stdoutPath, `${path}.stdoutPath`),
     stdoutSha256,
     reopenedTaskIds: stringArray(value.reopenedTaskIds, `${path}.reopenedTaskIds`),
+  };
+  const v2Fields = ['runId', 'taskId', 'reviewRound', 'taskReviewRound', 'preparedHeadSha', 'acceptedReviewArtifacts'] as const;
+  if (value.version === undefined) {
+    if (v2Fields.some((field) => value[field] !== undefined)) {
+      throw new OrchestratorError('STATE_CORRUPT', `${path} cannot mix v1 and v2 fields`);
+    }
+    return common;
+  }
+  if (value.version !== 2) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path}.version must be 2 when present`);
+  }
+  const preparedHeadSha = string(value.preparedHeadSha, `${path}.preparedHeadSha`);
+  assertFullSha(preparedHeadSha, `${path}.preparedHeadSha`);
+  if (!Array.isArray(value.acceptedReviewArtifacts)) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path}.acceptedReviewArtifacts must be an array`);
+  }
+  const acceptedReviewArtifacts = value.acceptedReviewArtifacts.map((entry, index) => {
+    const artifactPath = `${path}.acceptedReviewArtifacts[${index}]`;
+    if (!isObject(entry)) throw new OrchestratorError('STATE_CORRUPT', `${artifactPath} must be an object`);
+    const sha256 = string(entry.sha256, `${artifactPath}.sha256`);
+    if (!/^[0-9a-f]{64}$/.test(sha256)) {
+      throw new OrchestratorError('STATE_CORRUPT', `${artifactPath}.sha256 must be a lowercase sha256 digest`);
+    }
+    return {
+      round: integer(entry.round, `${artifactPath}.round`, 1),
+      path: string(entry.path, `${artifactPath}.path`),
+      sha256,
+    };
+  });
+  const reviewRound = integer(value.reviewRound, `${path}.reviewRound`, 1);
+  const taskReviewRound = integer(value.taskReviewRound, `${path}.taskReviewRound`, 1);
+  if (taskReviewRound > reviewRound) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path}.taskReviewRound cannot exceed reviewRound`);
+  }
+  if (acceptedReviewArtifacts.length !== taskReviewRound - 1
+    || acceptedReviewArtifacts.some((artifact, index) => artifact.round !== index + 1)) {
+    throw new OrchestratorError(
+      'STATE_CORRUPT',
+      `${path}.acceptedReviewArtifacts must bind every accepted task-local round before taskReviewRound`,
+    );
+  }
+  return {
+    ...common,
+    version: 2,
+    runId: string(value.runId, `${path}.runId`),
+    taskId: string(value.taskId, `${path}.taskId`),
+    reviewRound,
+    taskReviewRound,
+    preparedHeadSha,
+    acceptedReviewArtifacts,
   };
 }
 
@@ -1123,6 +1198,22 @@ export function validateRunState(value: unknown): RunState {
   const tasks = Object.fromEntries(
     Object.entries(value.tasks).map(([key, task]) => [key, parseTask(task, key)]),
   );
+  for (const [taskId, task] of Object.entries(tasks)) {
+    const explicitRounds = new Set<number>();
+    for (const recovery of task.reviewOutputRecoveries ?? []) {
+      if (recovery.version !== 2) continue;
+      if (recovery.runId !== runId || recovery.taskId !== taskId) {
+        throw new OrchestratorError('STATE_CORRUPT', `tasks.${taskId}.reviewOutputRecoveries identity mismatch`);
+      }
+      if (explicitRounds.has(recovery.reviewRound)) {
+        throw new OrchestratorError('STATE_CORRUPT', `tasks.${taskId}.reviewOutputRecoveries duplicates review round ${recovery.reviewRound}`);
+      }
+      explicitRounds.add(recovery.reviewRound);
+      if (!task.agentAttempts.some((attempt) => JSON.stringify(attempt) === JSON.stringify(recovery.attempt))) {
+        throw new OrchestratorError('STATE_CORRUPT', `tasks.${taskId}.reviewOutputRecoveries source attempt is missing`);
+      }
+    }
+  }
   const strategy = value.strategy === undefined ? undefined : string(value.strategy, 'strategy');
   if (strategy !== undefined && strategy !== 'adaptive') {
     throw new OrchestratorError('STATE_CORRUPT', 'strategy must be adaptive when present');

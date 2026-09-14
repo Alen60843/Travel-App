@@ -296,6 +296,7 @@ async function main(argv: readonly string[]): Promise<number> {
       runStatus: result.orchestrator.snapshot().status,
       taskId: result.taskId,
       archivedRecovery: result.recovery.recovery,
+      ...(result.recovery.version === 2 ? { reviewRound: result.recovery.reviewRound } : {}),
       originalStdoutSha256: result.recovery.stdoutSha256,
       reopenedTasks: result.reopenedTasks,
       manualNextStep: 'Run `pnpm agents:resume <run-id>` to execute the authorized review retry.',

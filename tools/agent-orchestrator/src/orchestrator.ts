@@ -88,6 +88,7 @@ import {
   validateRunState,
   reconcileInterruptedTasks,
   withUpdatedTimestamp,
+  type AcceptedReviewArtifactState,
   type AgentAttemptState,
   type AgentFailureRecoveryState,
   type HandoffRepairAttemptRecord,
@@ -291,6 +292,15 @@ export interface ReviewOutputRetryResult {
   readonly taskId: string;
   readonly recovery: ReviewOutputRecoveryState;
   readonly reopenedTasks: readonly string[];
+}
+
+interface ReviewAttemptEventBinding {
+  readonly round: number;
+  readonly agent: AgentName;
+  readonly finishedStatus?: string;
+  readonly exitCode?: number | null;
+  readonly repairRejected?: true;
+  readonly reviewBlocked?: true;
 }
 
 export interface PreflightRetryResult {
@@ -701,6 +711,7 @@ export class AgentOrchestrator {
       ...(options.signal === undefined ? {} : { signal: options.signal }),
       ...(latestRecoveryPolicy?.executors === undefined ? {} : { recoveryExecutors: latestRecoveryPolicy.executors }),
     });
+    await orchestrator.assertReviewOutputRecoveryBindings();
     // §15 crash safety: heal any adaptive unit left stale by a recovery
     // whose TaskRunState write landed but whose adaptive mirror didn't (see
     // reconcileRecoveredAdaptiveUnits) — evidence-gated, so a genuinely
@@ -1551,8 +1562,15 @@ export class AgentOrchestrator {
           );
         }
       }
-      const recovery: ReviewOutputRecoveryState = {
-        recovery: 1,
+      const recovery = {
+        version: 2,
+        runId,
+        taskId,
+        reviewRound: checked.reviewRound,
+        taskReviewRound: checked.taskReviewRound,
+        preparedHeadSha: previous.preparedHeadSha!,
+        acceptedReviewArtifacts: checked.acceptedReviewArtifacts,
+        recovery: (previous.reviewOutputRecoveries?.length ?? 0) + 1,
         authorizedAt: orchestrator.clock().toISOString(),
         previousRunStatus: orchestrator.state.status as 'FAILED' | 'BLOCKED',
         previousTaskStatus: 'FAILED',
@@ -1562,7 +1580,7 @@ export class AgentOrchestrator {
         stdoutPath: checked.stdoutPath,
         stdoutSha256: checked.stdoutSha256,
         reopenedTaskIds: reopenedTasks,
-      };
+      } satisfies ReviewOutputRecoveryState;
 
       await orchestrator.mutate((state) => {
         const tasks = { ...state.tasks };
@@ -1589,6 +1607,7 @@ export class AgentOrchestrator {
       await orchestrator.event('REVIEW_OUTPUT_RETRY_AUTHORIZED', taskId, {
         recovery: recovery.recovery,
         failedAttempt: recovery.attempt.attempt,
+        reviewRound: recovery.reviewRound,
         errorCode: recovery.error.code,
         stdoutPath: recovery.stdoutPath,
         stdoutSha256: recovery.stdoutSha256,
@@ -4115,6 +4134,10 @@ export class AgentOrchestrator {
   private reviewArtifactPath(taskId: string): string {
     const task = this.state.tasks[taskId]!;
     const round = Math.max(task.reviewRounds, task.reviewPaths.length) + 1;
+    return this.reviewArtifactPathForRound(taskId, round);
+  }
+
+  private reviewArtifactPathForRound(taskId: string, round: number): string {
     return join(this.stateStore.runDirectory, 'reviews',
       round === 1 ? `${taskId}.json` : `${taskId}.round-${round}.json`);
   }
@@ -4829,9 +4852,125 @@ export class AgentOrchestrator {
     return completedRounds;
   }
 
-  /** Fail-closed eligibility for the single v1 structured-review retry. */
+  /** Bind provider attempts to the review round announced immediately before execution. */
+  private async reviewAttemptEventBindings(taskId: string): Promise<Map<number, ReviewAttemptEventBinding>> {
+    const source = await readFile(this.stateStore.eventsPath, 'utf8');
+    const bindings = new Map<number, ReviewAttemptEventBinding>();
+    let activeRound: number | undefined;
+    let lastFinishedAttempt: number | undefined;
+    for (const [index, line] of source.split('\n').entries()) {
+      if (line.length === 0) continue;
+      let event: unknown;
+      try { event = JSON.parse(line); } catch (error) {
+        throw new OrchestratorError('STATE_CORRUPT', `Invalid event JSON at line ${index + 1}`, { cause: error });
+      }
+      if (!isRecord(event) || event.runId !== this.state.runId) {
+        throw new OrchestratorError('STATE_CORRUPT', `Event identity is invalid at line ${index + 1}`);
+      }
+      if (event.taskId !== taskId) continue;
+      const data = isRecord(event.data) ? event.data : {};
+      if (event.name === 'REVIEW_STARTED') {
+        if (!Number.isSafeInteger(data.round) || Number(data.round) < 1) {
+          throw new OrchestratorError('STATE_CORRUPT', `Review start round is invalid at line ${index + 1}`);
+        }
+        activeRound = Number(data.round);
+        lastFinishedAttempt = undefined;
+      } else if (event.name === 'AGENT_STARTED') {
+        if (activeRound === undefined || !Number.isSafeInteger(data.attempt) || Number(data.attempt) < 1
+          || (data.agent !== 'codex' && data.agent !== 'claude')) {
+          throw new OrchestratorError('STATE_CORRUPT', `Review attempt start is not round-bound at line ${index + 1}`);
+        }
+        const attempt = Number(data.attempt);
+        if (bindings.has(attempt)) {
+          throw new OrchestratorError('STATE_CORRUPT', `Review attempt ${attempt} has duplicate start evidence`);
+        }
+        bindings.set(attempt, { round: activeRound, agent: data.agent });
+      } else if (event.name === 'AGENT_FINISHED') {
+        if (!Number.isSafeInteger(data.attempt) || Number(data.attempt) < 1) {
+          throw new OrchestratorError('STATE_CORRUPT', `Review attempt finish is invalid at line ${index + 1}`);
+        }
+        const attempt = Number(data.attempt);
+        const binding = bindings.get(attempt);
+        if (binding === undefined || binding.finishedStatus !== undefined) {
+          throw new OrchestratorError('STATE_CORRUPT', `Review attempt ${attempt} has unbound finish evidence`);
+        }
+        bindings.set(attempt, {
+          ...binding,
+          ...(typeof data.status === 'string' ? { finishedStatus: data.status } : {}),
+          ...(typeof data.exitCode === 'number' || data.exitCode === null ? { exitCode: data.exitCode } : {}),
+        });
+        lastFinishedAttempt = attempt;
+      } else if (event.name === 'HANDOFF_REPAIR_ATTEMPTED' && lastFinishedAttempt !== undefined
+        && data.succeeded === false) {
+        bindings.set(lastFinishedAttempt, { ...bindings.get(lastFinishedAttempt)!, repairRejected: true });
+      } else if (event.name === 'TASK_FAILED' && lastFinishedAttempt !== undefined
+        && data.code === 'REVIEW_BLOCKED') {
+        bindings.set(lastFinishedAttempt, { ...bindings.get(lastFinishedAttempt)!, reviewBlocked: true });
+      }
+    }
+    return bindings;
+  }
+
+  /** Revalidate every v2 retry authorization before any resumed work can execute. */
+  private async assertReviewOutputRecoveryBindings(): Promise<void> {
+    for (const [taskId, task] of Object.entries(this.state.tasks)) {
+      const recoveries = (task.reviewOutputRecoveries ?? []).filter((entry) => entry.version === 2);
+      if (recoveries.length === 0) continue;
+      const spec = this.config.tasks.find((entry) => entry.id === taskId);
+      if (spec === undefined || !REVIEW_MODES.has(spec.mode) || spec.writer) {
+        throw new OrchestratorError('STATE_CORRUPT', `Structured-review retry task ${taskId} is no longer a read-only review`);
+      }
+      const bindings = await this.reviewAttemptEventBindings(taskId);
+      for (const recovery of recoveries) {
+        if (task.reviewRounds < recovery.taskReviewRound && task.preparedHeadSha !== recovery.preparedHeadSha) {
+          throw new OrchestratorError('STATE_CORRUPT', `Structured-review retry ${taskId} prepared HEAD binding changed`);
+        }
+        if (recovery.error.code !== 'REVIEW_BLOCKED' || recovery.attempt.outcome !== 'succeeded'
+          || recovery.attempt.finishedAt === undefined || recovery.attempt.agent !== spec.owner) {
+          throw new OrchestratorError('STATE_CORRUPT', `Structured-review retry ${taskId} source failure binding is invalid`);
+        }
+        const eventBinding = bindings.get(recovery.attempt.attempt);
+        if (eventBinding?.round !== recovery.reviewRound || eventBinding.agent !== recovery.attempt.agent
+          || eventBinding.finishedStatus !== 'succeeded' || eventBinding.exitCode !== 0
+          || eventBinding.repairRejected !== true || eventBinding.reviewBlocked !== true) {
+          throw new OrchestratorError('STATE_CORRUPT', `Structured-review retry ${taskId} round event binding changed`);
+        }
+        const expectedStdoutPath = this.taskAttemptStdoutLogPath(taskId, recovery.attempt);
+        if (recovery.stdoutPath !== expectedStdoutPath) {
+          throw new OrchestratorError('STATE_CORRUPT', `Structured-review retry ${taskId} stdout path binding changed`);
+        }
+        const stdoutDetails = await lstat(recovery.stdoutPath).catch((error) => {
+          throw new OrchestratorError('STATE_CORRUPT', `Structured-review retry ${taskId} stdout is unavailable`, { cause: error });
+        });
+        if (!stdoutDetails.isFile() || stdoutDetails.isSymbolicLink()
+          || createHash('sha256').update(await readFile(recovery.stdoutPath)).digest('hex') !== recovery.stdoutSha256) {
+          throw new OrchestratorError('STATE_CORRUPT', `Structured-review retry ${taskId} stdout evidence changed`);
+        }
+        for (const artifact of recovery.acceptedReviewArtifacts) {
+          const expectedPath = this.reviewArtifactPathForRound(taskId, artifact.round);
+          if (artifact.path !== expectedPath || task.reviewPaths[artifact.round - 1] !== artifact.path) {
+            throw new OrchestratorError('STATE_CORRUPT', `Structured-review retry ${taskId} accepted history binding changed`);
+          }
+          const details = await lstat(artifact.path).catch((error) => {
+            throw new OrchestratorError('STATE_CORRUPT', `Structured-review retry ${taskId} accepted artifact is unavailable`, { cause: error });
+          });
+          const bytes = details.isFile() && !details.isSymbolicLink() ? await readFile(artifact.path) : undefined;
+          if (bytes === undefined || createHash('sha256').update(bytes).digest('hex') !== artifact.sha256) {
+            throw new OrchestratorError('STATE_CORRUPT', `Structured-review retry ${taskId} accepted artifact changed`);
+          }
+          try { parseReview(bytes.toString('utf8')); } catch (error) {
+            throw new OrchestratorError('STATE_CORRUPT', `Structured-review retry ${taskId} accepted artifact is invalid`, { cause: error });
+          }
+        }
+      }
+    }
+  }
+
+  /** Fail-closed eligibility for one bounded structured-review retry per review round. */
   private async checkReviewOutputRetryEligibility(taskId: string): Promise<
-    | { readonly eligible: true; readonly stdoutPath: string; readonly stdoutSha256: string }
+    | { readonly eligible: true; readonly stdoutPath: string; readonly stdoutSha256: string;
+      readonly reviewRound: number; readonly taskReviewRound: number;
+      readonly acceptedReviewArtifacts: readonly AcceptedReviewArtifactState[] }
     | { readonly eligible: false; readonly reason: string }
   > {
     const refuse = (reason: string) => ({ eligible: false as const, reason });
@@ -4844,6 +4983,14 @@ export class AgentOrchestrator {
     if (Object.values(this.state.tasks).some((task) =>
       task.status === 'PENDING' || task.status === 'READY' || task.status === 'RUNNING')) {
       return refuse('run still contains non-terminal tasks');
+    }
+    for (const candidate of Object.values(this.state.tasks)) {
+      for (const candidateAttempt of candidate.agentAttempts) {
+        if (candidateAttempt.finishedAt === undefined) return refuse('run contains an unfinished agent attempt');
+        if (candidateAttempt.pid !== undefined && isProcessAlive(candidateAttempt.pid)) {
+          return refuse('a recorded provider process is still alive');
+        }
+      }
     }
     const integration = this.state.integration;
     if (integration.status !== 'PENDING' || integration.integratedTaskCommits.length > 0
@@ -4868,20 +5015,86 @@ export class AgentOrchestrator {
     if (task.status !== 'FAILED' || task.error?.code !== 'REVIEW_BLOCKED') {
       return refuse('task must be FAILED with error code REVIEW_BLOCKED');
     }
-    if ((task.reviewOutputRecoveries?.length ?? 0) >= 1) {
-      return refuse('structured-review retry budget is exhausted');
-    }
     const attempt = task.agentAttempts.at(-1);
     if (attempt?.outcome !== 'succeeded' || attempt.finishedAt === undefined) {
       return refuse('last agent attempt must have a completed succeeded process outcome');
     }
     if (attempt.agent !== spec.owner) return refuse('last attempt agent does not match the task owner');
     if (task.commit !== undefined) return refuse('a task commit is already recorded');
-    if (task.handoffPath !== undefined || task.reviewPaths.length > 0 || task.reviewRounds !== 0) {
-      return refuse('an accepted handoff or review already exists');
-    }
     if (task.handoffOutcome !== 'invalid') return refuse('task does not record rejected structured output');
     if (task.salvage !== undefined || task.replan !== undefined) return refuse('task has unrelated recovery state');
+
+    // A completed local review round has exactly one canonical, strictly
+    // parsed artifact. Anything else is ambiguous persisted history and must
+    // not be rebound to a new retry authorization.
+    if (task.reviewPaths.length !== task.reviewRounds) {
+      return refuse('accepted review paths do not exactly match completed review rounds');
+    }
+    const taskReviewRound = task.reviewRounds + 1;
+    let completedRounds: number;
+    try {
+      completedRounds = completedReviewRounds(
+        spec,
+        new TaskGraph(this.config.tasks),
+        (id) => this.state.tasks[id]?.status === 'SUCCEEDED',
+      ) + task.reviewRounds;
+      assertReviewRoundAllowed(completedRounds, this.config.maxReviewRounds);
+    } catch (error) {
+      return refuse(`current review lineage is not eligible: ${errorText(error)}`);
+    }
+    const reviewRound = completedRounds + 1;
+    const acceptedReviewArtifacts: AcceptedReviewArtifactState[] = [];
+    for (const [index, path] of task.reviewPaths.entries()) {
+      const round = index + 1;
+      const expectedPath = this.reviewArtifactPathForRound(taskId, round);
+      if (path !== expectedPath) return refuse(`accepted review round ${round} does not use its canonical artifact path`);
+      try {
+        const details = await lstat(path);
+        if (!details.isFile() || details.isSymbolicLink()) return refuse(`accepted review round ${round} is not a regular artifact`);
+        const bytes = await readFile(path);
+        parseReview(bytes.toString('utf8'));
+        acceptedReviewArtifacts.push({ round, path, sha256: createHash('sha256').update(bytes).digest('hex') });
+      } catch (error) {
+        return refuse(`accepted review round ${round} is invalid: ${errorText(error)}`);
+      }
+    }
+    if (task.handoffPath !== undefined && !task.reviewPaths.includes(task.handoffPath)) {
+      return refuse('task handoff path is not attributable to accepted review history');
+    }
+    try {
+      await lstat(this.reviewArtifactPathForRound(taskId, taskReviewRound));
+      return refuse(`task review round ${taskReviewRound} already has an artifact`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        return refuse(`current review artifact path is invalid: ${errorText(error)}`);
+      }
+    }
+    if (this.state.reviewCorrections?.some((entry) =>
+      entry.authorization.reviewTaskId === taskId && entry.authorization.sourceRound >= taskReviewRound)) {
+      return refuse(`task review round ${taskReviewRound} has already been consumed by a correction continuation`);
+    }
+
+    let attemptBindings: Map<number, ReviewAttemptEventBinding>;
+    try { attemptBindings = await this.reviewAttemptEventBindings(taskId); } catch (error) {
+      return refuse(`review attempt round evidence is invalid: ${errorText(error)}`);
+    }
+    const currentBinding = attemptBindings.get(attempt.attempt);
+    if (currentBinding?.round !== reviewRound || currentBinding.agent !== attempt.agent
+      || currentBinding.finishedStatus !== 'succeeded' || currentBinding.exitCode !== 0
+      || currentBinding.repairRejected !== true || currentBinding.reviewBlocked !== true) {
+      return refuse(`last provider attempt is not durably bound to unaccepted review round ${reviewRound}`);
+    }
+    for (const recovery of task.reviewOutputRecoveries ?? []) {
+      const legacyBinding = recovery.version === 2 ? undefined : attemptBindings.get(recovery.attempt.attempt);
+      const recoveredRound = recovery.version === 2 ? recovery.reviewRound : legacyBinding?.round;
+      if (recoveredRound === undefined) {
+        return refuse(`historical structured-review retry ${recovery.recovery} has no provable round`);
+      }
+      if (recovery.version !== 2 && (legacyBinding?.repairRejected !== true || legacyBinding.reviewBlocked !== true)) {
+        return refuse(`historical structured-review retry ${recovery.recovery} lacks rejected-output evidence`);
+      }
+      if (recoveredRound === reviewRound) return refuse(`structured-review retry budget for round ${reviewRound} is exhausted`);
+    }
     const unsatisfied = spec.dependsOn.filter((id) => {
       const status = this.state.tasks[id]?.status;
       return status !== 'SUCCEEDED' && status !== 'SKIPPED';
@@ -4901,16 +5114,6 @@ export class AgentOrchestrator {
     }
     if (spec.condition !== undefined && (await this.evaluateCondition(spec.condition)).skip) {
       return refuse('the current task condition says to skip');
-    }
-    try {
-      const completedRounds = completedReviewRounds(
-        spec,
-        new TaskGraph(this.config.tasks),
-        (id) => this.state.tasks[id]?.status === 'SUCCEEDED',
-      );
-      assertReviewRoundAllowed(completedRounds, this.config.maxReviewRounds);
-    } catch (error) {
-      return refuse(`current review lineage is not eligible: ${errorText(error)}`);
     }
     if (task.worktreePath === undefined || task.branch === undefined || task.preparedHeadSha === undefined) {
       return refuse('preserved task worktree/checkpoint is incomplete');
@@ -4959,6 +5162,9 @@ export class AgentOrchestrator {
         eligible: true,
         stdoutPath,
         stdoutSha256: createHash('sha256').update(stdout).digest('hex'),
+        reviewRound,
+        taskReviewRound,
+        acceptedReviewArtifacts,
       };
     } catch (error) {
       return refuse(`original agent stdout is unavailable: ${errorText(error)}`);

@@ -21,7 +21,6 @@ class ReviewRetryAgent implements Agent {
 
   async run(request: AgentRequest): Promise<AgentResult> {
     this.requests.push(request);
-    await request.onStarted?.(process.pid);
     const attempt = request.attempt ?? 1;
     const prefix = `${request.runId}.${request.taskId}.${this.name}.attempt-${attempt}`;
     const stdoutPath = join(request.artifactsDirectory, `${prefix}.stdout.log`);
@@ -213,7 +212,7 @@ test('retry-review-output CLI authorizes without invoking a provider and reports
   }
 });
 
-for (const scenario of ['wrong-error', 'failed-process', 'timed-out-process', 'accepted-review', 'accepted-handoff', 'non-quiescent', 'started-integration'] as const) {
+for (const scenario of ['wrong-error', 'failed-process', 'timed-out-process', 'live-process', 'accepted-review', 'accepted-handoff', 'non-quiescent', 'started-integration'] as const) {
   test(`structured-review retry refuses ${scenario}`, async () => {
     const value = await fixture();
     try {
@@ -224,6 +223,8 @@ for (const scenario of ['wrong-error', 'failed-process', 'timed-out-process', 'a
           ? { error: { code: 'HANDOFF_INVALID', message: 'wrong class', at: state.updatedAt } }
           : scenario === 'failed-process' || scenario === 'timed-out-process'
             ? { agentAttempts: [{ ...attempt, outcome: scenario === 'failed-process' ? 'failed' : 'timed_out' }] }
+            : scenario === 'live-process'
+              ? { agentAttempts: [{ ...attempt, pid: process.pid }] }
             : scenario === 'accepted-review'
               ? { reviewPaths: [join(value.orchestrator.stateStore.runDirectory, 'reviews', 'accepted.json')], reviewRounds: 1 }
               : scenario === 'accepted-handoff'
@@ -329,6 +330,24 @@ test('structured-review retry re-evaluates the current task condition', async ()
       }],
     }), 'utf8');
     await refuses(value);
+  } finally {
+    await value.repository.dispose();
+  }
+});
+
+test('structured-review retry binds lineage round separately from the task-local artifact round', async () => {
+  const value = await fixture({ condition: true });
+  try {
+    const authorized = await AgentOrchestrator.retryReviewOutput(value.runId, target, options(value));
+    assert.equal(authorized.recovery.version, 2);
+    if (authorized.recovery.version !== 2) assert.fail('expected v2 recovery');
+    assert.equal(authorized.recovery.reviewRound, 2);
+    assert.equal(authorized.recovery.taskReviewRound, 1);
+    assert.deepEqual(authorized.recovery.acceptedReviewArtifacts, []);
+    const resumed = await AgentOrchestrator.resume(value.runId, options(value));
+    const completed = await resumed.execute();
+    assert.equal(completed.tasks[target]?.reviewRounds, 1);
+    assert.match(completed.tasks[target]!.reviewPaths[0]!, /event-chat-review\.json$/);
   } finally {
     await value.repository.dispose();
   }
