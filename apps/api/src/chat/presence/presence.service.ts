@@ -30,12 +30,10 @@ export class PresenceService {
   private async authorize(userId: string, { roomId, targetUserId }: PresenceTarget): Promise<void> {
     if (userId === targetUserId) throw new AppError('PRESENCE_FORBIDDEN', 'Presence unavailable.');
     try {
-      const rooms = await Promise.all([
+      await Promise.all([
         this.chat.authorizeRoom(userId, roomId),
         this.chat.authorizeRoom(targetUserId, roomId),
       ]);
-      // Match Chat transport's fail-closed EVENT policy until N1 owns lifecycle.
-      if (rooms.some((room) => room.type === 'EVENT')) throw new Error('Unsupported room');
       // N1 checks pair blocks for MATCH; presence also needs this for group rooms.
       const blocked: unknown[] = await this.database.query(
         `SELECT 1 FROM user_blocks

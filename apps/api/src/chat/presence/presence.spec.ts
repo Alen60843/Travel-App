@@ -42,12 +42,19 @@ describe('presence visibility boundary', () => {
     expect(database.query).toHaveBeenCalledWith(expect.stringContaining('user_blocks'), [userId, target.targetUserId]);
   });
 
-  it.each(['caller', 'target', 'block', 'event', 'self'])('denies %s without probing Redis', async (policy) => {
+  it('allows EVENT presence when both participants pass current chat authorization', async () => {
+    const { service, chat, database } = fixture();
+    chat.authorizeRoom.mockResolvedValue({ type: 'EVENT' });
+    await expect(service.query(userId, target)).resolves.toEqual({ ...target, ...online });
+    expect(chat.authorizeRoom).toHaveBeenCalledTimes(4);
+    expect(database.query).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['caller', 'target', 'block', 'self'])('denies %s without probing Redis', async (policy) => {
     const { service, chat, database, store } = fixture();
     if (policy === 'caller') chat.authorizeRoom.mockRejectedValueOnce(new Error('denied'));
     if (policy === 'target') chat.authorizeRoom.mockResolvedValueOnce({ type: 'MATCH' }).mockRejectedValueOnce(new Error('denied'));
     if (policy === 'block') database.query.mockResolvedValue([{}]);
-    if (policy === 'event') chat.authorizeRoom.mockResolvedValue({ type: 'EVENT' });
     await expect(service.query(policy === 'self' ? target.targetUserId : userId, target))
       .rejects.toMatchObject({ code: 'PRESENCE_FORBIDDEN' });
     expect(store.read).not.toHaveBeenCalled();
