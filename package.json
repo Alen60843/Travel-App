@@ -17,6 +17,7 @@
     "agents:resume": "pnpm --filter @tripwith/agent-orchestrator resume",
     "agents:status": "pnpm --filter @tripwith/agent-orchestrator status",
     "agents:metrics": "pnpm --filter @tripwith/agent-orchestrator metrics",
+    "agents:diagnose": "pnpm --filter @tripwith/agent-orchestrator diagnose",
     "agents:cleanup": "pnpm --filter @tripwith/agent-orchestrator cleanup",
     "agents:recover-handoffs": "pnpm --filter @tripwith/agent-orchestrator recover-handoffs",
     "agents:retry-agent": "pnpm --filter @tripwith/agent-orchestrator retry-agent",

@@ -15,6 +15,7 @@
     "resume": "pnpm --silent run build && node dist/cli.js resume",
     "status": "pnpm --silent run build && node dist/cli.js status",
     "metrics": "pnpm --silent run build && node dist/cli.js metrics",
+    "diagnose": "pnpm --silent run build && node dist/cli.js diagnose",
     "cleanup": "pnpm --silent run build && node dist/cli.js cleanup",
     "recover-handoffs": "pnpm --silent run build && node dist/cli.js recover-handoffs",
     "retry-agent": "pnpm --silent run build && node dist/cli.js retry-agent",

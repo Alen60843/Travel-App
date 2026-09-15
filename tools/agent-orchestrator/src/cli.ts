@@ -13,6 +13,7 @@ import { loadAdaptivePhaseConfig, runtimePhaseConfig } from './adaptive';
 import { applyRecoveryPolicyOverlay } from './recovery/policy';
 import { applyReplanOverlays } from './replan/model';
 import { applyReviewCorrectionOverlays } from './review/correction-continuation';
+import { diagnoseFailure } from './failure-intelligence/classifier';
 
 const USAGE = `TripWith local agent orchestrator
 
@@ -23,6 +24,7 @@ Usage:
   pnpm agents:status <run-id>
   pnpm agents:cleanup <run-id>
   pnpm agents:metrics <run-id>
+  pnpm agents:diagnose <run-id> [task-id]
   pnpm agents:recover-handoffs <run-id>
   pnpm agents:retry-agent <run-id> <task-id>
   pnpm agents:repin-agent-executable <run-id> <agent> <absolute-executable-path>
@@ -46,6 +48,8 @@ Planning is read-only. Running or resuming may invoke locally authenticated paid
 No command merges into the phase branch or pushes to a remote.
 metrics is read-only: it recomputes a summary from persisted run artifacts and never
 touches agents, worktrees, or state.
+diagnose is read-only: it deterministically classifies only the current active blocker
+from persisted evidence and recommends, but never executes or authorizes, a bounded action.
 normalize-replan-evidence explicitly records one deterministic test-to-file interpretation
 for the exact persisted handoff entry and dirty source tree. It invokes no provider or task,
 creates no commit, and never rewrites the handoff. Inspect it, then propose-replan separately.
@@ -374,6 +378,30 @@ async function main(argv: readonly string[]): Promise<number> {
       policyHash: result.policyHash,
       manualNextStep: 'Run `pnpm agents:recover-handoffs <run-id>` or `pnpm agents:salvage-task <run-id> <task-id>` to use this authorized policy.',
     }, null, 2)}\n`);
+    return 0;
+  }
+  if (command === 'diagnose') {
+    const [taskId] = extra;
+    if (argument === undefined || extra.length > 1) {
+      process.stderr.write('Usage: diagnose <run-id> [task-id]\n');
+      return 1;
+    }
+    const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
+    const { store } = await locateRun(repositoryPath, argument);
+    const state = await store.load();
+    const baseConfig = state.strategy === 'adaptive'
+      ? runtimePhaseConfig(await loadAdaptivePhaseConfig(join(store.runDirectory, 'phase.yaml')), state.adaptive!)
+      : await loadAnyPhaseConfig(join(store.runDirectory, 'phase.yaml'));
+    const recoveredConfig = applyRecoveryPolicyOverlay(baseConfig, state.recoveryPolicyHistory?.at(-1)?.policy);
+    const config = state.strategy === 'adaptive' ? recoveredConfig
+      : applyReviewCorrectionOverlays(applyReplanOverlays(recoveredConfig, state), state);
+    const diagnosis = await diagnoseFailure({
+      store,
+      state,
+      config,
+      ...(taskId === undefined ? {} : { taskId }),
+    });
+    process.stdout.write(`${JSON.stringify({ diagnosis }, null, 2)}\n`);
     return 0;
   }
   if (argument === undefined || extra.length > 0) {
