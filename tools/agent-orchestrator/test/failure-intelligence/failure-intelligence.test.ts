@@ -149,9 +149,8 @@ test('detects AGENT_EXECUTABLE_DRIFT from exact persisted spawn ENOENT without f
     await chmod(availableReplacement, 0o755);
     const diagnosis = await diagnoseFailure(value);
     assert.equal(diagnosis.classification, 'AGENT_EXECUTABLE_DRIFT');
-    assert.equal(diagnosis.recommendedAction?.id, 'repin-agent-executable');
-    assert.match(diagnosis.recommendedAction?.command ?? '', /<absolute-executable-path>/);
-    assert.doesNotMatch(diagnosis.recommendedAction?.command ?? '', new RegExp(availableReplacement));
+    assert.equal(diagnosis.agent, 'codex');
+    assert.doesNotMatch(JSON.stringify(diagnosis), new RegExp(availableReplacement));
   } finally { await value.dispose(); }
 });
 
@@ -167,8 +166,6 @@ test('MALFORMED_REVIEW_OUTPUT requires a succeeded provider and an unaccepted st
     await appendReviewAttempt(value.store, 1, provider);
     const diagnosis = await diagnoseFailure(value);
     assert.equal(diagnosis.classification, 'MALFORMED_REVIEW_OUTPUT');
-    assert.equal(diagnosis.recommendedAction?.id, 'retry-review-output');
-    assert.equal(diagnosis.recommendedAction?.requiresHumanAuthorization, true);
   } finally { await value.dispose(); }
 });
 
@@ -233,7 +230,7 @@ test('consumed same-round Claude retry with two prompt-only successes is PROVIDE
     await appendReviewAttempt(value.store, 2, second);
     const diagnosis = await diagnoseFailure(value);
     assert.equal(diagnosis.classification, 'PROVIDER_OUTPUT_CONTRACT_FAILURE');
-    assert.equal(diagnosis.recommendedAction?.id, 'continue-claude-review-output');
+    assert.equal(diagnosis.variant, 'CLAUDE_TEXT_CONTRACT_MIGRATION');
     assert.match(diagnosis.evidence.at(-1)?.summary ?? '', /no prose was interpreted as approval/i);
 
     const structuredContract = 'e'.repeat(64);
@@ -247,9 +244,7 @@ test('consumed same-round Claude retry with two prompt-only successes is PROVIDE
         reviewOutputRecoveries: [{ ...recovery, attempt: firstWithContract }] },
     } } });
     assert.equal(outsideMigration.classification, 'PROVIDER_OUTPUT_CONTRACT_FAILURE');
-    assert.equal(outsideMigration.recommendedAction?.id, 'manual-inspection');
-    assert.equal(outsideMigration.recommendedAction?.command, undefined);
-    assert.equal(outsideMigration.recommendedAction?.requiresHumanAuthorization, false);
+    assert.equal(outsideMigration.variant, undefined);
   } finally { await value.dispose(); }
 });
 
@@ -319,7 +314,7 @@ test('OWNERSHIP_EXPANSION_REQUIRED requires a validated out-of-scope write claim
   try {
     const diagnosis = await diagnoseFailure(value);
     assert.equal(diagnosis.classification, 'OWNERSHIP_EXPANSION_REQUIRED');
-    assert.equal(diagnosis.recommendedAction?.id, 'propose-replan');
+    assert.equal(diagnosis.variant, undefined);
   } finally { await value.dispose(); }
 });
 
@@ -339,6 +334,7 @@ const ownershipContainmentCases = [
   { name: 'narrower child glob is contained', owned: ['src/**'], claims: ['src/api/**'], expected: 'unknown' },
   { name: 'deeper descendant glob is contained', owned: ['src/api/**'], claims: ['src/api/foo/**'], expected: 'unknown' },
   { name: 'ambiguous segment wildcard is not guessed safe or outside', owned: ['src/api/**'], claims: ['src/api*'], expected: 'unknown' },
+  { name: 'broader request against multiple overlapping owners remains ambiguous', owned: ['src/api/**', 'src/shared/**'], claims: ['src/**'], expected: 'unknown' },
   { name: 'one outside claim requires expansion alongside a contained claim', owned: ['src/api/**'], claims: ['src/api/**', 'src/other/**'], expected: 'OWNERSHIP_EXPANSION_REQUIRED' },
 ] as const;
 
@@ -392,8 +388,7 @@ test('persisted unresolved replan state proves ownership expansion without resta
         replan: { proposalId: 'c'.repeat(64), phase: 'CHECKPOINT_READY', verificationAttempts: [] } },
     } } });
     assert.equal(diagnosis.classification, 'OWNERSHIP_EXPANSION_REQUIRED');
-    assert.equal(diagnosis.recommendedAction?.id, 'manual-inspection');
-    assert.equal(diagnosis.recommendedAction?.requiresHumanAuthorization, false);
+    assert.equal(diagnosis.variant, 'EXISTING_REPLAN_CHECKPOINT');
   } finally { await value.dispose(); }
 });
 
@@ -432,6 +427,7 @@ async function retriedIntegrationFixture(options: {
   readonly emittedBoundaries?: number;
   readonly currentLogLocation?: 'live' | 'archived';
   readonly omitCurrentLog?: boolean;
+  readonly boundaryKind?: 'retry' | 'fix';
 }): Promise<Fixture> {
   const spec = taskSpec();
   const archivedIntegration = () => ({
@@ -484,7 +480,9 @@ async function retriedIntegrationFixture(options: {
       { name: 'RUN_BLOCKED', data: { code: 'INTEGRATION_TEST_FAILED' } },
     );
     if (attemptNumber <= boundaryCount) {
-      events.push({ name: 'RUN_RESUMED', data: { recoveryMode: 'integration_retry' } });
+      events.push(options.boundaryKind === 'fix'
+        ? { name: 'INTEGRATION_FIX_APPLIED', data: { commitSha: 'f'.repeat(40) } }
+        : { name: 'RUN_RESUMED', data: { recoveryMode: 'integration_retry' } });
     }
   }
   await appendEvents(value.store, events);
@@ -496,7 +494,6 @@ test('INTEGRATION_ENVIRONMENT_MISMATCH requires a later connection failure after
   try {
     const diagnosis = await diagnoseFailure(value);
     assert.equal(diagnosis.classification, 'INTEGRATION_ENVIRONMENT_MISMATCH');
-    assert.equal(diagnosis.recommendedAction?.id, 'retry-integration');
   } finally { await value.dispose(); }
 });
 
@@ -526,6 +523,16 @@ test('a proven connection failure in the current retry attempt still classifies'
     const diagnosis = await diagnoseFailure(value);
     assert.equal(diagnosis.classification, 'INTEGRATION_ENVIRONMENT_MISMATCH');
     assert.match(diagnosis.evidence.find((entry) => entry.kind === 'event')?.summary ?? '', /current attempt 2/i);
+  } finally { await value.dispose(); }
+});
+
+test('INTEGRATION_FIX_APPLIED bounds a new attempt without inheriting archived connection evidence', async () => {
+  const value = await retriedIntegrationFixture({ archivedAttempts: 1, boundaryKind: 'fix',
+    currentFailure: 'AssertionError: post-fix product test failed\n' });
+  try {
+    const diagnosis = await diagnoseFailure(value);
+    assert.equal(diagnosis.status, 'unknown');
+    assert.notEqual(diagnosis.classification, 'INTEGRATION_ENVIRONMENT_MISMATCH');
   } finally { await value.dispose(); }
 });
 
@@ -586,7 +593,7 @@ test('completed Phase-7-shaped state returns no_active_failure instead of histor
     const diagnosis = await diagnoseFailure(value);
     assert.equal(diagnosis.status, 'no_active_failure');
     assert.equal(diagnosis.classification, undefined);
-    assert.equal(diagnosis.recommendedAction, undefined);
+    assert.equal(diagnosis.variant, undefined);
   } finally { await value.dispose(); }
 });
 
@@ -698,6 +705,8 @@ test('diagnose CLI is byte-stable, deterministic, provider-free, and creates no 
     assert.equal(explicit.status, 0, explicit.stderr);
     assert.equal(first.stdout, second.stdout);
     assert.equal(JSON.parse(first.stdout).diagnosis.status, 'no_active_failure');
+    assert.deepEqual(JSON.parse(first.stdout).diagnosis.actionCandidates, []);
+    assert.equal(JSON.parse(first.stdout).diagnosis.recommendedAction, undefined);
     assert.deepEqual(JSON.parse(explicit.stdout).diagnosis.subject, { kind: 'task', taskId });
     const after = await Promise.all([readFile(store.statePath), readFile(store.eventsPath), readFile(phasePath)]);
     assert.deepEqual(after, before);

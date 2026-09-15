@@ -2,8 +2,8 @@
 
 Failure Intelligence v1 is a deterministic, read-only interpretation layer over one
 persisted orchestrator run. It answers what is currently blocked, which durable evidence
-supports that classification, which existing bounded command is the safest next candidate,
-and whether a human must authorize that action.
+supports that classification, and which factual variant—if any—was proven. The separate
+Action Mapping layer converts this diagnosis into bounded action candidates.
 
 Run it with:
 
@@ -30,7 +30,7 @@ one current blocker made subject selection ambiguous. `no_active_failure` means 
 task or run has no current terminal failure; completed runs therefore do not resurrect their
 historical failures.
 
-A recommendation is not an eligibility decision. Existing commands such as
+A mapped candidate is not an eligibility decision. Existing commands such as
 `repin-agent-executable`, `retry-review-output`, `continue-claude-review-output`,
 `propose-replan`, and `retry-integration` remain the sole authority for mutation. Each must
 independently revalidate its full safety and authorization contract when a human explicitly

@@ -20,7 +20,7 @@ import type {
 import { RUN_EVENT_NAMES } from '../state';
 import { matchesOwnershipPattern, ownershipGlobsOverlap } from '../tasks';
 import type { TaskSpec } from '../tasks/task-schema';
-import type { DiagnosisEvidence, FailureDiagnosis, RecommendedAction } from './types';
+import type { DiagnosisEvidence, FailureDiagnosis } from './types';
 
 const MAX_EVIDENCE_BYTES = 2 * 1024 * 1024;
 const REVIEW_MODES = new Set(['review', 'final_review']);
@@ -65,14 +65,6 @@ export interface DiagnoseFailureInput {
 
 function stateEvidence(reference: string, summary: string): DiagnosisEvidence {
   return { kind: 'state', reference, summary };
-}
-
-function action(
-  id: string,
-  command: string,
-  reason: string,
-): RecommendedAction {
-  return { id, command, requiresHumanAuthorization: true, execution: 'manual', reason };
 }
 
 function unknown(
@@ -210,16 +202,12 @@ async function diagnoseExecutableDrift(
     runId: input.state.runId,
     subject: { kind: 'task', taskId: task.id },
     classification: 'AGENT_EXECUTABLE_DRIFT',
+    agent: attempt.agent,
     evidence: [
       stateEvidence(`task:${task.id}.error`, `Task failed at the agent process boundary with AGENT_FAILED for its persisted ${attempt.agent} executable.`),
       { kind: 'attempt', reference: `attempt:${attempt.attempt}`, summary: 'The latest persisted provider attempt finished with outcome failed and produced no accepted structured result.' },
       { kind: 'filesystem', reference: `agentExecutables.${attempt.agent}`, summary: 'The exact persisted executable path from the spawn ENOENT failure is now missing.' },
     ],
-    recommendedAction: action(
-      'repin-agent-executable',
-      `pnpm agents:repin-agent-executable ${input.state.runId} ${attempt.agent} <absolute-executable-path>`,
-      'Explicitly select a replacement executable; the repin command must independently validate the complete migration evidence.',
-    ),
   };
 }
 
@@ -281,11 +269,6 @@ async function diagnoseReviewFailure(
       { kind: 'event', reference: `events.jsonl:${current.startedLine},${current.finishedLine ?? current.failedLine},${current.failedLine}`, summary: `Persisted lifecycle events bind the rejected output to review round ${current.round}.` },
       { kind: 'artifact', reference: `task:${task.id}.reviewPaths`, summary: `No accepted artifact exists for attempted task review round ${task.reviewRounds + 1}.` },
     ],
-    recommendedAction: action(
-      'retry-review-output',
-      `pnpm agents:retry-review-output ${input.state.runId} ${task.id}`,
-      'Request the existing one-time same-round structured review retry; that command must independently revalidate every safety invariant.',
-    ),
   };
 }
 
@@ -313,17 +296,11 @@ async function diagnoseClaudeContractFailure(
     { kind: 'attempt', reference: `attempt:${priorAttempt.attempt},${currentAttempt.attempt}`, summary: 'Two consecutive Claude provider attempts succeeded while strict structured review validation rejected both outputs.' },
     { kind: 'event', reference: `events.jsonl:${prior.startedLine},${current.startedLine}`, summary: `Both rejected attempts are durably bound to the same review round ${current.round}.` },
   ];
-  const manualInspection: RecommendedAction = {
-    id: 'manual-inspection',
-    requiresHumanAuthorization: false,
-    execution: 'manual',
-    reason: 'The ordinary retry is consumed, but persisted evidence does not match the one supported Claude text-contract migration; inspect without authorizing another generic retry.',
-  };
   const expectedPriorPath = join(input.store.runDirectory, 'logs',
     `${input.state.runId}.${task.id}.claude.attempt-${priorAttempt.attempt}.stdout.log`);
   const currentPath = join(input.store.runDirectory, 'logs',
     `${input.state.runId}.${task.id}.claude.attempt-${currentAttempt.attempt}.stdout.log`);
-  let specializedAction: RecommendedAction = manualInspection;
+  let specializedMigration = false;
   let logEvidence: DiagnosisEvidence | undefined;
   if (recovery.reviewRound === 2 && recovery.taskReviewRound === 2 && task.reviewRounds === 1
     && priorAttempt.structuredOutputContractId === undefined
@@ -336,11 +313,7 @@ async function diagnoseClaudeContractFailure(
       ]);
       if (createHash('sha256').update(priorOutput.bytes).digest('hex') === recovery.stdoutSha256
         && isPromptOnlyFailure(priorOutput.text) && isPromptOnlyFailure(currentOutput.text)) {
-        specializedAction = action(
-          'continue-claude-review-output',
-          `pnpm agents:continue-claude-review-output ${input.state.runId} ${task.id}`,
-          'The persisted failure matches the narrow Claude prompt-only contract migration; the continuation command must still independently revalidate its full authorization contract.',
-        );
+        specializedMigration = true;
         logEvidence = { kind: 'log', reference: `${priorOutput.reference},${currentOutput.reference}`, summary: 'Both bounded stdout artifacts are prompt-only text rather than a structured Claude result envelope; no prose was interpreted as approval.' };
       }
     } catch {
@@ -355,8 +328,8 @@ async function diagnoseClaudeContractFailure(
     runId: input.state.runId,
     subject: { kind: 'task', taskId: task.id },
     classification: 'PROVIDER_OUTPUT_CONTRACT_FAILURE',
+    ...(specializedMigration ? { variant: 'CLAUDE_TEXT_CONTRACT_MIGRATION' as const } : {}),
     evidence: logEvidence === undefined ? baseEvidence : [...baseEvidence, logEvidence],
-    recommendedAction: specializedAction,
   };
 }
 
@@ -378,15 +351,10 @@ async function diagnoseOwnershipExpansion(
       runId: input.state.runId,
       subject: { kind: 'task', taskId: task.id },
       classification: 'OWNERSHIP_EXPANSION_REQUIRED',
+      variant: 'EXISTING_REPLAN_CHECKPOINT',
       evidence: [
         stateEvidence(`task:${task.id}.replan`, `Persisted replan phase ${task.replan.phase} proves an unresolved ownership/scope expansion workflow.`),
       ],
-      recommendedAction: {
-        id: 'manual-inspection',
-        requiresHumanAuthorization: false,
-        execution: 'manual',
-        reason: 'Inspect the existing replan checkpoint and use its current bounded command; diagnosis must not restart or bypass that workflow.',
-      },
     };
   }
   if (task.handoffOutcome !== 'valid' || task.handoffPath === undefined) return null;
@@ -409,22 +377,13 @@ async function diagnoseOwnershipExpansion(
       runId: input.state.runId,
       subject: { kind: 'task', taskId: task.id },
       classification: 'OWNERSHIP_EXPANSION_REQUIRED',
+      ...(repositoryClaims.length === expanded.length
+        ? {}
+        : { variant: 'NON_REPOSITORY_WRITE_BOUNDARY' as const }),
       evidence: [
         stateEvidence(`task:${task.id}.handoffOutcome`, 'The originating task has a strictly validated persisted handoff.'),
         { kind: 'artifact', reference: `handoffs/${task.id}.json#additionalWorkRequests[${requestIndex}]`, summary: `The accepted request contains ${expanded.length} write resource claim(s) outside the task's authorized write ownership.` },
       ],
-      recommendedAction: repositoryClaims.length === expanded.length
-        ? action(
-            'propose-replan',
-            `pnpm agents:propose-replan ${input.state.runId} ${task.id}`,
-            'Ask the existing bounded replan command to interpret and validate the accepted resource claims; a separate authorization remains required before execution.',
-          )
-        : {
-            id: 'manual-inspection',
-            requiresHumanAuthorization: false,
-            execution: 'manual',
-            reason: 'The accepted request includes a non-repository write boundary that the static replan command cannot safely normalize.',
-          },
     };
   }
   return null;
@@ -535,11 +494,6 @@ async function diagnoseIntegration(input: DiagnoseFailureInput): Promise<Failure
       { kind: 'event', reference: `events.jsonl:${failed.line},${blocked.line}`, summary: `${earlierRequired.length} earlier required integration command(s) passed before the later required command failed and blocked current attempt ${current.attempt}.` },
       { kind: 'log', reference: matching.reference, summary: 'The bounded failed-command log reports that its configured external connection target was unavailable.' },
     ],
-    recommendedAction: action(
-      'retry-integration',
-      `pnpm agents:retry-integration ${input.state.runId}`,
-      'Correct the external environment first, then explicitly retry only the deterministic integration gate.',
-    ),
   };
 }
 

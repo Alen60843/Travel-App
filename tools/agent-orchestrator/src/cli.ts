@@ -14,6 +14,8 @@ import { applyRecoveryPolicyOverlay } from './recovery/policy';
 import { applyReplanOverlays } from './replan/model';
 import { applyReviewCorrectionOverlays } from './review/correction-continuation';
 import { diagnoseFailure } from './failure-intelligence/classifier';
+import { mapFailureToActions } from './action-mapping/mapper';
+import type { ActionCandidate } from './action-mapping/types';
 
 const USAGE = `TripWith local agent orchestrator
 
@@ -401,7 +403,16 @@ async function main(argv: readonly string[]): Promise<number> {
       config,
       ...(taskId === undefined ? {} : { taskId }),
     });
-    process.stdout.write(`${JSON.stringify({ diagnosis }, null, 2)}\n`);
+    const actionCandidates = mapFailureToActions(diagnosis);
+    const primary = actionCandidates[0];
+    const recommendedAction = primary === undefined ? undefined : legacyRecommendation(primary);
+    process.stdout.write(`${JSON.stringify({
+      diagnosis: {
+        ...diagnosis,
+        actionCandidates,
+        ...(recommendedAction === undefined ? {} : { recommendedAction }),
+      },
+    }, null, 2)}\n`);
     return 0;
   }
   if (argument === undefined || extra.length > 0) {
@@ -508,6 +519,18 @@ async function main(argv: readonly string[]): Promise<number> {
 
   process.stderr.write(`Unknown command: ${command}\n${USAGE}\n`);
   return 1;
+}
+
+function legacyRecommendation(candidate: ActionCandidate) {
+  return {
+    id: candidate.id.toLowerCase().replaceAll('_', '-'),
+    ...(candidate.command === undefined
+      ? {}
+      : { command: `pnpm ${candidate.command.script} ${candidate.command.args.join(' ')}` }),
+    requiresHumanAuthorization: candidate.authority.required,
+    execution: candidate.execution,
+    reason: candidate.reason,
+  };
 }
 
 function installCancellationSignal(): {

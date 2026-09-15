@@ -8,6 +8,14 @@ export const FAILURE_CLASSIFICATIONS = [
 
 export type FailureClassification = (typeof FAILURE_CLASSIFICATIONS)[number];
 
+export const FAILURE_VARIANTS = [
+  'CLAUDE_TEXT_CONTRACT_MIGRATION',
+  'EXISTING_REPLAN_CHECKPOINT',
+  'NON_REPOSITORY_WRITE_BOUNDARY',
+] as const;
+
+export type FailureVariant = (typeof FAILURE_VARIANTS)[number];
+
 export type DiagnosisEvidenceKind =
   | 'state'
   | 'attempt'
@@ -22,14 +30,6 @@ export interface DiagnosisEvidence {
   readonly summary: string;
 }
 
-export interface RecommendedAction {
-  readonly id: string;
-  readonly command?: string;
-  readonly requiresHumanAuthorization: boolean;
-  readonly execution: 'manual';
-  readonly reason: string;
-}
-
 export interface FailureDiagnosis {
   readonly version: 1;
   readonly status: 'diagnosed' | 'unknown' | 'no_active_failure';
@@ -39,6 +39,7 @@ export interface FailureDiagnosis {
     readonly taskId?: string;
   };
   readonly classification?: FailureClassification;
+  readonly variant?: FailureVariant;
+  readonly agent?: 'codex' | 'claude';
   readonly evidence: readonly DiagnosisEvidence[];
-  readonly recommendedAction?: RecommendedAction;
 }
