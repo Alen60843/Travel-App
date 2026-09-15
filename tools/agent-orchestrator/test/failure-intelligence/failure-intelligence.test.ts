@@ -297,8 +297,8 @@ function workRequest(resourceClaims: readonly unknown[]): unknown {
   };
 }
 
-async function ownershipFixture(payload: unknown): Promise<Fixture> {
-  const spec = taskSpec();
+async function ownershipFixture(payload: unknown, ownedFiles: readonly string[] = ['owned/**']): Promise<Fixture> {
+  const spec = taskSpec({ files: ownedFiles });
   const value = await fixture([spec], (state) => failedTask(state, {
     status: 'BLOCKED',
     error: error('REVIEW_BLOCKED', 'Additional owned work is required'),
@@ -332,6 +332,54 @@ test('vague accepted handoff prose cannot trigger ownership expansion', async ()
   } finally { await value.dispose(); }
 });
 
+const ownershipContainmentCases = [
+  { name: 'literal file beneath owned glob is contained', owned: ['src/api/**'], claims: ['src/api/foo.ts'], expected: 'unknown' },
+  { name: 'exact ownership glob is contained', owned: ['src/api/**'], claims: ['src/api/**'], expected: 'unknown' },
+  { name: 'broader parent glob requires expansion', owned: ['src/api/**'], claims: ['src/**'], expected: 'OWNERSHIP_EXPANSION_REQUIRED' },
+  { name: 'narrower child glob is contained', owned: ['src/**'], claims: ['src/api/**'], expected: 'unknown' },
+  { name: 'deeper descendant glob is contained', owned: ['src/api/**'], claims: ['src/api/foo/**'], expected: 'unknown' },
+  { name: 'ambiguous segment wildcard is not guessed safe or outside', owned: ['src/api/**'], claims: ['src/api*'], expected: 'unknown' },
+  { name: 'one outside claim requires expansion alongside a contained claim', owned: ['src/api/**'], claims: ['src/api/**', 'src/other/**'], expected: 'OWNERSHIP_EXPANSION_REQUIRED' },
+] as const;
+
+for (const value of ownershipContainmentCases) {
+  test(`ownership containment: ${value.name}`, async () => {
+    const fixtureValue = await ownershipFixture(handoff([workRequest(value.claims.map((key) =>
+      ({ kind: 'repository_path', key, mode: 'write' }))) ]), value.owned);
+    try {
+      const diagnosis = await diagnoseFailure(fixtureValue);
+      assert.equal(diagnosis.classification ?? diagnosis.status, value.expected);
+    } finally { await fixtureValue.dispose(); }
+  });
+}
+
+test('read-only resource claims do not trigger write ownership expansion', async () => {
+  const value = await ownershipFixture(handoff([workRequest([
+    { kind: 'repository_path', key: 'outside/**', mode: 'read' },
+  ])]), ['src/api/**']);
+  try {
+    const diagnosis = await diagnoseFailure(value);
+    assert.equal(diagnosis.status, 'unknown');
+    assert.notEqual(diagnosis.classification, 'OWNERSHIP_EXPANSION_REQUIRED');
+  } finally { await value.dispose(); }
+});
+
+test('malformed or unaccepted handoff evidence cannot trigger ownership expansion', async () => {
+  const malformed = await ownershipFixture({ prose: 'Please also edit outside/**.' }, ['src/api/**']);
+  const unaccepted = await ownershipFixture(handoff([workRequest([
+    { kind: 'repository_path', key: 'outside/**', mode: 'write' },
+  ])]), ['src/api/**']);
+  unaccepted.state = { ...unaccepted.state, tasks: { ...unaccepted.state.tasks,
+    [taskId]: { ...unaccepted.state.tasks[taskId]!, handoffOutcome: 'invalid' } } };
+  try {
+    for (const value of [malformed, unaccepted]) {
+      const diagnosis = await diagnoseFailure(value);
+      assert.equal(diagnosis.status, 'unknown');
+      assert.notEqual(diagnosis.classification, 'OWNERSHIP_EXPANSION_REQUIRED');
+    }
+  } finally { await malformed.dispose(); await unaccepted.dispose(); }
+});
+
 test('persisted unresolved replan state proves ownership expansion without restarting proposal', async () => {
   const spec = taskSpec();
   const value = await fixture([spec], (state) => failedTask(state, {
@@ -363,18 +411,83 @@ async function integrationFixture(failureText: string, stderrPathOverride?: stri
   }));
   const logs = join(value.store.runDirectory, 'logs', 'integration');
   await mkdir(logs, { recursive: true });
-  const passOut = join(logs, '01-pass.stdout.log');
-  const passErr = join(logs, '01-pass.stderr.log');
-  const failOut = join(logs, '02-fail.stdout.log');
-  const failErr = stderrPathOverride ?? join(logs, '02-fail.stderr.log');
+  const passOut = join(logs, '01-first-gate.stdout.log');
+  const passErr = join(logs, '01-first-gate.stderr.log');
+  const failOut = join(logs, '02-database-gate.stdout.log');
+  const failErr = stderrPathOverride ?? join(logs, '02-database-gate.stderr.log');
   await writeFile(passOut, 'ok\n'); await writeFile(passErr, ''); await writeFile(failOut, '');
   if (stderrPathOverride === undefined) await writeFile(failErr, oversized ? 'x'.repeat(2 * 1024 * 1024 + 1) : failureText);
   await appendEvents(value.store, [
     { name: 'INTEGRATION_STARTED' },
-    { name: 'INTEGRATION_COMMAND_FINISHED', data: { index: 0, command: 'first gate', required: true, exitCode: 0, timedOut: false, termination: null, stdoutPath: passOut, stderrPath: passErr } },
-    { name: 'INTEGRATION_COMMAND_FINISHED', data: { index: 1, command: 'database gate', required: true, exitCode: 2, timedOut: false, termination: null, stdoutPath: failOut, stderrPath: failErr } },
+    { name: 'INTEGRATION_COMMAND_FINISHED', data: { index: 0, command: 'first-gate', required: true, exitCode: 0, timedOut: false, termination: null, stdoutPath: passOut, stderrPath: passErr } },
+    { name: 'INTEGRATION_COMMAND_FINISHED', data: { index: 1, command: 'database-gate', required: true, exitCode: 2, timedOut: false, termination: null, stdoutPath: failOut, stderrPath: failErr } },
     { name: 'RUN_BLOCKED', data: { code: 'INTEGRATION_TEST_FAILED' } },
   ]);
+  return value;
+}
+
+async function retriedIntegrationFixture(options: {
+  readonly archivedAttempts: number;
+  readonly currentFailure: string;
+  readonly emittedBoundaries?: number;
+  readonly currentLogLocation?: 'live' | 'archived';
+  readonly omitCurrentLog?: boolean;
+}): Promise<Fixture> {
+  const spec = taskSpec();
+  const archivedIntegration = () => ({
+    status: 'BLOCKED' as const,
+    integratedTaskCommits: [],
+    error: error('INTEGRATION_TEST_FAILED', 'Archived required integration command failure'),
+  });
+  const value = await fixture([spec], (state) => ({
+    ...state,
+    status: 'BLOCKED',
+    tasks: { ...state.tasks, [taskId]: { ...state.tasks[taskId]!, status: 'SUCCEEDED', finishedAt: timestamp } },
+    integration: {
+      status: 'BLOCKED',
+      integratedTaskCommits: [],
+      error: error('INTEGRATION_TEST_FAILED', 'Current required integration command failure'),
+    },
+    integrationAttempts: Array.from({ length: options.archivedAttempts }, archivedIntegration),
+  }));
+  const liveLogs = join(value.store.runDirectory, 'logs', 'integration');
+  await mkdir(liveLogs, { recursive: true });
+  const passOut = join(liveLogs, '01-first-gate.stdout.log');
+  const passErr = join(liveLogs, '01-first-gate.stderr.log');
+  const failOut = join(liveLogs, '02-database-gate.stdout.log');
+  const liveFailErr = join(liveLogs, '02-database-gate.stderr.log');
+  await writeFile(passOut, 'ok\n');
+  await writeFile(passErr, '');
+  await writeFile(failOut, '');
+  if (options.omitCurrentLog !== true) await writeFile(liveFailErr, options.currentFailure);
+
+  for (let attemptNumber = 1; attemptNumber <= options.archivedAttempts; attemptNumber += 1) {
+    const archivedLogs = join(value.store.runDirectory, 'logs', `integration-attempt-${attemptNumber}`);
+    await mkdir(archivedLogs, { recursive: true });
+    await writeFile(join(archivedLogs, '02-database-gate.stderr.log'),
+      'psql: connection to server at "localhost", port 55432 failed: Connection refused\n');
+  }
+
+  const currentFailErr = options.currentLogLocation === 'archived'
+    ? join(value.store.runDirectory, 'logs', `integration-attempt-${options.archivedAttempts}`, '02-database-gate.stderr.log')
+    : liveFailErr;
+  const events: Omit<RunEvent, 'runId' | 'timestamp'>[] = [{ name: 'INTEGRATION_STARTED' }];
+  const boundaryCount = options.emittedBoundaries ?? options.archivedAttempts;
+  for (let attemptNumber = 1; attemptNumber <= options.archivedAttempts + 1; attemptNumber += 1) {
+    const current = attemptNumber === options.archivedAttempts + 1;
+    events.push(
+      { name: 'INTEGRATION_COMMAND_FINISHED', data: { index: 0, command: 'first-gate', required: true,
+        exitCode: 0, timedOut: false, termination: null, stdoutPath: passOut, stderrPath: passErr } },
+      { name: 'INTEGRATION_COMMAND_FINISHED', data: { index: 1, command: 'database-gate', required: true,
+        exitCode: 2, timedOut: false, termination: null, stdoutPath: failOut,
+        stderrPath: current ? currentFailErr : liveFailErr } },
+      { name: 'RUN_BLOCKED', data: { code: 'INTEGRATION_TEST_FAILED' } },
+    );
+    if (attemptNumber <= boundaryCount) {
+      events.push({ name: 'RUN_RESUMED', data: { recoveryMode: 'integration_retry' } });
+    }
+  }
+  await appendEvents(value.store, events);
   return value;
 }
 
@@ -393,6 +506,70 @@ test('a genuine failing assertion is not misclassified as an integration environ
     const diagnosis = await diagnoseFailure(value);
     assert.equal(diagnosis.status, 'unknown');
     assert.notEqual(diagnosis.classification, 'INTEGRATION_ENVIRONMENT_MISMATCH');
+  } finally { await value.dispose(); }
+});
+
+test('current retry attempt cannot inherit archived connection-refused evidence at reused positional paths', async () => {
+  const value = await retriedIntegrationFixture({ archivedAttempts: 1,
+    currentFailure: 'AssertionError: current attempt expected 1 to equal 2\n' });
+  try {
+    const diagnosis = await diagnoseFailure(value);
+    assert.equal(diagnosis.status, 'unknown');
+    assert.notEqual(diagnosis.classification, 'INTEGRATION_ENVIRONMENT_MISMATCH');
+  } finally { await value.dispose(); }
+});
+
+test('a proven connection failure in the current retry attempt still classifies', async () => {
+  const value = await retriedIntegrationFixture({ archivedAttempts: 1,
+    currentFailure: 'connect ECONNREFUSED localhost:55432\n' });
+  try {
+    const diagnosis = await diagnoseFailure(value);
+    assert.equal(diagnosis.classification, 'INTEGRATION_ENVIRONMENT_MISMATCH');
+    assert.match(diagnosis.evidence.find((entry) => entry.kind === 'event')?.summary ?? '', /current attempt 2/i);
+  } finally { await value.dispose(); }
+});
+
+test('missing current-attempt logs fail closed even when an archived attempt proves connection refusal', async () => {
+  const value = await retriedIntegrationFixture({ archivedAttempts: 1, currentFailure: '', omitCurrentLog: true });
+  try {
+    const diagnosis = await diagnoseFailure(value);
+    assert.equal(diagnosis.status, 'unknown');
+    assert.equal(diagnosis.classification, undefined);
+  } finally { await value.dispose(); }
+});
+
+test('current attempt events cannot cite an archived attempt log', async () => {
+  const value = await retriedIntegrationFixture({ archivedAttempts: 1,
+    currentFailure: 'AssertionError: current attempt failed\n', currentLogLocation: 'archived' });
+  try {
+    const diagnosis = await diagnoseFailure(value);
+    assert.equal(diagnosis.status, 'unknown');
+    assert.equal(diagnosis.classification, undefined);
+  } finally { await value.dispose(); }
+});
+
+test('two retry cycles select only attempt 3 evidence', async () => {
+  const productFailure = await retriedIntegrationFixture({ archivedAttempts: 2,
+    currentFailure: 'AssertionError: attempt 3 product test failed\n' });
+  const environmentFailure = await retriedIntegrationFixture({ archivedAttempts: 2,
+    currentFailure: 'could not connect to server: Connection refused\n' });
+  try {
+    const productDiagnosis = await diagnoseFailure(productFailure);
+    assert.equal(productDiagnosis.status, 'unknown');
+    assert.notEqual(productDiagnosis.classification, 'INTEGRATION_ENVIRONMENT_MISMATCH');
+    const environmentDiagnosis = await diagnoseFailure(environmentFailure);
+    assert.equal(environmentDiagnosis.classification, 'INTEGRATION_ENVIRONMENT_MISMATCH');
+    assert.match(environmentDiagnosis.evidence.find((entry) => entry.kind === 'event')?.summary ?? '', /current attempt 3/i);
+  } finally { await productFailure.dispose(); await environmentFailure.dispose(); }
+});
+
+test('archive state without its matching retry boundary fails closed', async () => {
+  const value = await retriedIntegrationFixture({ archivedAttempts: 2, emittedBoundaries: 1,
+    currentFailure: 'connect ECONNREFUSED localhost:55432\n' });
+  try {
+    const diagnosis = await diagnoseFailure(value);
+    assert.equal(diagnosis.status, 'unknown');
+    assert.equal(diagnosis.classification, undefined);
   } finally { await value.dispose(); }
 });
 
@@ -455,7 +632,7 @@ test('oversized connection logs fail closed instead of producing a guessed diagn
 test('unreadable connection evidence fails closed instead of producing a guessed diagnosis', async () => {
   const value = await integrationFixture('connect ECONNREFUSED localhost:55432\n');
   try {
-    await rm(join(value.store.runDirectory, 'logs', 'integration', '02-fail.stderr.log'));
+    await rm(join(value.store.runDirectory, 'logs', 'integration', '02-database-gate.stderr.log'));
     const diagnosis = await diagnoseFailure(value);
     assert.equal(diagnosis.status, 'unknown');
     assert.equal(diagnosis.classification, undefined);

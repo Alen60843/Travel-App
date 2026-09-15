@@ -1,12 +1,13 @@
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import type { PhaseConfig } from '../config';
 import { extractClaudeStructuredReviewOutput, parseJsonOrNull } from '../agents';
 import { effectiveAgentExecutables, unusableExecutableState } from '../agents/executable-repin';
 import { OrchestratorError } from '../errors';
+import { parseCommand } from '../integration/integration-gate';
 import { readReplanHandoff } from '../replan/checkpoint';
 import type {
   AgentAttemptState,
@@ -47,6 +48,12 @@ interface ReadEvidence {
   readonly bytes: Buffer;
   readonly text: string;
   readonly reference: string;
+}
+
+interface CurrentIntegrationAttempt {
+  readonly attempt: number;
+  readonly commands: readonly PersistedEvent[];
+  readonly blocked: PersistedEvent;
 }
 
 export interface DiagnoseFailureInput {
@@ -393,7 +400,7 @@ async function diagnoseOwnershipExpansion(
   const requests = loaded.handoff.additionalWorkRequests ?? [];
   for (const [requestIndex, request] of requests.entries()) {
     const expanded = (request.resourceClaims ?? []).filter((claim) => claim.mode === 'write'
-      && (claim.kind !== 'repository_path' || !writeClaimContained(claim.key, spec)));
+      && (claim.kind !== 'repository_path' || writeClaimRelation(claim.key, spec) === 'outside'));
     if (expanded.length === 0) continue;
     const repositoryClaims = expanded.filter((claim) => claim.kind === 'repository_path');
     return {
@@ -423,15 +430,40 @@ async function diagnoseOwnershipExpansion(
   return null;
 }
 
-function writeClaimContained(key: string, spec: TaskSpec): boolean {
-  if (!spec.writer) return false;
-  const wildcard = /[*?]/.test(key);
-  if (!wildcard) return spec.files.some((pattern) => matchesOwnershipPattern(key, pattern));
-  // Existing ownership utilities prove disjointness but not arbitrary glob
-  // language containment. Exact equality is safe; a wholly disjoint claim is
-  // provably outside. Partial overlap remains unknown rather than guessed.
-  if (spec.files.includes(key)) return true;
-  return spec.files.some((pattern) => ownershipGlobsOverlap(key, pattern));
+type WriteClaimRelation = 'contained' | 'outside' | 'ambiguous';
+
+function writeClaimRelation(key: string, spec: TaskSpec): WriteClaimRelation {
+  if (!spec.writer) return 'outside';
+  if (!/[*?]/.test(key)) {
+    return spec.files.some((pattern) => matchesOwnershipPattern(key, pattern)) ? 'contained' : 'outside';
+  }
+  if (spec.files.includes(key)) return 'contained';
+  for (const owned of spec.files) {
+    const requestedPrefix = literalGlobstarPrefix(key);
+    const ownedPrefix = literalGlobstarPrefix(owned);
+    if (requestedPrefix !== null && ownedPrefix !== null
+      && pathSegmentsStartWith(requestedPrefix, ownedPrefix)) return 'contained';
+  }
+  if (spec.files.length === 1) {
+    const requestedPrefix = literalGlobstarPrefix(key);
+    const ownedPrefix = literalGlobstarPrefix(spec.files[0]!);
+    if (requestedPrefix !== null && ownedPrefix !== null
+      && pathSegmentsStartWith(ownedPrefix, requestedPrefix)) return 'outside';
+  }
+  return spec.files.some((pattern) => ownershipGlobsOverlap(key, pattern)) ? 'ambiguous' : 'outside';
+}
+
+/** A deliberately bounded subset proof for literal directory prefixes ending in `/**`. */
+function literalGlobstarPrefix(pattern: string): readonly string[] | null {
+  const segments = pattern.split('/');
+  if (segments.at(-1) !== '**') return null;
+  const prefix = segments.slice(0, -1);
+  return prefix.length > 0 && prefix.every((segment) => segment.length > 0 && !/[*?]/.test(segment))
+    ? prefix : null;
+}
+
+function pathSegmentsStartWith(value: readonly string[], prefix: readonly string[]): boolean {
+  return value.length >= prefix.length && prefix.every((segment, index) => value[index] === segment);
 }
 
 async function diagnoseIntegration(input: DiagnoseFailureInput): Promise<FailureDiagnosis> {
@@ -450,15 +482,15 @@ async function diagnoseIntegration(input: DiagnoseFailureInput): Promise<Failure
       stateEvidence('integration.error', 'Integration is blocked with INTEGRATION_TEST_FAILED, but bounded event evidence could not be read safely.'),
     ]);
   }
-  const start = events.map((event) => event.name).lastIndexOf('INTEGRATION_STARTED');
-  if (start < 0) {
-    return unknown(input.state.runId, subject, [stateEvidence('integration.error', 'Integration failure has no current-attempt INTEGRATION_STARTED evidence.')]);
+  const current = currentIntegrationAttempt(input.state, events);
+  if (current === null) {
+    return unknown(input.state.runId, subject, [stateEvidence('integration.error', 'The current integration attempt cannot be bound exactly to persisted archive and event history.')]);
   }
-  const commands = events.slice(start + 1).filter((event) => event.name === 'INTEGRATION_COMMAND_FINISHED');
-  const blocked = events.slice(start + 1).find((event) => event.name === 'RUN_BLOCKED'
-    && event.data.code === 'INTEGRATION_TEST_FAILED');
-  if (blocked === undefined || commands.length === 0 || commands.some((event) => !validCommandEvidence(event.data))) {
-    return unknown(input.state.runId, subject, [stateEvidence('integration.error', 'Current integration event evidence is incomplete or malformed.')]);
+  const { commands, blocked } = current;
+  if (commands.length === 0 || commands.some((event, index) =>
+    !validCommandEvidence(event.data) || event.data.index !== index
+    || !currentIntegrationLogPaths(input.store.runDirectory, event.data))) {
+    return unknown(input.state.runId, subject, [stateEvidence('integration.error', 'Current integration command or live-log evidence is incomplete, non-contiguous, or malformed.')]);
   }
   const failedIndex = commands.findIndex((event) => event.data.required === true && commandFailed(event.data));
   if (failedIndex < 0) {
@@ -489,7 +521,7 @@ async function diagnoseIntegration(input: DiagnoseFailureInput): Promise<Failure
   if (matching === undefined) {
     return unknown(input.state.runId, subject, [
       stateEvidence('integration.error', 'Integration is blocked with INTEGRATION_TEST_FAILED, but bounded logs do not prove an external connection/environment failure.'),
-      { kind: 'event', reference: `events.jsonl:${failed.line}`, summary: 'A required integration command failed after earlier required commands passed.' },
+      { kind: 'event', reference: `events.jsonl:${failed.line},${blocked.line}`, summary: `A required integration command failed and blocked current attempt ${current.attempt} after earlier required commands passed.` },
     ]);
   }
   return {
@@ -500,7 +532,7 @@ async function diagnoseIntegration(input: DiagnoseFailureInput): Promise<Failure
     classification: 'INTEGRATION_ENVIRONMENT_MISMATCH',
     evidence: [
       stateEvidence('integration.error', 'Integration is blocked with INTEGRATION_TEST_FAILED.'),
-      { kind: 'event', reference: `events.jsonl:${failed.line}`, summary: `${earlierRequired.length} earlier required integration command(s) passed before the later required command failed.` },
+      { kind: 'event', reference: `events.jsonl:${failed.line},${blocked.line}`, summary: `${earlierRequired.length} earlier required integration command(s) passed before the later required command failed and blocked current attempt ${current.attempt}.` },
       { kind: 'log', reference: matching.reference, summary: 'The bounded failed-command log reports that its configured external connection target was unavailable.' },
     ],
     recommendedAction: action(
@@ -517,12 +549,66 @@ function commandFailed(data: Readonly<Record<string, unknown>>): boolean {
 }
 
 function validCommandEvidence(data: Readonly<Record<string, unknown>>): boolean {
-  return typeof data.command === 'string' && data.command.length > 0
+  return Number.isSafeInteger(data.index) && Number(data.index) >= 0
+    && typeof data.command === 'string' && data.command.length > 0
     && typeof data.required === 'boolean'
     && (typeof data.exitCode === 'number' || data.exitCode === null)
     && typeof data.timedOut === 'boolean'
     && (data.termination === null || data.termination === 'timeout' || data.termination === 'aborted')
     && typeof data.stdoutPath === 'string' && typeof data.stderrPath === 'string';
+}
+
+function currentIntegrationAttempt(
+  state: RunState,
+  events: readonly PersistedEvent[],
+): CurrentIntegrationAttempt | null {
+  const starts = events.map((event, index) => ({ event, index })).filter(({ event }) =>
+    event.name === 'INTEGRATION_STARTED' && event.taskId === undefined);
+  if (starts.length !== 1) return null;
+  const archived = state.integrationAttempts ?? [];
+  const boundaries = events.map((event, index) => ({ event, index })).filter(({ event }) =>
+    event.taskId === undefined && (event.name === 'INTEGRATION_FIX_APPLIED'
+      || event.name === 'RUN_RESUMED' && event.data.recoveryMode === 'integration_retry'));
+  if (boundaries.length !== archived.length) return null;
+
+  let previousBoundary = starts[0]!.index;
+  for (const [index, boundary] of boundaries.entries()) {
+    if (boundary.index <= previousBoundary) return null;
+    const priorBlocks = events.slice(previousBoundary + 1, boundary.index).filter((event) =>
+      event.name === 'RUN_BLOCKED' && event.taskId === undefined);
+    const priorBlock = priorBlocks.at(-1);
+    const snapshot = archived[index];
+    if (snapshot?.status !== 'BLOCKED' || snapshot.error === undefined
+      || priorBlock?.data.code !== snapshot.error.code) return null;
+    previousBoundary = boundary.index;
+  }
+
+  const currentEvents = events.slice(previousBoundary + 1);
+  const blocks = currentEvents.filter((event) => event.name === 'RUN_BLOCKED' && event.taskId === undefined);
+  if (blocks.length !== 1 || blocks[0]!.data.code !== state.integration.error?.code) return null;
+  const blocked = blocks[0]!;
+  const commands = currentEvents.filter((event) =>
+    event.name === 'INTEGRATION_COMMAND_FINISHED' && event.taskId === undefined);
+  if (commands.some((event) => event.line >= blocked.line)) return null;
+  return { attempt: archived.length + 1, commands, blocked };
+}
+
+function currentIntegrationLogPaths(
+  runDirectory: string,
+  data: Readonly<Record<string, unknown>>,
+): boolean {
+  if (!Number.isSafeInteger(data.index) || typeof data.command !== 'string'
+    || typeof data.stdoutPath !== 'string' || typeof data.stderrPath !== 'string') return false;
+  try {
+    const executable = parseCommand(data.command)[0];
+    if (executable === undefined) return false;
+    const stem = `${String(Number(data.index) + 1).padStart(2, '0')}-${basename(executable)}`;
+    const liveLogs = join(runDirectory, 'logs', 'integration');
+    return data.stdoutPath === join(liveLogs, `${stem}.stdout.log`)
+      && data.stderrPath === join(liveLogs, `${stem}.stderr.log`);
+  } catch {
+    return false;
+  }
 }
 
 async function readEvents(store: StateStore): Promise<readonly PersistedEvent[]> {
