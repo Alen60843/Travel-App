@@ -54,6 +54,8 @@ export interface AgentAttemptState {
   /** Effective configured budget and observed runtime, persisted for timeout diagnosis. */
   readonly timeoutMs?: number;
   readonly durationMs?: number;
+  /** Exact structured-review transport used by this attempt, when applicable. */
+  readonly structuredOutputContractId?: string;
 }
 
 /**
@@ -629,6 +631,16 @@ function parseAttempt(value: unknown, path: string): AgentAttemptState {
     throw new OrchestratorError('STATE_CORRUPT', `${path}.outcome is invalid`);
   }
   const pid = value.pid === undefined ? undefined : integer(value.pid, `${path}.pid`, 1);
+  const structuredOutputContractId = optionalString(
+    value.structuredOutputContractId,
+    `${path}.structuredOutputContractId`,
+  );
+  if (structuredOutputContractId !== undefined && !/^[0-9a-f]{64}$/.test(structuredOutputContractId)) {
+    throw new OrchestratorError(
+      'STATE_CORRUPT',
+      `${path}.structuredOutputContractId must be a lowercase sha256 digest`,
+    );
+  }
   return {
     attempt: integer(value.attempt, `${path}.attempt`, 1),
     agent,
@@ -649,6 +661,7 @@ function parseAttempt(value: unknown, path: string): AgentAttemptState {
     ...(value.durationMs === undefined
       ? {}
       : { durationMs: integer(value.durationMs, `${path}.durationMs`) }),
+    ...(structuredOutputContractId === undefined ? {} : { structuredOutputContractId }),
   };
 }
 

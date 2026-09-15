@@ -3,7 +3,13 @@ import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import type { Agent, AgentName, AgentRequest, AgentResult } from '../../src/agents';
+import {
+  CLAUDE_STRUCTURED_REVIEW_OUTPUT_CONTRACT_ID,
+  type Agent,
+  type AgentName,
+  type AgentRequest,
+  type AgentResult,
+} from '../../src/agents';
 import { HANDOFF_KEYS, FINDING_RESPONSE_KEYS } from '../../src/handoff';
 import { isOrchestratorError } from '../../src/errors';
 import { AgentOrchestrator } from '../../src/orchestrator';
@@ -1465,11 +1471,9 @@ test('scenario 20: a review response prefaced with prose is recovered via framin
   }
 });
 
-// 21. Persisted FAILED recovery for a review-mode task (REVIEW_BLOCKED),
-// mirroring the exact real dogfood shape: final_review recovered from its
-// preserved stdout, Claude NOT re-invoked, and Judge correctly SKIPPED
-// afterward because the recovered review approved.
-test('scenario 21: a persisted FAILED/REVIEW_BLOCKED final_review recovers via framing, Claude is not re-invoked, and Judge is SKIPPED', async () => {
+// 21. Persisted FAILED recovery for a schema-enforced Claude review unwraps
+// the same provider envelope as live execution, without another invocation.
+test('scenario 21: persisted FAILED final_review unwraps Claude structured_output without reinvocation', async () => {
   const { fixture, write } = await setUp();
   try {
     const phaseFile = await write({ maxCorrectionRounds: 1, escalation: true });
@@ -1493,13 +1497,10 @@ test('scenario 21: a persisted FAILED/REVIEW_BLOCKED final_review recovers via f
 
     const logsDir = join(started.stateStore.runDirectory, 'logs');
     await mkdir(logsDir, { recursive: true });
-    const claudeStdout = [
-      'All on-disk files match the diff exactly. This completes my verification.',
-      '',
-      'Note: this task requires a single JSON verdict object; providing it directly.',
-      '',
-      JSON.stringify(approvedReview()),
-    ].join('\n');
+    const claudeStdout = JSON.stringify({
+      type: 'result', subtype: 'success', is_error: false, result: '',
+      structured_output: approvedReview(),
+    });
     await writeFile(
       join(logsDir, `${runId}.reverify.claude.attempt-1.stdout.log`),
       claudeStdout,
@@ -1538,6 +1539,7 @@ test('scenario 21: a persisted FAILED/REVIEW_BLOCKED final_review recovers via f
             startedAt: before.createdAt,
             finishedAt: before.createdAt,
             outcome: 'succeeded',
+            structuredOutputContractId: CLAUDE_STRUCTURED_REVIEW_OUTPUT_CONTRACT_ID,
           }],
           error: { code: 'REVIEW_BLOCKED', message: 'review: must be an object', at: before.createdAt },
         },
@@ -1559,8 +1561,7 @@ test('scenario 21: a persisted FAILED/REVIEW_BLOCKED final_review recovers via f
     const afterRecovery = orchestrator.snapshot();
     assert.equal(afterRecovery.tasks.reverify?.status, 'SUCCEEDED');
     assert.equal(afterRecovery.tasks.reverify?.handoffOutcome, 'valid');
-    assert.equal(afterRecovery.tasks.reverify?.handoffRepairAttempts.length > 0, true);
-    assert.equal(afterRecovery.tasks.reverify?.handoffRepairAttempts.at(-1)?.succeeded, true);
+    assert.equal(afterRecovery.tasks.reverify?.handoffRepairAttempts.length, 0);
     // Read-only task: no commit, ever.
     assert.equal(afterRecovery.tasks.reverify?.commit, undefined);
     assert.equal(afterRecovery.tasks.judge?.status, 'PENDING');

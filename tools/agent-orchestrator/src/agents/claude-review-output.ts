@@ -6,7 +6,7 @@ import {
   FINDING_SEVERITIES,
   REVIEW_STATUSES,
 } from '../review/findings';
-import type { AgentRole } from './agent';
+import type { AgentName, AgentRole } from './agent';
 import { parseJsonOrNull } from './process-agent';
 
 /**
@@ -176,6 +176,25 @@ export function extractClaudeStructuredReviewOutput(
     return null;
   }
   return envelope.structured_output;
+}
+
+/**
+ * Pure provider translation shared by live execution and persisted-stdout
+ * recovery. A recorded contract ID distinguishes schema-enforced Claude
+ * review attempts from legacy Claude attempts that predate provenance; every
+ * other path retains whole-stdout JSON parsing.
+ */
+export function extractStructuredHandoffFromStdout(input: {
+  readonly agent: AgentName;
+  readonly role: AgentRole;
+  readonly rawStdout: string | null;
+  readonly structuredOutputContractId?: string;
+}): unknown | null {
+  return input.agent === 'claude'
+    && usesClaudeStructuredReviewOutput(input.role)
+    && input.structuredOutputContractId !== undefined
+    ? extractClaudeStructuredReviewOutput(input.rawStdout)
+    : parseJsonOrNull(input.rawStdout);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

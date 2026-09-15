@@ -66,3 +66,15 @@ the same review round, prepared HEAD, dependency commits, accepted review
 history, and every prompt input artifact. Authorization invokes no provider.
 Normal `agents:resume` may make one post-fix invocation; no automatic or
 explicit second invocation is permitted through this continuation.
+
+Before dispatch, the active adapter identity must still equal the authorized
+`newContractId`. Attempt allocation then persists that exact identity as
+`structuredOutputContractId`. From that point onward, recovery validates the
+v3 authorization against the attempt rather than the current source constant,
+so later legitimate schema evolution cannot corrupt completed history.
+
+The same pure provider-output boundary handles live Claude results, interrupted
+task reconciliation, explicit structured-output recovery, and review framing.
+Schema-enforced attempts unwrap only the verified `structured_output` payload;
+legacy attempts without contract provenance retain their historical whole-
+stdout parsing behavior.

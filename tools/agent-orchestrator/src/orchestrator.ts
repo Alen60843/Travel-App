@@ -5,10 +5,10 @@ import { dirname, join, resolve, sep } from 'node:path';
 
 import {
   ClaudeAgent,
-  CLAUDE_STRUCTURED_REVIEW_OUTPUT_CONTRACT_ID,
   CLAUDE_TEXT_REVIEW_OUTPUT_CONTRACT_ID,
   CodexAgent,
   extractClaudeStructuredReviewOutput,
+  extractStructuredHandoffFromStdout,
   parseJsonOrNull,
   readBoundedStdoutText,
   resolveAgentExecutable,
@@ -17,6 +17,7 @@ import {
   executableRepinId,
   inspectAgentExecutable,
   unusableExecutableState,
+  usesClaudeStructuredReviewOutput,
   type Agent,
   type AgentExecutableRepin,
   type AgentExecutableRepinIdentity,
@@ -1682,6 +1683,8 @@ export class AgentOrchestrator {
       const spec = orchestrator.config.tasks.find((candidate) => candidate.id === taskId)!;
       const previous = orchestrator.state.tasks[taskId]!;
       if (spec.owner !== 'claude') refuse('task owner is not Claude');
+      const activeContractId = structuredOutputContractIdFor(orchestrator.agents.claude, spec.mode)
+        ?? refuse('active Claude adapter does not declare a structured-review contract');
       if (eligibility.reviewRound !== 2 || eligibility.taskReviewRound !== 2) {
         refuse('only the unaccepted second review round is supported');
       }
@@ -1740,7 +1743,7 @@ export class AgentOrchestrator {
         consumedRecoverySha256: canonicalHash(consumed),
         malformedAttempts: [consumed.attempt.attempt, currentAttempt.attempt],
         oldContractId: CLAUDE_TEXT_REVIEW_OUTPUT_CONTRACT_ID,
-        newContractId: CLAUDE_STRUCTURED_REVIEW_OUTPUT_CONTRACT_ID,
+        newContractId: activeContractId,
         dependencyCommits: orchestrator.dependencyCommits(spec),
         promptArtifacts: await orchestrator.reviewPromptArtifactEvidence(spec),
         authorizedBy: 'human',
@@ -3689,7 +3692,33 @@ export class AgentOrchestrator {
   private async runTrackedAgent(prepared: PreparedTask, agent: Agent): Promise<AgentResult> {
     const task = prepared.task;
     const configuredTimeoutMs = task.timeoutMs ?? this.config.agentTimeoutMs;
-    const attemptNumber = await this.allocateAttempt(task.id, agent.name, configuredTimeoutMs);
+    const structuredOutputContractId = structuredOutputContractIdFor(agent, task.mode);
+    const contractContinuation = this.state.tasks[task.id]?.reviewOutputRecoveries?.find(
+      (entry): entry is ReviewOutputRecoveryV3State => entry.version === 3,
+    );
+    if (contractContinuation !== undefined) {
+      const postFixAttempts = this.state.tasks[task.id]!.agentAttempts.filter(
+        (attempt) => attempt.attempt > contractContinuation.attempt.attempt,
+      );
+      if (postFixAttempts.length > 0) {
+        throw new OrchestratorError(
+          'TASK_STATE_INVALID',
+          `Claude review contract continuation invocation is already consumed for ${task.id}`,
+        );
+      }
+      if (structuredOutputContractId !== contractContinuation.newContractId) {
+        throw new OrchestratorError(
+          'TASK_STATE_INVALID',
+          `Claude review contract changed before the authorized post-fix attempt for ${task.id}`,
+        );
+      }
+    }
+    const attemptNumber = await this.allocateAttempt(
+      task.id,
+      agent.name,
+      configuredTimeoutMs,
+      structuredOutputContractId,
+    );
     await this.event('AGENT_STARTED', task.id, {
       agent: agent.name, attempt: attemptNumber, timeoutMs: configuredTimeoutMs,
     });
@@ -4300,10 +4329,12 @@ export class AgentOrchestrator {
 
   private async finishReview(prepared: PreparedTask, result: AgentResult): Promise<void> {
     await this.assertReadOnlyTaskClean(prepared);
+    const attempt = this.state.tasks[prepared.task.id]?.agentAttempts.at(-1);
     const parsed = await this.parseOrRecoverReview(
       prepared.task,
       result.structuredHandoff,
       result.rawStdout ?? null,
+      attempt?.structuredOutputContractId,
     );
     await this.recordHandoffOutcome(prepared.task.id, parsed.outcome);
     if (parsed.review === null) {
@@ -4353,6 +4384,7 @@ export class AgentOrchestrator {
     task: TaskSpec,
     rawStructuredHandoff: unknown,
     rawStdout: string | null,
+    structuredOutputContractId?: string,
   ): Promise<
     | { readonly review: StructuredReview; readonly error: null; readonly outcome: HandoffOutcomeRecord }
     | { readonly review: null; readonly error: unknown; readonly outcome: HandoffOutcomeRecord }
@@ -4365,7 +4397,23 @@ export class AgentOrchestrator {
         throw error;
       }
       const normalized = normalizeApprovedReview(rawStructuredHandoff);
-      const framed = normalized === null ? extractStructuredPayload(rawStdout, validateReview) : null;
+      const providerPayload = extractStructuredHandoffFromStdout({
+        agent: task.owner,
+        role: task.mode,
+        rawStdout,
+        ...(structuredOutputContractId === undefined ? {} : { structuredOutputContractId }),
+      });
+      const providerFramingRequired = task.owner === 'claude'
+        && usesClaudeStructuredReviewOutput(task.mode)
+        && structuredOutputContractId !== undefined;
+      const framingSource = providerFramingRequired
+        ? providerPayload === null || providerPayload === undefined
+          ? null
+          : typeof providerPayload === 'string'
+            ? providerPayload
+            : JSON.stringify(providerPayload) ?? null
+        : rawStdout;
+      const framed = normalized === null ? extractStructuredPayload(framingSource, validateReview) : null;
       const recovered = normalized ?? (framed?.ok ? framed.value : null);
       const record: HandoffRepairAttemptRecord = recovered !== null
         ? { method: normalized !== null ? 'deterministic' : 'framing', succeeded: true, timestamp: this.clock().toISOString() }
@@ -5194,7 +5242,6 @@ export class AgentOrchestrator {
         || !['review', 'final_review'].includes(spec.mode)
         || prior === undefined || canonicalHash(prior) !== recovery.consumedRecoverySha256
         || recovery.oldContractId !== CLAUDE_TEXT_REVIEW_OUTPUT_CONTRACT_ID
-        || recovery.newContractId !== CLAUDE_STRUCTURED_REVIEW_OUTPUT_CONTRACT_ID
         || recovery.preparedHeadSha !== task.preparedHeadSha
         || JSON.stringify(this.dependencyCommits(spec)) !== JSON.stringify(recovery.dependencyCommits)
         || recovery.malformedAttempts[0] !== prior.attempt.attempt
@@ -5221,6 +5268,20 @@ export class AgentOrchestrator {
         || postFixAttempts.some((attempt) => attempt.agent !== 'claude')
         || (task.status === 'READY' && postFixAttempts.length !== 0)) {
         throw new OrchestratorError('STATE_CORRUPT', `Claude review contract continuation ${taskId} exceeded its one-invocation budget`);
+      }
+      if (postFixAttempts.length === 0) {
+        const activeContractId = structuredOutputContractIdFor(this.agents.claude, spec.mode);
+        if (activeContractId !== recovery.newContractId) {
+          throw new OrchestratorError(
+            'TASK_STATE_INVALID',
+            `Claude review contract changed before the authorized post-fix attempt for ${taskId}`,
+          );
+        }
+      } else if (postFixAttempts[0]!.structuredOutputContractId !== recovery.newContractId) {
+        throw new OrchestratorError(
+          'STATE_CORRUPT',
+          `Claude review contract continuation ${taskId} attempt provenance changed`,
+        );
       }
     }
   }
@@ -5934,7 +5995,14 @@ export class AgentOrchestrator {
     const worktree = await this.worktrees.assertRegistered(taskState.worktreePath!);
     const lastAttempt = taskState.agentAttempts.at(-1)!;
     const rawStdout = await readBoundedStdoutText(this.taskAttemptStdoutLogPath(task.id, lastAttempt));
-    const rawStructuredHandoff = parseJsonOrNull(rawStdout);
+    const rawStructuredHandoff = extractStructuredHandoffFromStdout({
+      agent: lastAttempt.agent,
+      role: task.mode,
+      rawStdout,
+      ...(lastAttempt.structuredOutputContractId === undefined
+        ? {}
+        : { structuredOutputContractId: lastAttempt.structuredOutputContractId }),
+    });
     const taskDiff = (await this.git.run(worktree.path, [
       'diff', '--no-ext-diff', '--no-color', taskState.preparedHeadSha!,
     ])).stdout;
@@ -5967,7 +6035,14 @@ export class AgentOrchestrator {
     const worktree = await this.worktrees.assertRegistered(taskState.worktreePath!);
     const lastAttempt = taskState.agentAttempts.at(-1)!;
     const rawStdout = await readBoundedStdoutText(this.taskAttemptStdoutLogPath(task.id, lastAttempt));
-    const rawStructuredHandoff = parseJsonOrNull(rawStdout);
+    const rawStructuredHandoff = extractStructuredHandoffFromStdout({
+      agent: lastAttempt.agent,
+      role: task.mode,
+      rawStdout,
+      ...(lastAttempt.structuredOutputContractId === undefined
+        ? {}
+        : { structuredOutputContractId: lastAttempt.structuredOutputContractId }),
+    });
     const prepared: PreparedTask = {
       task,
       worktree,
@@ -5977,7 +6052,12 @@ export class AgentOrchestrator {
       actualDependencyDiff: '',
     };
     await this.assertReadOnlyTaskClean(prepared);
-    const parsed = await this.parseOrRecoverReview(task, rawStructuredHandoff, rawStdout);
+    const parsed = await this.parseOrRecoverReview(
+      task,
+      rawStructuredHandoff,
+      rawStdout,
+      lastAttempt.structuredOutputContractId,
+    );
     await this.recordHandoffOutcome(task.id, parsed.outcome);
     if (parsed.review === null) {
       throw parsed.error;
@@ -6088,16 +6168,34 @@ export class AgentOrchestrator {
           }
           try {
             if (source === undefined) {
+              const contractContinuation = taskState.reviewOutputRecoveries?.find(
+                (entry): entry is ReviewOutputRecoveryV3State => entry.version === 3,
+              );
+              if (contractContinuation !== undefined && lastAttempt !== undefined
+                && lastAttempt.attempt > contractContinuation.attempt.attempt) {
+                // Allocation is the durable one-invocation boundary. If the
+                // host died before stdout appeared, replay cannot prove the
+                // provider was never started, so the v3 attempt is consumed.
+                observation.handoffInvalid = true;
+              }
               observations[task.id] = observation;
               continue;
             }
+            const structuredHandoff = extractStructuredHandoffFromStdout({
+              agent: lastAttempt!.agent,
+              role: task.mode,
+              rawStdout: source,
+              ...(lastAttempt!.structuredOutputContractId === undefined
+                ? {}
+                : { structuredOutputContractId: lastAttempt!.structuredOutputContractId }),
+            });
             if (REVIEW_MODES.has(task.mode)) {
-              const review = parseReview(source);
+              const review = parseReview(structuredHandoff);
               const reviewPath = await this.persistReviewArtifact(task.id, review);
               observation.review = review;
               observation.reviewPath = reviewPath;
             } else {
-              const handoff = parseHandoff(source);
+              const handoff = parseHandoff(structuredHandoff);
               observation.handoff = handoff;
               observation.handoffPath = await writeHandoff(
                 join(this.stateStore.runDirectory, 'handoffs'),
@@ -6168,6 +6266,7 @@ export class AgentOrchestrator {
     taskId: string,
     agent: 'codex' | 'claude',
     timeoutMs: number,
+    structuredOutputContractId?: string,
   ): Promise<number> {
     let allocatedAttempt = 0;
     const operation = this.stateQueue.then(async () => {
@@ -6181,6 +6280,7 @@ export class AgentOrchestrator {
         agent,
         startedAt: this.clock().toISOString(),
         timeoutMs,
+        ...(structuredOutputContractId === undefined ? {} : { structuredOutputContractId }),
       };
       const next = withUpdatedTimestamp(
         updateTask(this.state, taskId, (value) => ({
@@ -6210,6 +6310,21 @@ export class AgentOrchestrator {
       ...(data === undefined ? {} : { data }),
     });
   }
+}
+
+function structuredOutputContractIdFor(
+  agent: Agent,
+  role: AgentRequest['role'],
+): string | undefined {
+  if (agent.name !== 'claude' || !usesClaudeStructuredReviewOutput(role)) return undefined;
+  const contractId = agent.structuredOutputContractId;
+  if (contractId !== undefined && !/^[0-9a-f]{64}$/.test(contractId)) {
+    throw new OrchestratorError(
+      'TASK_STATE_INVALID',
+      'Claude adapter structured-output contract ID must be a lowercase sha256 digest',
+    );
+  }
+  return contractId;
 }
 
 /**

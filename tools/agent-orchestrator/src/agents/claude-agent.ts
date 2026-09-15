@@ -11,7 +11,8 @@ import {
 } from './process-agent';
 import {
   CLAUDE_REVIEW_OUTPUT_SCHEMA,
-  extractClaudeStructuredReviewOutput,
+  CLAUDE_STRUCTURED_REVIEW_OUTPUT_CONTRACT_ID,
+  extractStructuredHandoffFromStdout,
   usesClaudeStructuredReviewOutput,
 } from './claude-review-output';
 
@@ -23,6 +24,7 @@ const CLAUDE_EFFORT: Readonly<Record<AgentEffort, string>> = {
 
 export class ClaudeAgent extends ProcessAgent {
   readonly name = 'claude' as const;
+  readonly structuredOutputContractId = CLAUDE_STRUCTURED_REVIEW_OUTPUT_CONTRACT_ID;
   protected readonly defaultExecutable = 'claude';
 
   constructor(options: ProcessAgentOptions = {}) {
@@ -73,7 +75,12 @@ export class ClaudeAgent extends ProcessAgent {
     rawStdout: string | null,
   ): unknown | null {
     return usesClaudeStructuredReviewOutput(request.role)
-      ? extractClaudeStructuredReviewOutput(rawStdout)
+      ? extractStructuredHandoffFromStdout({
+          agent: this.name,
+          role: request.role,
+          rawStdout,
+          structuredOutputContractId: this.structuredOutputContractId,
+        })
       : super.extractStructuredHandoff(request, rawStdout);
   }
 }

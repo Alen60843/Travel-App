@@ -39,9 +39,10 @@ const prose = 'Review complete. No material defect remains against the stated in
 
 class RoundAwareAgent implements Agent {
   readonly requests: AgentRequest[] = [];
+  structuredOutputContractId: string | undefined;
   private reviewInvocation = 0;
   constructor(readonly name: AgentName,
-    private readonly reviewSequence: readonly ('changes_requested' | 'prose' | 'approved')[] = []) {}
+    private readonly reviewSequence: readonly ('changes_requested' | 'prose' | 'approved' | 'framed')[] = []) {}
 
   async run(request: AgentRequest): Promise<AgentResult> {
     this.requests.push(request);
@@ -75,6 +76,9 @@ class RoundAwareAgent implements Agent {
       } else if (response === 'prose') {
         output = null;
         rawStdout = prose;
+      } else if (response === 'framed') {
+        output = null;
+        rawStdout = claudeEnvelope(`Review completed.\n${JSON.stringify({ status: 'approved', findings: [] })}`);
       } else {
         output = { status: 'approved', findings: [] };
         rawStdout = JSON.stringify(output);
@@ -120,7 +124,7 @@ async function fixture(
   roundOneRecovery = false,
   doubleMalformedRoundTwo = false,
   useRepositoryRuns = false,
-  postFixResult: 'approved' | 'prose' = 'approved',
+  postFixResult: 'approved' | 'prose' | 'framed' = 'approved',
 ): Promise<Fixture> {
   const repository = await createTemporaryRepository();
   await mkdir(join(repository.repository, 'apps/api/src/chat'), { recursive: true });
@@ -180,7 +184,7 @@ async function events(value: Fixture): Promise<RunEvent[]> {
 
 async function doubleMalformedRoundTwoFixture(
   useRepositoryRuns = false,
-  postFixResult: 'approved' | 'prose' = 'approved',
+  postFixResult: 'approved' | 'prose' | 'framed' = 'approved',
 ): Promise<Fixture> {
   const value = await fixture(false, true, useRepositoryRuns, postFixResult);
   await AgentOrchestrator.retryReviewOutput(value.runId, reviewTaskId, options(value));
@@ -190,7 +194,62 @@ async function doubleMalformedRoundTwoFixture(
   assert.equal(failed.tasks[reviewTaskId]?.reviewRounds, 1);
   assert.equal(failed.tasks[reviewTaskId]?.agentAttempts.length, 3);
   assert.equal(failed.tasks[reviewTaskId]?.reviewOutputRecoveries?.length, 1);
+  // Attempts 1-3 model the real prompt-only history. The adapter contract is
+  // upgraded only after those outputs exist and before v3 authorization.
+  value.agents.claude.structuredOutputContractId = CLAUDE_STRUCTURED_REVIEW_OUTPUT_CONTRACT_ID;
   return { ...value, orchestrator: resumed };
+}
+
+function claudeEnvelope(structuredOutput: unknown): string {
+  return JSON.stringify({
+    type: 'result', subtype: 'success', is_error: false, result: '',
+    structured_output: structuredOutput,
+  });
+}
+
+async function persistCrashedPostFixAttempt(value: Fixture, rawStdout: string) {
+  const authorized = await AgentOrchestrator.continueClaudeReviewAfterOutputContractFix(
+    value.runId, reviewTaskId, options(value),
+  );
+  const state = authorized.orchestrator.snapshot();
+  const task = state.tasks[reviewTaskId]!;
+  const attemptNumber = task.agentAttempts.at(-1)!.attempt + 1;
+  const timestamp = new Date().toISOString();
+  const attempt = {
+    attempt: attemptNumber,
+    agent: 'claude' as const,
+    startedAt: timestamp,
+    finishedAt: timestamp,
+    outcome: 'succeeded' as const,
+    timeoutMs: 60_000,
+    durationMs: 1,
+    structuredOutputContractId: authorized.recovery.newContractId,
+  };
+  const stdoutPath = join(value.orchestrator.stateStore.runDirectory, 'logs',
+    `${value.runId}.${reviewTaskId}.claude.attempt-${attemptNumber}.stdout.log`);
+  await writeFile(stdoutPath, rawStdout);
+  await authorized.orchestrator.stateStore.save({
+    ...state,
+    status: 'RUNNING',
+    tasks: { ...state.tasks, [reviewTaskId]: {
+      ...task,
+      status: 'RUNNING',
+      startedAt: timestamp,
+      agentAttempts: [...task.agentAttempts, attempt],
+    } },
+  });
+  await authorized.orchestrator.stateStore.appendEvent({
+    name: 'REVIEW_STARTED', timestamp, runId: value.runId, taskId: reviewTaskId, data: { round: 2 },
+  });
+  await authorized.orchestrator.stateStore.appendEvent({
+    name: 'AGENT_STARTED', timestamp, runId: value.runId, taskId: reviewTaskId,
+    data: { agent: 'claude', attempt: attemptNumber, timeoutMs: attempt.timeoutMs },
+  });
+  await authorized.orchestrator.stateStore.appendEvent({
+    name: 'AGENT_FINISHED', timestamp, runId: value.runId, taskId: reviewTaskId,
+    data: { agent: 'claude', attempt: attemptNumber, status: 'succeeded', exitCode: 0, durationMs: 1 },
+  });
+  return { authorized, attempt, stdoutPath };
 }
 
 test('accepted round 1 plus malformed round 2 authorizes only the current round without executing work', async () => {
@@ -318,6 +377,19 @@ test('Claude contract continuation binds the consumed round-2 retry and both mal
   } finally { await value.repository.dispose(); }
 });
 
+test('Claude contract continuation authorizes the active adapter identity rather than a source constant', async () => {
+  const value = await doubleMalformedRoundTwoFixture();
+  try {
+    const activeContractId = 'c'.repeat(64);
+    value.agents.claude.structuredOutputContractId = activeContractId;
+    const authorized = await AgentOrchestrator.continueClaudeReviewAfterOutputContractFix(
+      value.runId, reviewTaskId, options(value),
+    );
+    assert.equal(authorized.recovery.newContractId, activeContractId);
+    assert.equal(value.agents.claude.requests.length, 3);
+  } finally { await value.repository.dispose(); }
+});
+
 test('Claude contract continuation is idempotent before resume and permits exactly one post-fix invocation', async () => {
   const value = await doubleMalformedRoundTwoFixture();
   try {
@@ -338,10 +410,154 @@ test('Claude contract continuation is idempotent before resume and permits exact
     const completed = await resumed.execute();
     assert.equal(completed.status, 'COMPLETED');
     assert.equal(completed.tasks[reviewTaskId]?.agentAttempts.length, 4);
+    assert.equal(
+      completed.tasks[reviewTaskId]?.agentAttempts.at(-1)?.structuredOutputContractId,
+      first.recovery.newContractId,
+    );
     assert.equal(completed.tasks[reviewTaskId]?.reviewRounds, 2);
     assert.equal(value.agents.claude.requests.length, invocationCount + 1);
     await (await AgentOrchestrator.resume(value.runId, options(value))).execute();
     assert.equal(value.agents.claude.requests.length, invocationCount + 1);
+  } finally { await value.repository.dispose(); }
+});
+
+test('Claude contract change before the post-fix attempt refuses without invoking a provider', async () => {
+  const value = await doubleMalformedRoundTwoFixture();
+  try {
+    await AgentOrchestrator.continueClaudeReviewAfterOutputContractFix(
+      value.runId, reviewTaskId, options(value),
+    );
+    const invocations = value.agents.claude.requests.length;
+    value.agents.claude.structuredOutputContractId = 'f'.repeat(64);
+    await assert.rejects(
+      AgentOrchestrator.resume(value.runId, options(value)),
+      (error) => isOrchestratorError(error, 'TASK_STATE_INVALID')
+        && /contract changed before/.test(error.message),
+    );
+    assert.equal(value.agents.claude.requests.length, invocations);
+    assert.equal((await value.orchestrator.stateStore.load()).tasks[reviewTaskId]?.agentAttempts.length, 3);
+  } finally { await value.repository.dispose(); }
+});
+
+test('Claude review framing operates on structured_output rather than the outer envelope', async () => {
+  const value = await doubleMalformedRoundTwoFixture(false, 'framed');
+  try {
+    await AgentOrchestrator.continueClaudeReviewAfterOutputContractFix(
+      value.runId, reviewTaskId, options(value),
+    );
+    const completed = await (await AgentOrchestrator.resume(value.runId, options(value))).execute();
+    assert.equal(completed.status, 'COMPLETED');
+    assert.equal(completed.tasks[reviewTaskId]?.reviewRounds, 2);
+    assert.equal(completed.tasks[reviewTaskId]?.handoffRepairAttempts.at(-1)?.method, 'framing');
+    assert.equal(completed.tasks[reviewTaskId]?.handoffRepairAttempts.at(-1)?.succeeded, true);
+  } finally { await value.repository.dispose(); }
+});
+
+test('crashed Claude post-fix final review unwraps its envelope once and survives later contract evolution', async () => {
+  const value = await doubleMalformedRoundTwoFixture();
+  try {
+    const firstPath = value.orchestrator.snapshot().tasks[reviewTaskId]!.reviewPaths[0]!;
+    const firstBytes = await readFile(firstPath);
+    const invocations = value.agents.claude.requests.length;
+    const { authorized, attempt } = await persistCrashedPostFixAttempt(
+      value,
+      claudeEnvelope({ status: 'approved', findings: [] }),
+    );
+    assert.equal(attempt.structuredOutputContractId, authorized.recovery.newContractId);
+
+    // A later adapter/schema identity is irrelevant once the exact attempt
+    // contract has been durably recorded.
+    value.agents.claude.structuredOutputContractId = 'e'.repeat(64);
+    const resumed = await AgentOrchestrator.resume(value.runId, options(value));
+    const recovered = resumed.snapshot().tasks[reviewTaskId]!;
+    const roundTwoPath = join(value.orchestrator.stateStore.runDirectory, 'reviews', `${reviewTaskId}.round-2.json`);
+    assert.equal(recovered.status, 'SUCCEEDED');
+    assert.equal(recovered.reviewRounds, 2);
+    assert.deepEqual(recovered.reviewPaths, [firstPath, roundTwoPath]);
+    assert.deepEqual(JSON.parse(await readFile(roundTwoPath, 'utf8')), { status: 'approved', findings: [] });
+    assert.deepEqual(await readFile(firstPath), firstBytes);
+    assert.equal(value.agents.claude.requests.length, invocations);
+
+    const artifactBytes = await readFile(roundTwoPath);
+    const repeated = await AgentOrchestrator.resume(value.runId, options(value));
+    assert.deepEqual(await readFile(roundTwoPath), artifactBytes);
+    assert.deepEqual(await readFile(firstPath), firstBytes);
+    const completed = await repeated.execute();
+    assert.equal(completed.status, 'COMPLETED');
+    assert.equal(value.agents.claude.requests.length, invocations);
+  } finally { await value.repository.dispose(); }
+});
+
+for (const [label, rawStdout] of [
+  ['malformed envelope', '{"type":"result"'],
+  ['prose-only stdout', 'Final Verdict: Approved'],
+  ['semantic-invalid payload', claudeEnvelope({ status: 'changes_requested', findings: [] })],
+] as const) {
+  test(`crashed Claude post-fix review fails closed for ${label}`, async () => {
+    const value = await doubleMalformedRoundTwoFixture();
+    try {
+      const firstPath = value.orchestrator.snapshot().tasks[reviewTaskId]!.reviewPaths[0]!;
+      const firstBytes = await readFile(firstPath);
+      const invocations = value.agents.claude.requests.length;
+      await persistCrashedPostFixAttempt(value, rawStdout);
+      const resumed = await AgentOrchestrator.resume(value.runId, options(value));
+      const task = resumed.snapshot().tasks[reviewTaskId]!;
+      assert.equal(task.status, 'BLOCKED');
+      assert.equal(task.reviewRounds, 1);
+      assert.deepEqual(task.reviewPaths, [firstPath]);
+      assert.deepEqual(await readFile(firstPath), firstBytes);
+      assert.equal(value.agents.claude.requests.length, invocations);
+      await AgentOrchestrator.resume(value.runId, options(value));
+      assert.equal(value.agents.claude.requests.length, invocations);
+    } finally { await value.repository.dispose(); }
+  });
+}
+
+test('tampered post-fix attempt contract provenance fails STATE_CORRUPT', async () => {
+  const value = await doubleMalformedRoundTwoFixture();
+  try {
+    await persistCrashedPostFixAttempt(value, claudeEnvelope({ status: 'approved', findings: [] }));
+    const state = await value.orchestrator.stateStore.load();
+    const task = state.tasks[reviewTaskId]!;
+    await value.orchestrator.stateStore.save({ ...state, tasks: { ...state.tasks, [reviewTaskId]: {
+      ...task,
+      agentAttempts: task.agentAttempts.map((attempt) => attempt.attempt === 4
+        ? { ...attempt, structuredOutputContractId: 'd'.repeat(64) }
+        : attempt),
+    } } });
+    await assert.rejects(
+      AgentOrchestrator.resume(value.runId, options(value)),
+      (error) => isOrchestratorError(error, 'STATE_CORRUPT') && /attempt provenance changed/.test(error.message),
+    );
+  } finally { await value.repository.dispose(); }
+});
+
+test('a crash after post-fix attempt allocation cannot make a second invocation available', async () => {
+  const value = await doubleMalformedRoundTwoFixture();
+  try {
+    const authorized = await AgentOrchestrator.continueClaudeReviewAfterOutputContractFix(
+      value.runId, reviewTaskId, options(value),
+    );
+    const state = authorized.orchestrator.snapshot();
+    const task = state.tasks[reviewTaskId]!;
+    const attempt = {
+      attempt: 4,
+      agent: 'claude' as const,
+      startedAt: new Date().toISOString(),
+      timeoutMs: 60_000,
+      structuredOutputContractId: authorized.recovery.newContractId,
+    };
+    await authorized.orchestrator.stateStore.save({ ...state, status: 'RUNNING', tasks: {
+      ...state.tasks,
+      [reviewTaskId]: { ...task, status: 'RUNNING', agentAttempts: [...task.agentAttempts, attempt] },
+    } });
+    const invocations = value.agents.claude.requests.length;
+    const resumed = await AgentOrchestrator.resume(value.runId, options(value));
+    assert.equal(resumed.snapshot().tasks[reviewTaskId]?.status, 'BLOCKED');
+    await resumed.execute();
+    await AgentOrchestrator.resume(value.runId, options(value));
+    assert.equal(value.agents.claude.requests.length, invocations);
+    assert.equal((await value.orchestrator.stateStore.load()).tasks[reviewTaskId]?.agentAttempts.length, 4);
   } finally { await value.repository.dispose(); }
 });
 
