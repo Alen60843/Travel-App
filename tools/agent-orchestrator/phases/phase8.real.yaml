@@ -1,0 +1,477 @@
+# Phase 8 — Mandatory Identity Verification and Trust Application Layer
+#
+# Real implementation DAG for the approved Phase 8 scope in the canonical
+# design document. Planning this file is read-only. Running it invokes real
+# agents and must be separately authorized. Coordinator Shadow is deliberately
+# absent from this DAG and may only be invoked manually outside the run.
+
+phase: 8
+name: Phase 8 — Mandatory Identity Verification and Trust Boundary
+baseBranch: phase8/trust-verification
+canonicalDesignDocument: docs/superpowers/specs/2026-08-20-tripwith-phase-1-design.md
+concurrency: 2
+agentRetries: 1
+maxReviewRounds: 2
+maxHandoffRepairAttempts: 2
+agentTimeoutMs: 3600000
+
+agentWorktree:
+  prepare:
+    - command: pnpm install --frozen-lockfile
+      required: true
+      timeoutMs: 900000
+    - command: pnpm --filter @tripwith/shared build
+      required: true
+      timeoutMs: 300000
+
+salvage:
+  verify:
+    - command: pnpm --filter @tripwith/api typecheck
+      required: true
+      timeoutMs: 600000
+    - command: >-
+        pnpm --filter @tripwith/api test -- --runInBand
+        --testPathPattern='src/(identity-verification|trust|auth|trips|matching|swipes|events|explorer|chat|realtime)/.*\.(spec|int-spec)\.ts$|test/phase8-trust-verification/.*\.int-spec\.ts$'
+      required: true
+      timeoutMs: 1800000
+
+tasks:
+  # Workstream 1 — provider-neutral verification and Trust core.
+  - id: phase8-verification-trust-core
+    title: Provider-neutral identity verification and Trust core
+    owner: codex
+    effort: high
+    mode: implementation
+    files:
+      - apps/api/src/identity-verification/**
+      - apps/api/src/trust/**
+      - apps/api/src/database/entities/identity.entity.ts
+      - apps/api/src/database/entities/trust.entity.ts
+      - apps/api/src/database/entities/index.ts
+      - apps/api/src/database/entities/mapping-fidelity.int-spec.ts
+      - apps/api/src/database/entities/round-trip.int-spec.ts
+      - apps/api/src/database/migrations/*Phase8*.ts
+      - apps/api/src/database/migrations/sql/*Phase8*.sql
+      - apps/api/src/database/scripts/verify-invariants.sql
+      - apps/api/src/database/scripts/verify-concurrency.sh
+      - apps/api/src/database/scripts/harden-app-role.sql
+      - apps/api/src/database/scripts/verify-app-role-hardening.sql
+      - packages/shared/src/identity-verification.ts
+      - packages/shared/src/identity-verification.test.ts
+      - packages/shared/src/trust.ts
+      - packages/shared/src/trust.test.ts
+      - packages/shared/src/enums.ts
+      - packages/shared/src/index.ts
+      - apps/api/test/phase8-trust-verification/core/**
+    dependsOn: []
+    instructions: |
+      Implement the smallest coherent provider-neutral identity-verification
+      lifecycle and Trust application layer approved in the canonical design.
+      Inspect the current schema, entities, guards and Phase 1–7 tests before
+      choosing the additive schema. Name any new migration TypeScript and SQL
+      files with `Phase8` so they remain inside this task's explicit ownership.
+      Never rewrite the initial migration.
+
+      Identity verification:
+        - represent provider-neutral lifecycle semantics equivalent to PENDING,
+          VERIFIED, REJECTED and REVOKED; do not encode a vendor state machine
+        - persist only the minimum current eligibility, deterministic/idempotent
+          lifecycle evidence, safe provenance and audit state required now
+        - define a provider-neutral port for a future adapter, but implement no
+          real vendor and no fake production provider that grants access
+        - keep mutation behind an internal/trusted application boundary; no
+          unauthenticated or user-controlled request may assert status,
+          verifiedAt, provider result or provenance
+        - expose only the minimum safe self/read status needed before verification
+        - retain backward compatibility for user_profiles.identity_verified_at
+          and explicitly define it as a compatibility projection/current-state
+          signal if richer lifecycle state is introduced
+        - never persist or log identity-document images or contents, biometrics,
+          raw provider responses or provider evidence in the normal domain
+
+      Trust core:
+        - build a real application layer over trust_score_events and the
+          trigger-maintained users.trust_score_raw/users.trust_score projection
+        - keep PostgreSQL, the append-only ledger and existing clamp semantics
+          authoritative; no application service may directly update either score
+        - accept domain operations, not client-selected arbitrary delta, raw
+          score, TrustEventType, source user, reversal target or authoritative
+          idempotency key
+        - derive bounded/versioned idempotency keys; identical replay has one
+          logical effect and the same key with different semantics conflicts
+        - harden reversals so the original exists, has the same subject, receives
+          the exact opposite delta, is reversed at most once, and cannot itself
+          be a reversal unless canonical policy explicitly supports that
+        - prefer database constraints/triggers for invariants that must hold
+          under concurrency or non-cooperating writers
+        - expose only a safe self summary (clamped score and current verification
+          state where supported) and a read-only internal moderation context seam
+          containing the current clamped score and verification eligibility/state
+        - do not expose trust_score_raw, source users, reports, moderation notes,
+          provider evidence, document metadata or the raw ledger by default
+
+      Verification itself creates no Trust event, delta, multiplier or bonus.
+      Add focused unit and real PostgreSQL concurrency/invariant tests, including
+      lifecycle replay/conflict, ledger replay/conflict, reversal exactness and
+      one-effect duplicate races. Extend the existing DB/app-role verification
+      scripts only as required by the approved invariants.
+
+      HUMAN_REQUIRED boundary: do not choose a vendor, accepted-document policy,
+      expiry/reverification policy, external revocation authority, exact provider
+      provenance retention, moderator authorization, moderation-to-Trust mapping
+      or full explainability policy. If correctness genuinely depends on one,
+      return a blocked handoff that names the missing decision and evidence rather
+      than inventing it.
+
+  - id: phase8-verification-trust-review
+    title: Adversarial review of identity verification and Trust core
+    owner: claude
+    model: sonnet
+    effort: high
+    mode: review
+    files: []
+    dependsOn:
+      - phase8-verification-trust-core
+    instructions: |
+      Adversarially review the Workstream 1 diff and focused evidence. Attempt to
+      prove a self-verification path, provider leakage into domain contracts,
+      lifecycle/idempotency replay defect, concurrent state race, raw identity
+      evidence persistence or logging, direct score mutation, ledger/projection
+      divergence, unsafe reversal, insufficient database enforcement, or unsafe
+      authorization/data exposure. Verify that identity verification creates no
+      Trust bonus and that identity_verified_at compatibility is unambiguous.
+      Report only material evidence-backed findings; do not select unresolved
+      product policy or redesign the phase.
+
+  - id: phase8-verification-trust-correction
+    title: Correct identity verification and Trust findings
+    owner: codex
+    effort: high
+    mode: correction
+    files:
+      - apps/api/src/identity-verification/**
+      - apps/api/src/trust/**
+      - apps/api/src/database/entities/identity.entity.ts
+      - apps/api/src/database/entities/trust.entity.ts
+      - apps/api/src/database/entities/index.ts
+      - apps/api/src/database/entities/mapping-fidelity.int-spec.ts
+      - apps/api/src/database/entities/round-trip.int-spec.ts
+      - apps/api/src/database/migrations/*Phase8*.ts
+      - apps/api/src/database/migrations/sql/*Phase8*.sql
+      - apps/api/src/database/scripts/verify-invariants.sql
+      - apps/api/src/database/scripts/verify-concurrency.sh
+      - apps/api/src/database/scripts/harden-app-role.sql
+      - apps/api/src/database/scripts/verify-app-role-hardening.sql
+      - packages/shared/src/identity-verification.ts
+      - packages/shared/src/identity-verification.test.ts
+      - packages/shared/src/trust.ts
+      - packages/shared/src/trust.test.ts
+      - packages/shared/src/enums.ts
+      - packages/shared/src/index.ts
+      - apps/api/test/phase8-trust-verification/core/**
+    dependsOn:
+      - phase8-verification-trust-review
+    condition:
+      reviewOf: phase8-verification-trust-review
+      skipIfStatus:
+        - approved
+    instructions: |
+      Classify every assigned finding against current code, schema and test
+      evidence. Correct confirmed defects only within Workstream 1 ownership.
+      Preserve the provider-neutral boundary, database authority, append-only
+      ledger and data-minimization rules. Do not resolve a HUMAN_REQUIRED policy
+      choice by assumption; block with explicit evidence when one is essential.
+
+  - id: phase8-verification-trust-final-review
+    title: Final review of identity verification and Trust corrections
+    owner: claude
+    model: sonnet
+    effort: high
+    mode: final_review
+    files: []
+    dependsOn:
+      - phase8-verification-trust-correction
+    condition:
+      reviewOf: phase8-verification-trust-review
+      skipIfStatus:
+        - approved
+    instructions: |
+      Re-check the original Workstream 1 findings against the corrected diff and
+      database-backed evidence. Approve only when every material defect is closed
+      without inventing vendor, retention, expiry, revocation or moderation policy.
+
+  # Workstream 2 — serialized behind the reviewed Workstream 1 contract.
+  - id: phase8-verification-eligibility-integration
+    title: Backend-wide verified-identity eligibility integration
+    owner: codex
+    effort: high
+    mode: implementation
+    files:
+      - apps/api/src/identity-verification/**
+      - apps/api/src/auth/**
+      - apps/api/src/users/**
+      - apps/api/src/settings/**
+      - apps/api/src/consent/**
+      - apps/api/src/health/**
+      - apps/api/src/trips/**
+      - apps/api/src/matching/**
+      - apps/api/src/swipes/**
+      - apps/api/src/events/**
+      - apps/api/src/explorer/**
+      - apps/api/src/chat/**
+      - apps/api/src/realtime/**
+      - apps/api/src/app.module.ts
+      - apps/api/test/phase8-trust-verification/eligibility/**
+    dependsOn:
+      - phase8-verification-trust-final-review
+    instructions: |
+      Integrate the reviewed Workstream 1 eligibility contract across the existing
+      backend. Normal product access requires both a valid authenticated account
+      and current VERIFIED identity state. PENDING, REJECTED, REVOKED and missing
+      verification fail closed for Trips, Matching/traveler discovery, Swipes,
+      Events, join requests/participation, Explorer and Chat/realtime.
+
+      HTTP:
+        - enforce eligibility server-side with a fail-closed guard/composition
+          design; frontend behavior is never authority
+        - make the pre-verification exception surface narrow and explicit: only
+          required authentication/provisioning, safe own-account/profile state,
+          verification status/flow, logout/auth lifecycle and existing required
+          consent/legal/support/health surfaces
+        - prove that adding a normal-product endpoint cannot silently bypass the
+          gate merely because a frontend check was omitted
+        - do not invent a broad public or unverified API
+
+      WebSocket:
+        - authentication alone is insufficient for normal Chat/realtime access
+        - check fresh durable verification state at authorization-sensitive join,
+          send, catch-up and delivery boundaries, including after revocation
+        - Socket.IO membership and Redis are never verification authority
+        - preserve membership, match/event lifecycle, restrictions, bidirectional
+          blocks, durable message authorization and stale-recipient protections
+
+      Verification is cumulative with existing policy. Preserve the Matching
+      formula and minimum Trust preference, Event min_trust_score eligibility,
+      and all account restrictions. Explorer receives only the global verification
+      gate; invent no Explorer Trust threshold. Chat remains Trust-Score-neutral.
+
+      Add focused unit, HTTP integration and real Socket.IO tests covering every
+      lifecycle denial, verified success, explicit pre-verification allowlist,
+      fresh revocation, and regression of existing Phase 7 authorization.
+      Do not add a provider adapter, frontend behavior or unresolved product policy.
+      If correctness requires vendor, expiry, external revocation or authorization
+      policy that is not approved, return a clearly evidenced HUMAN_REQUIRED block.
+
+  - id: phase8-verification-eligibility-review
+    title: Adversarial review of verified-identity eligibility integration
+    owner: claude
+    model: sonnet
+    effort: high
+    mode: review
+    files: []
+    dependsOn:
+      - phase8-verification-eligibility-integration
+    instructions: |
+      Adversarially review all normal HTTP and WebSocket boundaries. Look for a
+      missing endpoint, accidental allowlist, stale verification state, socket or
+      delivery bypass, user-controlled status, or a path where verification
+      replaces rather than composes existing account, block, membership,
+      Matching, Event or Chat authorization. Require concrete evidence and focused
+      regression coverage. Do not broaden scope or choose unresolved policy.
+
+  - id: phase8-verification-eligibility-correction
+    title: Correct verified-identity eligibility findings
+    owner: codex
+    effort: high
+    mode: correction
+    files:
+      - apps/api/src/identity-verification/**
+      - apps/api/src/auth/**
+      - apps/api/src/users/**
+      - apps/api/src/settings/**
+      - apps/api/src/consent/**
+      - apps/api/src/health/**
+      - apps/api/src/trips/**
+      - apps/api/src/matching/**
+      - apps/api/src/swipes/**
+      - apps/api/src/events/**
+      - apps/api/src/explorer/**
+      - apps/api/src/chat/**
+      - apps/api/src/realtime/**
+      - apps/api/src/app.module.ts
+      - apps/api/test/phase8-trust-verification/eligibility/**
+    dependsOn:
+      - phase8-verification-eligibility-review
+    condition:
+      reviewOf: phase8-verification-eligibility-review
+      skipIfStatus:
+        - approved
+    instructions: |
+      Classify and correct confirmed Workstream 2 findings only. Preserve the
+      reviewed verification contract and every existing authorization/Trust
+      prerequisite. Do not weaken fail-closed HTTP/WebSocket behavior, expand the
+      allowlist or invent unresolved provider/revocation policy.
+
+  - id: phase8-verification-eligibility-final-review
+    title: Final review of verified-identity eligibility corrections
+    owner: claude
+    model: sonnet
+    effort: high
+    mode: final_review
+    files: []
+    dependsOn:
+      - phase8-verification-eligibility-correction
+    condition:
+      reviewOf: phase8-verification-eligibility-review
+      skipIfStatus:
+        - approved
+    instructions: |
+      Re-check the original eligibility findings against the corrected diff and
+      HTTP/Socket.IO evidence. Approve only when normal access fails closed for
+      every non-VERIFIED state while the narrow intended pre-verification surface
+      remains usable and all Phase 1–7 authorization remains cumulative.
+
+  - id: phase8-composed-verification
+    title: Phase 8 composed lifecycle, eligibility and Trust verification
+    owner: codex
+    effort: high
+    mode: testing
+    files:
+      - apps/api/test/phase8-trust-verification/**
+    dependsOn:
+      - phase8-verification-trust-final-review
+      - phase8-verification-eligibility-final-review
+    instructions: |
+      Add only composed verification fixtures/tests; do not change production code
+      or make new feature decisions. Include a dedicated tsconfig for this test
+      directory, following the proven Phase 7 composed-test pattern.
+
+      Prove at minimum:
+        - new/missing, PENDING, REJECTED and REVOKED users are denied normal
+          product access; VERIFIED users proceed subject to all existing policy
+        - identical trusted lifecycle assertion is idempotent, a same-key semantic
+          conflict is deterministic, and no user-controlled self-verification path
+          exists
+        - representative Trips, Matching, Swipes, Events, join requests, Explorer
+          and Chat HTTP endpoints deny unverified access while the explicit minimal
+          pre-verification surface remains reachable
+        - authenticated but unverified sockets cannot gain social access; verified
+          sockets retain all Phase 7 membership/block/restriction checks; revoked
+          users fail at fresh authorization and delivery boundaries
+        - users.trust_score_raw equals 5.000 plus the ledger delta sum and the
+          public score is clamp(raw, 0, 10)
+        - the ledger is append-only; concurrent duplicate occurrence has one
+          effect; conflicting semantics fail; reversals are exact and unique;
+          protected projections cannot be directly mutated through the app role
+        - verification creates zero arbitrary Trust bonus
+        - Matching remains 0.40 I + 0.30 T + 0.20 S + 0.10 P with SQL/TypeScript
+          parity and its existing Trust floor; Event minimum Trust, Explorer,
+          account restrictions, blocks and Phase 7 Chat retain their semantics
+        - PostgreSQL remains verification/Trust authority and Redis is never one
+
+      Use the real migrated PostgreSQL/PostGIS test database and real Socket.IO
+      frames where the behavior crosses those boundaries. Do not create vendor,
+      moderator, report, frontend, payment or policy-engine fixtures disguised as
+      product implementation.
+
+  - id: phase8-final-review
+    title: Final independent Phase 8 review
+    owner: claude
+    model: sonnet
+    effort: high
+    mode: final_review
+    files: []
+    dependsOn:
+      - phase8-composed-verification
+    instructions: |
+      Review the composed Phase 8 diff and test evidence against the canonical
+      design; do not redesign the feature. Explicitly verify mandatory identity
+      eligibility across HTTP and WebSocket, absence of a hidden vendor choice or
+      self-verification path, zero Trust bonus from verification, absence of raw
+      documents/biometrics/provider payload storage, Trust-ledger authority and
+      reversal correctness, and compatibility across Phases 1–7. Surface any
+      genuinely unresolved approved-policy dependency as HUMAN_REQUIRED rather
+      than inventing an answer.
+
+integration:
+  prepare:
+    - command: pnpm install --frozen-lockfile
+      required: true
+      timeoutMs: 900000
+    - command: pnpm --filter @tripwith/shared build
+      required: true
+      timeoutMs: 300000
+  commands:
+    - command: pnpm --filter @tripwith/shared typecheck
+      required: true
+      timeoutMs: 300000
+    - command: pnpm --filter @tripwith/shared build
+      required: true
+      timeoutMs: 300000
+    - command: pnpm --filter @tripwith/shared test
+      required: true
+      timeoutMs: 600000
+    - command: pnpm --filter @tripwith/api typecheck
+      required: true
+      timeoutMs: 600000
+    - command: pnpm --filter @tripwith/api build
+      required: true
+      timeoutMs: 600000
+    - command: pnpm run db:migrate
+      required: true
+      timeoutMs: 600000
+    - command: pnpm --filter @tripwith/api exec tsc -p test/phase8-trust-verification/tsconfig.json
+      required: true
+      timeoutMs: 600000
+    - command: >-
+        pnpm --filter @tripwith/api test -- --runInBand
+        --testPathPattern='src/(identity-verification|trust)/.*\.(spec|int-spec)\.ts$|test/phase8-trust-verification/.*\.int-spec\.ts$'
+      required: true
+      timeoutMs: 1800000
+    - command: pnpm --filter @tripwith/api exec tsc -p test/phase7-chat-realtime/tsconfig.json
+      required: true
+      timeoutMs: 600000
+    - command: >-
+        pnpm --filter @tripwith/api test -- --runInBand
+        --testPathPattern='src/(auth|swipes|events|database|chat)/.*\.spec\.ts$'
+      required: true
+      timeoutMs: 1800000
+    - command: >-
+        pnpm --filter @tripwith/api test -- --runInBand --runTestsByPath
+        test/phase7-chat-realtime/composed.int-spec.ts
+      required: true
+      timeoutMs: 1800000
+    - command: >-
+        pnpm --filter @tripwith/api test -- --runInBand
+        --testPathPattern='src/(swipes|events|database|chat)/.*\.int-spec\.ts$'
+      required: true
+      timeoutMs: 1800000
+    - command: pnpm run check:enums
+      required: true
+      timeoutMs: 600000
+    - command: pnpm run db:revert && pnpm run db:migrate
+      required: true
+      timeoutMs: 900000
+    - command: pnpm --filter @tripwith/api db:verify
+      required: true
+      timeoutMs: 1800000
+    - command: >-
+        if psql "$DATABASE_URL" -Atqc "SELECT 1 FROM pg_roles WHERE rolname = 'tripwith_app'" | grep -qx 1;
+        then psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -v app_role=tripwith_app
+        -f apps/api/src/database/scripts/verify-app-role-hardening.sql;
+        else printf '%s\n' 'App-role hardening verification skipped: tripwith_app role is unavailable'; fi
+      required: true
+      timeoutMs: 600000
+    - command: pnpm --filter @tripwith/api test -- --runInBand --detectOpenHandles
+      required: true
+      timeoutMs: 1800000
+    - command: git diff --check
+      required: true
+      timeoutMs: 300000
+  diagnostics: []
+
+# Explicit Phase 8 boundary: no vendor integration, document upload/storage,
+# biometrics, moderator/admin UI or API, report workflow, automated moderation,
+# Trust ML, graph/vector database, generic rules/policy engine, payment change,
+# frontend/mobile implementation, orchestrator change, Router, automatic
+# Coordinator execution, or Coordinator Shadow task.
