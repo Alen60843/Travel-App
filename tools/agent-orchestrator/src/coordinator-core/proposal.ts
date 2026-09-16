@@ -41,8 +41,11 @@ function strictKeys(value: Record<string, unknown>, allowed: readonly string[], 
 }
 
 function required(value: Record<string, unknown>, key: string, path: string): unknown {
-  if (!Object.prototype.hasOwnProperty.call(value, key)) invalid(`${path}.${key} is required`);
-  return value[key];
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
+    invalid(`${path}.${key} must be an enumerable data property`);
+  }
+  return descriptor.value;
 }
 
 function boundedText(value: unknown, path: string, maximumBytes: number): string {
@@ -82,10 +85,33 @@ function referenceKey(reference: CoordinatorReference): string {
 
 function parseReferences(value: unknown): readonly CoordinatorReference[] {
   if (!Array.isArray(value)) invalid('supportingReferences must be an array');
-  if (value.length > MAX_COORDINATOR_REFERENCES) {
+  if (Object.getPrototypeOf(value) !== Array.prototype) {
+    invalid('supportingReferences must use Array.prototype');
+  }
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+  if (lengthDescriptor === undefined || !('value' in lengthDescriptor)
+    || !Number.isSafeInteger(lengthDescriptor.value) || lengthDescriptor.value < 0) {
+    invalid('supportingReferences length must be an array data property');
+  }
+  const length = lengthDescriptor.value as number;
+  if (length > MAX_COORDINATOR_REFERENCES) {
     invalid(`supportingReferences exceeds ${MAX_COORDINATOR_REFERENCES} entries`);
   }
-  const references = Array.from(value, (entry, index) => parseReference(entry, index));
+  const allowedKeys = new Set<string>(['length']);
+  const references: CoordinatorReference[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const key = String(index);
+    allowedKeys.add(key);
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
+      invalid(`supportingReferences[${index}] must be an enumerable data property`);
+    }
+    references.push(parseReference(descriptor.value, index));
+  }
+  const extra = Reflect.ownKeys(value).filter((key) => typeof key !== 'string' || !allowedKeys.has(key));
+  if (extra.length > 0) {
+    invalid(`supportingReferences has unsupported fields: ${extra.map(String).sort().join(', ')}`);
+  }
   const keys = references.map(referenceKey);
   if (new Set(keys).size !== keys.length) invalid('supportingReferences must not contain duplicates');
   return references;

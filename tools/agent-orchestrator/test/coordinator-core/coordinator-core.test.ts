@@ -234,6 +234,135 @@ test('strict parser rejects inherited fields, class instances, symbols, and spar
   })));
 });
 
+test('strict parser rejects a top-level decision getter without invoking it', () => {
+  const input = proposal('no_action') as Record<string, unknown>;
+  let calls = 0;
+  Object.defineProperty(input, 'decision', { enumerable: true, get: () => {
+    calls += 1;
+    return 'no_action';
+  } });
+  assert.throws(() => parseCoordinatorProposal(input));
+  assert.equal(calls, 0);
+});
+
+test('strict parser rejects a top-level reason getter without invoking it', () => {
+  const input = proposal('no_action') as Record<string, unknown>;
+  let calls = 0;
+  Object.defineProperty(input, 'reason', { enumerable: true, get: () => {
+    calls += 1;
+    return 'A bounded reason.';
+  } });
+  assert.throws(() => parseCoordinatorProposal(input));
+  assert.equal(calls, 0);
+});
+
+test('strict parser rejects a select_action actionId getter without invoking it', () => {
+  const input = proposal('select_action') as Record<string, unknown>;
+  let calls = 0;
+  Object.defineProperty(input, 'actionId', { enumerable: true, get: () => {
+    calls += 1;
+    return 'RETRY_REVIEW_OUTPUT';
+  } });
+  assert.throws(() => parseCoordinatorProposal(input));
+  assert.equal(calls, 0);
+});
+
+test('strict parser rejects a supportingReferences getter without invoking it', () => {
+  const input = proposal('no_action') as Record<string, unknown>;
+  let calls = 0;
+  Object.defineProperty(input, 'supportingReferences', { enumerable: true, get: () => {
+    calls += 1;
+    return [];
+  } });
+  assert.throws(() => parseCoordinatorProposal(input));
+  assert.equal(calls, 0);
+});
+
+test('strict parser rejects a nested reference kind getter without invoking it', () => {
+  const reference: Record<string, unknown> = { reference: evidenceReference };
+  let calls = 0;
+  Object.defineProperty(reference, 'kind', { enumerable: true, get: () => {
+    calls += 1;
+    return 'current_evidence';
+  } });
+  assert.throws(() => parseCoordinatorProposal(proposal('no_action', {
+    supportingReferences: [reference],
+  })));
+  assert.equal(calls, 0);
+});
+
+test('strict parser rejects a nested reference payload getter without invoking it', () => {
+  const reference: Record<string, unknown> = { kind: 'memory' };
+  let calls = 0;
+  Object.defineProperty(reference, 'memoryId', { enumerable: true, get: () => {
+    calls += 1;
+    return '0'.repeat(64);
+  } });
+  assert.throws(() => parseCoordinatorProposal(proposal('no_action', {
+    supportingReferences: [reference],
+  })));
+  assert.equal(calls, 0);
+});
+
+test('strict parser rejects setter-only and non-enumerable required fields', () => {
+  const setterOnly = proposal('no_action') as Record<string, unknown>;
+  Object.defineProperty(setterOnly, 'reason', { enumerable: true, set: () => undefined });
+  const nonEnumerable = proposal('no_action') as Record<string, unknown>;
+  Object.defineProperty(nonEnumerable, 'decision', { enumerable: false, value: 'no_action' });
+  assert.throws(() => parseCoordinatorProposal(setterOnly));
+  assert.throws(() => parseCoordinatorProposal(nonEnumerable));
+});
+
+test('strict parser rejects accessor array elements without invoking them', () => {
+  const references: unknown[] = [];
+  let calls = 0;
+  Object.defineProperty(references, '0', { enumerable: true, get: () => {
+    calls += 1;
+    return { kind: 'current_evidence', reference: evidenceReference };
+  } });
+  assert.throws(() => parseCoordinatorProposal(proposal('no_action', {
+    supportingReferences: references,
+  })));
+  assert.equal(calls, 0);
+});
+
+test('strict parser rejects nonstandard, non-dense, and extra-property reference arrays', () => {
+  const nonstandard: unknown[] = [];
+  Object.setPrototypeOf(nonstandard, null);
+  const nonEnumerable: unknown[] = [];
+  Object.defineProperty(nonEnumerable, '0', {
+    enumerable: false,
+    value: { kind: 'current_evidence', reference: evidenceReference },
+  });
+  const extra = [{ kind: 'current_evidence', reference: evidenceReference }];
+  Object.defineProperty(extra, 'other', { enumerable: true, value: true });
+  for (const supportingReferences of [nonstandard, nonEnumerable, extra]) {
+    assert.throws(() => parseCoordinatorProposal(proposal('no_action', { supportingReferences })));
+  }
+});
+
+test('strict parser continues to accept a normal JSON.parse-produced proposal', () => {
+  const input = JSON.parse(JSON.stringify(proposal('select_action', {
+    supportingReferences: [{ kind: 'current_evidence', reference: evidenceReference }],
+  }))) as unknown;
+  assert.deepEqual(parseCoordinatorProposal(input), input);
+});
+
+test('strict parser continues to accept null-prototype enumerable data objects', () => {
+  const input = Object.assign(Object.create(null) as Record<string, unknown>, {
+    version: 1,
+    decision: 'human_required',
+    reason: 'Human review is required.',
+    supportingReferences: [],
+  });
+  assert.deepEqual(parseCoordinatorProposal(input), {
+    version: 1,
+    decision: 'human_required',
+    reason: 'Human review is required.',
+    supportingReferences: [],
+  });
+});
+
 test('all three valid supporting-reference kinds resolve exactly', async () => {
   const entries = history();
   const input = context('diagnosed', { history: entries });
