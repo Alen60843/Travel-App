@@ -17,6 +17,9 @@ import { diagnoseFailure } from './failure-intelligence/classifier';
 import { mapFailureToActions } from './action-mapping/mapper';
 import type { ActionCandidate } from './action-mapping/types';
 import { MemoryStore, projectDiagnosisToMemory } from './memory';
+import { resolveAgentExecutable } from './agents/executable-resolution';
+import { ClaudeCoordinatorReasoner } from './coordinator-providers';
+import { coordinateShadowRun } from './coordinator-shadow';
 
 const USAGE = `TripWith local agent orchestrator
 
@@ -28,6 +31,7 @@ Usage:
   pnpm agents:cleanup <run-id>
   pnpm agents:metrics <run-id>
   pnpm agents:diagnose <run-id> [task-id]
+  pnpm agents:coordinate-shadow:claude <run-id> [task-id]
   pnpm agents:remember-diagnosis <run-id> [task-id]
   pnpm agents:recover-handoffs <run-id>
   pnpm agents:retry-agent <run-id> <task-id>
@@ -54,6 +58,9 @@ metrics is read-only: it recomputes a summary from persisted run artifacts and n
 touches agents, worktrees, or state.
 diagnose is read-only: it deterministically classifies only the current active blocker
 from persisted evidence and recommends, but never executes or authorizes, a bounded action.
+coordinate-shadow:claude is an explicit read-only, non-authoritative provider call. It loads
+diagnosis, Memory, and bounded navigation context; prints a shadow Coordinator result; and
+never executes, authorizes, persists, retries, resumes, or mutates the selected run.
 remember-diagnosis explicitly persists only the current structured diagnosis and mapped
 candidate facts in repository Memory. It never mutates the run or executes a candidate.
 normalize-replan-evidence explicitly records one deterministic test-to-file interpretation
@@ -405,6 +412,36 @@ async function main(argv: readonly string[]): Promise<number> {
       },
     }, null, 2)}\n`);
     return 0;
+  }
+  if (command === 'coordinate-shadow-claude') {
+    const [taskId] = extra;
+    if (argument === undefined || extra.length > 1) {
+      process.stderr.write('Usage: coordinate-shadow-claude <run-id> [task-id]\n');
+      return 1;
+    }
+    const cancellation = installCancellationSignal();
+    try {
+      const repositoryRoot = await new GitClient().repositoryRoot(process.cwd());
+      const executable = await resolveAgentExecutable('claude');
+      if (executable === null) {
+        throw new Error('Claude executable could not be resolved for Shadow Coordinator');
+      }
+      const reasoner = new ClaudeCoordinatorReasoner({
+        executable: executable.path,
+        workingDirectory: repositoryRoot,
+        abortSignal: cancellation.signal,
+      });
+      const report = await coordinateShadowRun({
+        repositoryRoot,
+        runId: argument,
+        ...(taskId === undefined ? {} : { taskId }),
+        reasoner,
+      });
+      process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+      return 0;
+    } finally {
+      cancellation.dispose();
+    }
   }
   if (command === 'remember-diagnosis') {
     const [taskId] = extra;

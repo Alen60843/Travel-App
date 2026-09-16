@@ -6,6 +6,7 @@ import {
   FINDING_SEVERITIES,
   REVIEW_STATUSES,
 } from '../review/findings';
+import { extractClaudeStructuredOutput } from '../protocol/claude-structured-output';
 import type { AgentName, AgentRole } from './agent';
 import { parseJsonOrNull } from './process-agent';
 
@@ -166,16 +167,7 @@ export function usesClaudeStructuredReviewOutput(role: AgentRole): boolean {
 export function extractClaudeStructuredReviewOutput(
   rawStdout: string | null,
 ): unknown | null {
-  const envelope = parseJsonOrNull(rawStdout);
-  if (!isRecord(envelope)
-    || envelope.type !== 'result'
-    || envelope.subtype !== 'success'
-    || envelope.is_error !== false
-    || !Object.prototype.hasOwnProperty.call(envelope, 'structured_output')
-    || envelope.structured_output === null) {
-    return null;
-  }
-  return envelope.structured_output;
+  return extractClaudeStructuredOutput(rawStdout);
 }
 
 /**
@@ -195,8 +187,4 @@ export function extractStructuredHandoffFromStdout(input: {
     && input.structuredOutputContractId !== undefined
     ? extractClaudeStructuredReviewOutput(input.rawStdout)
     : parseJsonOrNull(input.rawStdout);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
