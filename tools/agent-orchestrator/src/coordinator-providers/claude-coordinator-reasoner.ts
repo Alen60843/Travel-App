@@ -23,72 +23,38 @@ export const CLAUDE_COORDINATOR_CAPABILITY_PROFILE: CapabilityProfile = Object.f
   capabilities: Object.freeze(['structured_reasoning', 'structured_output'] as const),
 });
 
-const referenceSchemas = [
-  {
-    type: 'object',
-    additionalProperties: false,
-    required: ['kind', 'reference'],
-    properties: {
-      kind: { type: 'string', enum: ['current_evidence'] },
-      reference: { type: 'string', minLength: 1, maxLength: MAX_COORDINATOR_REFERENCE_BYTES },
-    },
-  },
-  {
-    type: 'object',
-    additionalProperties: false,
-    required: ['kind', 'memoryId'],
-    properties: {
-      kind: { type: 'string', enum: ['memory'] },
-      memoryId: { type: 'string', minLength: 1, maxLength: MAX_COORDINATOR_REFERENCE_BYTES },
-    },
-  },
-  {
-    type: 'object',
-    additionalProperties: false,
-    required: ['kind', 'path'],
-    properties: {
-      kind: { type: 'string', enum: ['repository_hint'] },
-      path: { type: 'string', minLength: 1, maxLength: MAX_COORDINATOR_REFERENCE_BYTES },
-    },
-  },
-] as const;
-
-const commonProperties = {
-  version: { type: 'integer', enum: [1] },
-  reason: { type: 'string', minLength: 1, maxLength: MAX_COORDINATOR_REASON_BYTES },
-  supportingReferences: {
-    type: 'array',
-    maxItems: MAX_COORDINATOR_REFERENCES,
-    items: { oneOf: referenceSchemas },
+const referenceSchema = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['kind'],
+  properties: {
+    kind: { type: 'string', enum: ['current_evidence', 'memory', 'repository_hint'] },
+    reference: { type: 'string', minLength: 1, maxLength: MAX_COORDINATOR_REFERENCE_BYTES },
+    memoryId: { type: 'string', minLength: 1, maxLength: MAX_COORDINATOR_REFERENCE_BYTES },
+    path: { type: 'string', minLength: 1, maxLength: MAX_COORDINATOR_REFERENCE_BYTES },
   },
 } as const;
 
-/** Transport defense-in-depth; parseCoordinatorProposal remains semantic authority. */
+/**
+ * Combinator-free Claude transport defense-in-depth. This intentionally
+ * permits semantically invalid field combinations; parseCoordinatorProposal
+ * remains the sole semantic authority.
+ */
 export const CLAUDE_COORDINATOR_PROPOSAL_SCHEMA = {
-  oneOf: [
-    {
-      type: 'object',
-      additionalProperties: false,
-      required: ['version', 'decision', 'reason', 'supportingReferences'],
-      properties: { ...commonProperties, decision: { type: 'string', enum: ['no_action'] } },
+  type: 'object',
+  additionalProperties: false,
+  required: ['version', 'decision', 'reason', 'supportingReferences'],
+  properties: {
+    version: { type: 'integer', enum: [1] },
+    decision: { type: 'string', enum: ['no_action', 'select_action', 'human_required'] },
+    actionId: { type: 'string', enum: ACTION_IDS },
+    reason: { type: 'string', minLength: 1, maxLength: MAX_COORDINATOR_REASON_BYTES },
+    supportingReferences: {
+      type: 'array',
+      maxItems: MAX_COORDINATOR_REFERENCES,
+      items: referenceSchema,
     },
-    {
-      type: 'object',
-      additionalProperties: false,
-      required: ['version', 'decision', 'actionId', 'reason', 'supportingReferences'],
-      properties: {
-        ...commonProperties,
-        decision: { type: 'string', enum: ['select_action'] },
-        actionId: { type: 'string', enum: ACTION_IDS },
-      },
-    },
-    {
-      type: 'object',
-      additionalProperties: false,
-      required: ['version', 'decision', 'reason', 'supportingReferences'],
-      properties: { ...commonProperties, decision: { type: 'string', enum: ['human_required'] } },
-    },
-  ],
+  },
 } as const;
 
 export interface ClaudeCoordinatorReasonerOptions {

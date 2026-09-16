@@ -47,10 +47,19 @@ resolved path to runtime, preventing discovery/spawn disagreement.
 
 ## Structured output and authority
 
-The transport schema has three strict variants: `no_action`, `select_action`,
-and `human_required`. Every object and reference variant rejects additional
-properties; action IDs use the stable production enum; strings and reference
-counts carry structural bounds.
+With the verified local Claude Code `2.1.71` setup, structured output was
+empirically observed to stall on JSON Schemas using `oneOf`, including a tiny
+two-branch reproduction, while simple object schemas completed normally. This
+is a description of that verified setup, not a claim about every Claude
+version or environment.
+
+The Coordinator transport schema is therefore one intentionally flat,
+combinator-free object. It bounds known fields, decision and action enums,
+reference count, reference kinds, and string lengths, and rejects unknown
+fields. `actionId` and the three reference payload fields are optional at the
+transport layer because their conditional relationships require branching.
+The flat reference item similarly requires only `kind` while exposing the
+known `reference`, `memoryId`, and `path` fields.
 
 Claude returns a JSON provider envelope. A small generic envelope helper,
 shared with the existing structured-review path, accepts only a verified
@@ -58,10 +67,15 @@ success envelope and extracts only `structured_output`. Missing, null,
 malformed, or provider-error envelopes fail closed. The established review
 wrapper remains API-compatible and retains its prior semantics.
 
-Schema validation is transport defense-in-depth. The extracted value remains
-untrusted, and `parseCoordinatorProposal()` remains the sole runtime and
-semantic authority, including UTF-8 byte limits, hostile-runtime rules,
-current-action selection, evidence existence, and status truth tables.
+Schema validation is transport defense-in-depth only. It may admit invalid
+field combinations, such as `no_action` with `actionId` or a `memory` reference
+with `path`. The extracted value remains untrusted, and
+`parseCoordinatorProposal()` remains the sole runtime and semantic authority,
+including variant field relationships, UTF-8 byte limits, and hostile-runtime
+rules. Coordinator Core remains the current-state authority for action
+selection, evidence existence, historical/current separation, and status truth
+tables. Flattening the transport schema grants the model no additional
+authority.
 
 ## Bounded process behavior
 

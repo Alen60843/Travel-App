@@ -5,7 +5,11 @@ import { join, resolve } from 'node:path';
 import test from 'node:test';
 
 import { canonicalJson } from '../../src/canonical-json';
-import { coordinate, type CoordinatorReasoner } from '../../src/coordinator-core';
+import {
+  coordinate,
+  parseCoordinatorProposal,
+  type CoordinatorReasoner,
+} from '../../src/coordinator-core';
 import {
   CLAUDE_COORDINATOR_CAPABILITY_PROFILE,
   CLAUDE_COORDINATOR_PROPOSAL_SCHEMA,
@@ -85,24 +89,67 @@ test('one propose call spawns once, sends the complete canonical context on stdi
   } finally { await fixture.dispose(); }
 });
 
-test('transport schema is strict, bounded, and covers all proposal/reference variants', () => {
-  assert.equal(CLAUDE_COORDINATOR_PROPOSAL_SCHEMA.oneOf.length, 3);
-  assert.deepEqual(CLAUDE_COORDINATOR_PROPOSAL_SCHEMA.oneOf.map((entry) => entry.properties.decision.enum[0]),
-    ['no_action', 'select_action', 'human_required']);
-  for (const variant of CLAUDE_COORDINATOR_PROPOSAL_SCHEMA.oneOf) {
-    assert.equal(variant.additionalProperties, false);
-    assert.equal(variant.properties.supportingReferences.maxItems, 16);
-    const references = variant.properties.supportingReferences.items.oneOf;
-    assert.deepEqual(references.map((entry) => entry.properties.kind.enum[0]),
-      ['current_evidence', 'memory', 'repository_hint']);
-    assert.ok(references.every((entry) => entry.additionalProperties === false));
-  }
-  const select = CLAUDE_COORDINATOR_PROPOSAL_SCHEMA.oneOf[1];
-  assert.ok(select.required.includes('actionId'));
-  assert.deepEqual(select.properties.actionId.enum, [
+test('production transport schema is flat and contains no JSON Schema combinators', () => {
+  const keys = collectKeys(CLAUDE_COORDINATOR_PROPOSAL_SCHEMA);
+  for (const forbidden of [
+    'oneOf', 'anyOf', 'allOf', 'if', 'then', 'else', 'dependentSchemas', 'discriminator',
+  ]) assert.equal(keys.has(forbidden), false, forbidden);
+});
+
+test('flat transport schema bounds known proposal and reference fields without conditional semantics', () => {
+  const schema = CLAUDE_COORDINATOR_PROPOSAL_SCHEMA;
+  assert.equal(schema.type, 'object');
+  assert.equal(schema.additionalProperties, false);
+  assert.deepEqual(schema.required, ['version', 'decision', 'reason', 'supportingReferences']);
+  assert.deepEqual(schema.properties.decision.enum, ['no_action', 'select_action', 'human_required']);
+  assert.equal((schema.required as readonly string[]).includes('actionId'), false);
+  assert.deepEqual(schema.properties.actionId.enum, [
     'REPIN_AGENT_EXECUTABLE', 'RETRY_REVIEW_OUTPUT', 'CONTINUE_CLAUDE_REVIEW_OUTPUT',
     'PROPOSE_REPLAN', 'RETRY_INTEGRATION', 'MANUAL_INSPECTION',
   ]);
+  assert.equal(schema.properties.supportingReferences.maxItems, 16);
+  const reference = schema.properties.supportingReferences.items;
+  assert.equal(reference.additionalProperties, false);
+  assert.deepEqual(reference.required, ['kind']);
+  assert.deepEqual(reference.properties.kind.enum,
+    ['current_evidence', 'memory', 'repository_hint']);
+  assert.deepEqual(Object.keys(reference.properties), ['kind', 'reference', 'memoryId', 'path']);
+});
+
+test('runtime parser accepts all three valid proposal variants under the flat transport schema', () => {
+  const proposals = [
+    {
+      version: 1, decision: 'no_action', reason: 'No action.', supportingReferences: [],
+    },
+    {
+      version: 1, decision: 'select_action', actionId: 'RETRY_REVIEW_OUTPUT',
+      reason: 'Retry the current malformed review.',
+      supportingReferences: [{ kind: 'current_evidence', reference: 'task:review.error' }],
+    },
+    {
+      version: 1, decision: 'human_required', reason: 'Human judgment is required.',
+      supportingReferences: [{ kind: 'repository_hint', path: 'tools/agent-orchestrator' }],
+    },
+  ];
+  for (const proposal of proposals) assert.deepEqual(parseCoordinatorProposal(proposal), proposal);
+});
+
+test('runtime parser rejects semantic combinations intentionally representable by the flat schema', () => {
+  const schema = CLAUDE_COORDINATOR_PROPOSAL_SCHEMA;
+  assert.equal((schema.required as readonly string[]).includes('actionId'), false);
+  assert.deepEqual(schema.properties.supportingReferences.items.required, ['kind']);
+  assert.ok('path' in schema.properties.supportingReferences.items.properties);
+  assert.ok('memoryId' in schema.properties.supportingReferences.items.properties);
+
+  const base = { version: 1, reason: 'Transport-valid but semantically invalid.', supportingReferences: [] };
+  for (const proposal of [
+    { ...base, decision: 'no_action', actionId: 'RETRY_REVIEW_OUTPUT' },
+    { ...base, decision: 'select_action' },
+    { ...base, decision: 'no_action', supportingReferences: [{ kind: 'memory', path: 'wrong' }] },
+    { ...base, decision: 'no_action', supportingReferences: [
+      { kind: 'current_evidence', reference: 'run.status', memoryId: 'extra' },
+    ] },
+  ]) assert.throws(() => parseCoordinatorProposal(proposal));
 });
 
 test('valid success envelope returns structured_output rather than the provider envelope', async () => {
@@ -189,10 +236,16 @@ for (const behavior of ['oversized_stdout', 'oversized_stderr'] as const) {
   });
 }
 
-test('schema transport never replaces Coordinator Core semantic validation', async () => {
+test('schema-valid but currently unavailable action remains PROPOSAL_INVALID through Coordinator Core', async () => {
   const fixture = await createFixture();
   try {
-    const invalid = { ...validProposal(), reason: '   ' };
+    const invalid = {
+      version: 1,
+      decision: 'select_action',
+      actionId: 'RETRY_REVIEW_OUTPUT',
+      reason: 'Select an action that is not a current candidate.',
+      supportingReferences: [],
+    };
     const result = await coordinate(context, reasoner(fixture, { FAKE_RESPONSE: JSON.stringify(invalid) }));
     assert.deepEqual(result, {
       version: 1,
@@ -273,4 +326,17 @@ function assertArgPair(args: readonly string[], flag: string, value: string): vo
   const index = args.indexOf(flag);
   assert.notEqual(index, -1, flag);
   assert.equal(args[index + 1], value);
+}
+
+function collectKeys(value: unknown, keys = new Set<string>()): ReadonlySet<string> {
+  if (Array.isArray(value)) {
+    for (const item of value) collectKeys(item, keys);
+    return keys;
+  }
+  if (typeof value !== 'object' || value === null) return keys;
+  for (const [key, child] of Object.entries(value)) {
+    keys.add(key);
+    collectKeys(child, keys);
+  }
+  return keys;
 }
