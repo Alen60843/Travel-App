@@ -20,6 +20,10 @@ function sameSubject(left: MemorySubject, right: MemorySubject): boolean {
   return canonicalJson(left) === canonicalJson(right);
 }
 
+function sameRunProvenance(left: MemoryEntry, right: MemoryEntry): boolean {
+  return left.provenance.runId === right.provenance.runId;
+}
+
 function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
@@ -79,6 +83,9 @@ export function buildMemoryGraph(entries: readonly MemoryEntry[]): MemoryGraph {
       if (!sameSubject(entry.subject, target.subject)) {
         corrupt(`action ${entry.id} and failure ${referencedId} have incompatible subjects`);
       }
+      if (!sameRunProvenance(entry, target)) {
+        corrupt(`action ${entry.id} and failure ${referencedId} have incompatible run provenance`);
+      }
       if (entry.data.basisClassification !== target.data.classification) {
         corrupt(`action ${entry.id} and failure ${referencedId} have incompatible classifications`);
       }
@@ -95,6 +102,9 @@ export function buildMemoryGraph(entries: readonly MemoryEntry[]): MemoryGraph {
       }
       if (!sameSubject(entry.subject, target.subject)) {
         corrupt(`outcome ${entry.id} and action ${referencedId} have incompatible subjects`);
+      }
+      if (!sameRunProvenance(entry, target)) {
+        corrupt(`outcome ${entry.id} and action ${referencedId} have incompatible run provenance`);
       }
       addEdge({ relation: 'OUTCOME', source: memory(referencedId), target: entryNode });
       continue;

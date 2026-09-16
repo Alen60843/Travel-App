@@ -21,7 +21,7 @@ The closed v1 relations are:
 
 No relation is inferred from prose. In particular, v1 does not claim causality, dependency, supersession, or resolution.
 
-Before emitting a candidate-action edge, the referenced entry must exist, be the exact referenced `FAILURE`, have the same structured subject, and have a classification equal to `basisClassification`. Before emitting an outcome edge, the referenced entry must exist, be the exact referenced `ACTION_CANDIDATE`, and have the same subject. Invalid or wrong-kind references fail closed with `STATE_CORRUPT`. A `FAILURE` with no candidate action is valid.
+Before emitting a candidate-action edge, the referenced entry must exist, be the exact referenced `FAILURE`, have the same structured subject and exact `provenance.runId`, and have a classification equal to `basisClassification`. Before emitting an outcome edge, the referenced entry must exist, be the exact referenced `ACTION_CANDIDATE`, and have the same subject and exact `provenance.runId`. Two absent run IDs remain compatible, but an absent run ID is never a wildcard for a present one. Invalid, wrong-kind, or cross-run references fail closed with `STATE_CORRUPT`. A `FAILURE` with no candidate action is valid.
 
 ## Exact relevant memory
 

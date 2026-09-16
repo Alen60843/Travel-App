@@ -27,7 +27,7 @@ function provenance(
 }
 
 function failure(
-  runId = 'run-a',
+  runId: string | null = 'run-a',
   classification: FailureMemoryBody['data']['classification'] = 'AGENT_EXECUTABLE_DRIFT',
   subject: MemorySubject = taskSubject,
 ): Extract<MemoryEntry, { readonly kind: 'FAILURE' }> {
@@ -36,7 +36,7 @@ function failure(
     kind: 'FAILURE',
     subject,
     data: { diagnosisVersion: 1, classification },
-    provenance: provenance('failure_diagnosis', subject, runId),
+    provenance: provenance('failure_diagnosis', subject, runId ?? undefined),
   }) as Extract<MemoryEntry, { readonly kind: 'FAILURE' }>;
 }
 
@@ -46,7 +46,7 @@ function action(
     sourceId?: string;
     subject?: MemorySubject;
     classification?: FailureMemoryBody['data']['classification'];
-    runId?: string;
+    runId?: string | null;
   } = {},
 ): Extract<MemoryEntry, { readonly kind: 'ACTION_CANDIDATE' }> {
   const subject = options.subject ?? source.subject;
@@ -65,13 +65,14 @@ function action(
       basisClassification: options.classification ?? 'AGENT_EXECUTABLE_DRIFT',
       sourceFailureMemoryId: options.sourceId ?? source.id,
     },
-    provenance: provenance('action_mapping', subject, options.runId ?? source.provenance.runId),
+    provenance: provenance('action_mapping', subject,
+      options.runId === null ? undefined : options.runId ?? source.provenance.runId),
   }) as Extract<MemoryEntry, { readonly kind: 'ACTION_CANDIDATE' }>;
 }
 
 function outcome(
   source: MemoryEntry,
-  options: { sourceId?: string; subject?: MemorySubject; runId?: string } = {},
+  options: { sourceId?: string; subject?: MemorySubject; runId?: string | null } = {},
 ): Extract<MemoryEntry, { readonly kind: 'OUTCOME' }> {
   const subject = options.subject ?? source.subject;
   return createMemoryEntry({
@@ -79,7 +80,8 @@ function outcome(
     kind: 'OUTCOME',
     subject,
     data: { sourceActionMemoryId: options.sourceId ?? source.id, status: 'succeeded', resultCode: 'verified' },
-    provenance: provenance('outcome', subject, options.runId ?? source.provenance.runId),
+    provenance: provenance('outcome', subject,
+      options.runId === null ? undefined : options.runId ?? source.provenance.runId),
   }) as Extract<MemoryEntry, { readonly kind: 'OUTCOME' }>;
 }
 
@@ -171,11 +173,70 @@ test('ACTION_CANDIDATE creates the exact FAILURE to candidate relation', () => {
     { kind: 'memory', memoryId: f.id }, { kind: 'memory', memoryId: a.id }));
 });
 
+test('action and failure with the same subject but different runIds fail closed', () => {
+  const f = failure('run-a');
+  const a = action(f, { runId: 'run-b' });
+  assert.throws(() => buildMemoryGraph([f, a]), (error) => isOrchestratorError(error, 'STATE_CORRUPT'));
+});
+
+test('action runId present and failure runId absent fails closed', () => {
+  const f = failure(null);
+  const a = action(f, { runId: 'run-a' });
+  assert.throws(() => buildMemoryGraph([f, a]), (error) => isOrchestratorError(error, 'STATE_CORRUPT'));
+});
+
+test('action runId absent and failure runId present fails closed', () => {
+  const f = failure('run-a');
+  const a = action(f, { runId: null });
+  assert.throws(() => buildMemoryGraph([f, a]), (error) => isOrchestratorError(error, 'STATE_CORRUPT'));
+});
+
+test('action and failure with both runIds absent remain valid', () => {
+  const f = failure(null);
+  const a = action(f, { runId: null });
+  assert.ok(hasEdge(buildMemoryGraph([f, a]).edges, 'CANDIDATE_ACTION',
+    { kind: 'memory', memoryId: f.id }, { kind: 'memory', memoryId: a.id }));
+});
+
+test('same taskId across runs cannot authorize a cross-run sourceFailureMemoryId', () => {
+  const f = failure('run-a');
+  const a = action(f, { runId: 'run-b', sourceId: f.id });
+  assert.throws(() => buildMemoryGraph([f, a]), (error) => isOrchestratorError(error, 'STATE_CORRUPT'));
+});
+
 test('OUTCOME creates the exact ACTION_CANDIDATE to outcome relation', () => {
   const f = failure();
   const a = action(f);
   const o = outcome(a);
   assert.ok(hasEdge(buildMemoryGraph([o, f, a]).edges, 'OUTCOME',
+    { kind: 'memory', memoryId: a.id }, { kind: 'memory', memoryId: o.id }));
+});
+
+test('Run A action and Run B outcome with the same subject fail closed', () => {
+  const f = failure('run-a');
+  const a = action(f);
+  const o = outcome(a, { runId: 'run-b' });
+  assert.throws(() => buildMemoryGraph([f, a, o]), (error) => isOrchestratorError(error, 'STATE_CORRUPT'));
+});
+
+test('outcome and action fail closed when exactly one runId is present', () => {
+  const noRunFailure = failure(null);
+  const noRunAction = action(noRunFailure, { runId: null });
+  const runFailure = failure('run-a');
+  const runAction = action(runFailure);
+  assert.throws(() => buildMemoryGraph([noRunFailure, noRunAction,
+    outcome(noRunAction, { runId: 'run-a' })]),
+  (error) => isOrchestratorError(error, 'STATE_CORRUPT'));
+  assert.throws(() => buildMemoryGraph([runFailure, runAction,
+    outcome(runAction, { runId: null })]),
+  (error) => isOrchestratorError(error, 'STATE_CORRUPT'));
+});
+
+test('outcome and action with both runIds absent remain valid', () => {
+  const f = failure(null);
+  const a = action(f, { runId: null });
+  const o = outcome(a, { runId: null });
+  assert.ok(hasEdge(buildMemoryGraph([f, a, o]).edges, 'OUTCOME',
     { kind: 'memory', memoryId: a.id }, { kind: 'memory', memoryId: o.id }));
 });
 
@@ -255,6 +316,14 @@ test('same exact task query without runId returns deterministic facts across run
   assert.deepEqual(new Set(result.failures.map((entry) => entry.provenance.runId)), new Set(['run-a', 'run-b']));
   assert.deepEqual(result.actionCandidates.map((entry) => entry.data.actionId).sort(),
     ['REPIN_AGENT_EXECUTABLE', 'RETRY_REVIEW_OUTPUT']);
+  assert.ok(hasEdge(result.edges, 'CANDIDATE_ACTION',
+    { kind: 'memory', memoryId: first.id }, { kind: 'memory', memoryId: firstAction.id }));
+  assert.ok(hasEdge(result.edges, 'CANDIDATE_ACTION',
+    { kind: 'memory', memoryId: second.id }, { kind: 'memory', memoryId: secondAction.id }));
+  assert.equal(hasEdge(result.edges, 'CANDIDATE_ACTION',
+    { kind: 'memory', memoryId: first.id }, { kind: 'memory', memoryId: secondAction.id }), false);
+  assert.equal(hasEdge(result.edges, 'CANDIDATE_ACTION',
+    { kind: 'memory', memoryId: second.id }, { kind: 'memory', memoryId: firstAction.id }), false);
 });
 
 test('task query with runId returns only that physical run', async () => {
