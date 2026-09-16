@@ -1,8 +1,8 @@
-# TripWith — Phase 1 Architecture and Database + Phase 2/3/4 Addenda
+# TripWith — Canonical Architecture, Database and Product-Phase Addenda
 
-**Date:** 2026-08-20 (revised through the Phase 4 post-review correction gate on 2026-08-21)
-**Status:** Phases 1–4 implemented, corrected and verified; Phase 4 closed; Phase 5 not started
-**Scope:** Architecture, complete relational model, initial migration, Phase 2 backend/infrastructure, Phase 3 Authentication & Users, and Phase 4 Trips & Matching. No frontend and no payment-provider business implementation.
+**Date:** 2026-08-20 (revised with the approved Phase 8 product direction on 2026-09-16)
+**Status:** Phases 1–7 implemented, corrected and verified; Phase 8 product direction approved; Phase 8 implementation not started
+**Scope:** Canonical architecture and relational model, completed product-phase addenda, and the approved Phase 8 identity-verification and Trust direction. No frontend and no payment-provider or identity-verification-provider business implementation.
 
 ---
 
@@ -13,6 +13,7 @@
 | Data layer | TypeORM + hand-written SQL migrations | Migrations are reviewable `.sql`; no generator mangles GIST/partial/generated constructs |
 | Regulatory baseline | EU-first (GDPR + PSD2/SCA, EUR) | `user_consents` ledger; payments model an SCA challenge state; money is integer minor units + ISO-4217 |
 | Minimum age | 18+ platform-wide | Trigger-enforced; age-preference columns carry a hard floor of 18 |
+| Identity eligibility | Successful provider-neutral identity verification is mandatory for normal product access | Authentication alone permits only verification-completion/status and account/legal/support flows; normal HTTP and WebSocket capabilities fail closed until verification succeeds |
 | Repo layout | pnpm + Turborepo monorepo | `packages/shared` owns enums and date semantics used by API and mobile |
 
 ### Assumptions that materially affect architecture
@@ -22,7 +23,7 @@ Flagged per §34, because these are business decisions this document must not ma
 1. **The €15 deposit is a platform fee retained by TripWith, not funds held on behalf of the provider.** The schema says `authorization` / `deposit` / `capture` and never *escrow*. If the model is custodial, Phase 10 changes materially (segregated balances, payout ledger, probably licensing). **Highest-consequence open item.**
 2. **Remaining provider payment happens off-platform.** No payout or settlement tables. Additive later.
 3. **Google Places caching windows are configuration, not schema.** The permitted window is a policy value to confirm against current Places terms at implementation time; `cache_expires_at` is per-row so a policy change is a config change.
-4. **Identity verification is a placeholder** for an unchosen provider; trust weighting for verified accounts is Phase 8.
+4. **The identity-verification provider remains intentionally unchosen.** Phase 8 introduces a provider-neutral verification lifecycle and makes successful verification an eligibility gate for normal product access. Identity verification is separate from Trust Score and must not create a Trust Score bonus. See §26.
 
 ---
 
@@ -52,6 +53,7 @@ flowchart TB
     end
     subgraph ext["External"]
         FB["Firebase Auth"]
+        IVP["IdentityVerificationProvider\n(unselected)"]
         GM["Google Maps / Places"]
         PP["PaymentProvider (Stripe impl.)"]
     end
@@ -69,6 +71,7 @@ flowchart TB
     W --> PP
     HTTP --> S3
     HTTP -.verify JWT locally.-> FB
+    HTTP -.provider-neutral verification adapter.-> IVP
     PP -.signed webhook.-> LB
 ```
 
@@ -184,6 +187,7 @@ Swipe writes to `swipes`. On a reciprocal `LIKE`, one transaction creates the `c
 | Service | Boundary | Rule |
 |---|---|---|
 | Firebase Auth | `AuthModule` verifies the ID token in-process | See below |
+| IdentityVerificationProvider (unselected) | Provider-neutral verification lifecycle/result port | Domain code consumes TripWith lifecycle semantics and minimum provenance, never vendor objects or raw identity evidence |
 | Google Places | `ProvidersModule` via an enrichment worker | Lands in `provider_external_sources`, never in `providers` columns |
 | PaymentProvider | `authorize / capture / cancelAuthorization / refund / getPaymentStatus / handleWebhook` | Domain code sees TripWith's `payment_status`, never a provider object |
 | S3 | Pre-signed upload URLs | The API never proxies file bytes |
@@ -191,6 +195,8 @@ Swipe writes to `swipes`. On a reciprocal `LIKE`, one transaction creates the `c
 **Firebase verification — corrected.** An earlier draft implied a network round-trip to Firebase per request. It is not. A Firebase ID token is an RS256-signed JWT. The Admin SDK fetches Google's public signing certificates from a well-known endpoint and caches them for the lifetime the response's `Cache-Control` allows (keys rotate on the order of a day), so the steady-state path is **local signature verification plus issuer/audience/expiry claim checks — no per-request network call**. Network I/O occurs only on cache refresh, or when explicitly checking revocation (`checkRevoked`), which is reserved for sensitive operations rather than every request.
 
 What does not change: the token is verified **server-side on every request**, and a client-supplied user ID is never trusted. The verified UID maps to `users.firebase_uid`; everything downstream uses the internal UUID.
+
+Firebase authentication answers which account/session is calling. It does not establish that the account holder's real-world identity has passed the separate Phase 8 verification requirement. The provider adapter may perform document validation, authenticity and expiration checks, and country/provider-specific supported-document policy; TripWith domain code receives only provider-neutral lifecycle results and the minimum provenance required by §26.
 
 ---
 
@@ -300,6 +306,7 @@ A message is persisted first, then broadcast. A dropped socket costs a redeliver
 ## 8. Security and privacy boundaries
 
 - Authorization is server-side without exception; UI affordances are not a security control.
+- Successful authentication is not sufficient for normal product access. The backend must enforce current identity-verification eligibility on normal-product HTTP and WebSocket entry points; a direct client call cannot bypass the Phase 8 gate.
 - Ownership verified on every mutation.
 - Webhooks verify signatures before any state change; `signature_verified` is recorded.
 - Secrets from environment only — `data-source.ts` throws on a missing variable rather than defaulting.
@@ -506,7 +513,7 @@ Conventions: UUID PKs (`BIGINT` identity only for append-only high-volume logs);
 *Columns:* `display_name`, `bio`, `avatar_url`, `home_country_code`, `native_language_code`, `languages_spoken TEXT[]`, `travel_style` (1–5), `interest_ids INT[]` (trigger-maintained active-interest projection), `identity_verified_at`.
 *Constraints:* name length 2–50; bio ≤ 1000; ISO country/language patterns; style 1–5.
 *Indexes:* `GIN (interest_ids gin__int_ops)`, home country (partial), travel style.
-*Note:* **no geography column, deliberately.**
+*Notes:* **no geography column, deliberately.** `identity_verified_at` is the existing verification placeholder/current-state signal; Phase 8 may require richer provider-neutral lifecycle and provenance than one timestamp can represent. This decision does not prescribe the exact additive schema.
 
 **`user_settings`** — discovery and privacy preferences.
 *Columns:* `ghost_mode_enabled`, `ghost_mode_until`, `discovery_enabled`, `trip_visibility`, `min/max_age_preference`, `min_trust_score_preference`, `max_distance_km`, locale/timezone.
@@ -626,6 +633,8 @@ Conventions: UUID PKs (`BIGINT` identity only for append-only high-volume logs);
 *Constraints:* `UNIQUE (idempotency_key)`; `delta` within `±10`; no self-crediting; reversals must reference an original; unique reversal per original.
 *Indexes:* `(user_id, created_at DESC)`; `(event_id)`; **`(source_user_id, user_id, created_at DESC)`** to detect reciprocal boosting rings.
 *Triggers:* `tw_forbid_mutation` (append-only) and `tw_apply_trust_delta` — the **sole** writer of `users.trust_score_raw`.
+
+Identity verification is not a trust event and does not award a Trust Score bonus. Trust remains the separate behavioral/reputation signal for an already eligible user. Raw identity documents, biometrics and provider payloads never enter this ledger.
 
 **`account_restrictions`** — `type`, `reason`, `issued_by_user_id` (NULL = automated), `starts_at`, `ends_at` (NULL = indefinite), `lifted_at`, `notified_at`. Unique active restriction per `(user_id, type)`; expiry index; **un-notified index**, because §16 forbids silent shadow-banning.
 
@@ -926,6 +935,8 @@ Authorization: Bearer <Firebase ID token>
 - Active account status and the absence of a current `FULL_SUSPENSION` are required for normal access. Deleted, soft-deleted, deactivated, suspended, pending/unusable and fully restricted accounts fail closed.
 - Socket.IO now uses the same verification and internal-user resolution instead of the Phase 2 rejecting placeholder, and joins only the resolved `user:{internal_uuid}` room.
 
+**Phase 8 supersession:** the Phase 3 boundary above records the completed authentication implementation, but it is no longer the complete normal-access policy. Successful authentication, an active account and the absence of `FULL_SUSPENSION` remain necessary but are not sufficient: current successful identity verification is also required. Unverified users are limited to the minimum verification-completion/status and account/legal/support flows defined in §26.
+
 ### Account provisioning and onboarding
 
 `POST /api/v1/auth/provision` is the only first-account creation path. It requires a revocation-checked Firebase identity with a verified email plus date of birth, display name, and Terms of Service and Privacy Policy attestations that exactly match the server-owned `CURRENT_TOS_VERSION` and `CURRENT_PRIVACY_POLICY_VERSION`. A client can attest to a configured version but cannot define which version is current. One PostgreSQL transaction creates:
@@ -940,6 +951,8 @@ users (ACTIVE, verified email, 18+ DOB)
 The insert uses PostgreSQL uniqueness as the concurrency authority. Concurrent first requests wait on the unique conflict and resolve the winner; tests prove one user, one profile, one settings row and exactly two required consent rows. Repeated provisioning is idempotent for the active account and re-enters the normal account-status/restriction boundary before returning owner data.
 
 No onboarding boolean was added. Completeness is derived from active status, verified email, profile/settings presence, display name and latest grants for both **currently configured** required-policy versions. A policy rollout leaves the account valid but makes old grants outdated until append-only current-version grants are recorded. `onboarding.discoverable` means effective discoverability now: it additionally requires `discovery_enabled`, inactive/effectively expired Ghost Mode, and no effective `MATCHING_SUSPENDED` or `FULL_SUSPENSION`. Matching restrictions do not make onboarding incomplete; they independently suppress effective discovery. A partially complete or currently restricted account is never reported as discoverable.
+
+Under the Phase 8 policy, current successful identity verification is an additional independent prerequisite for effective discoverability. The preceding list records the completed Phase 3 derivation before that gate existed; Phase 8 must make an unverified account non-discoverable at the backend boundary.
 
 The API age validator parses an exact `YYYY-MM-DD` calendar date in UTC and uses the shared `MINIMUM_ACCOUNT_AGE_YEARS`; PostgreSQL's existing `tw_enforce_minimum_age()` trigger remains authoritative. Below-18, exact-18, older, impossible-date and future-date cases are covered.
 
@@ -1129,6 +1142,8 @@ docs/superpowers/specs/2026-08-20-tripwith-phase-1-design.md
 **Approval state:** Phase 4 is implemented, integrated and verified on `phase4/trips-matching`. Phase 4 is closed; no merge or Phase 5 work was performed.
 
 Phase 4 used three bounded implementation workstreams—Trips, Candidate Generation/Scoring, and Swipes/Matches—with the Lead owning integration, cache/privacy behavior, benchmarking, review, regression gates and this canonical close-out. It adds no Explorer, event lifecycle, payment-provider, messaging, Trust Score mutation, Marketplace, SOS or mobile behavior.
+
+**Phase 8 supersession:** the Phase 4 APIs and algorithms below remain the completed Trips/Matching design, but Trips, traveler discovery, Matching and Swipes now also require the global identity-verification eligibility gate in §26. That gate is independent of the existing Trust Score floor and ranking component.
 
 ### Trips
 
@@ -1407,6 +1422,8 @@ This tooling work did not start Phase 5 Explorer implementation.
 
 Phase 5 adds the authenticated, read-only Explorer event-discovery boundary and composes `ExplorerModule` into the API. It adds no event lifecycle mutation, migration, spatial index, Redis cache, live-user-location lookup or mobile map implementation.
 
+**Phase 8 supersession:** authentication remains necessary, but Explorer is normal product functionality and therefore also requires the backend-enforced identity-verification eligibility gate in §26.
+
 ### Endpoint contract and bounds
 
 `GET /api/v1/explorer/events` is protected by `TripWithAuthGuard`. The controller passes only the guard-resolved internal user ID to the service; a client-supplied user ID is rejected by the global whitelist and is never an authorization input. The current result is not personalized, but retaining the authenticated identity seam prevents a future client-selected identity path.
@@ -1505,3 +1522,113 @@ The focused suites cover primitive and cross-field validation, explicit-offset t
 - Legitimate requests above 100,000 discoverable events fail closed with 422. Production density telemetry may justify a different, re-benchmarked strategy; the ceiling must not be raised as an unmeasured configuration tweak.
 - Degree-grid cells have latitude-dependent physical sizes, especially near the poles. Aggregation, IDs and output bounds remain deterministic, and circular longitude averaging handles the dateline, but visual cluster footprints are not equal-area.
 - The standard TypeORM integration test still needs one run against the normal migrated PostgreSQL/PostGIS test service. The benchmark proves the SQL and index path but does not exercise Nest/TypeORM connection configuration.
+
+---
+
+## 26. Phase 8 product direction — mandatory identity verification and Trust boundary
+
+**Approved:** 2026-09-16
+
+**Implementation state:** product policy and architectural direction approved; implementation, migration design, provider selection and Phase 8 execution plan not started.
+
+Phase 8 makes successful identity verification a mandatory eligibility requirement for normal use of TripWith. An account may authenticate successfully without yet being eligible for normal product access. The three concepts are deliberately independent:
+
+| Concern | Question answered | Authority and consequence |
+|---|---|---|
+| Authentication | Who is this account/session? | Firebase authentication establishes a server-verified external UID that maps to the internal `users.id`; it does not prove real-world identity verification |
+| Identity verification | Has this person's real-world identity been successfully verified? | A provider-neutral verification lifecycle controls eligibility for normal product access |
+| Trust | How has this verified user behaved within TripWith? | The append-only `trust_score_events` ledger and trigger-maintained user projection remain the behavioral/reputation authority |
+
+Identity verification is an eligibility gate, not a Trust Score reward. Verification success must not be silently translated into a trust delta, multiplier or arbitrary score bonus. A user must first be identity-verified and may then still fail a distinct Matching preference or Event `min_trust_score` threshold.
+
+### Verification evidence and provider-neutral boundary
+
+Verification may be based on an accepted official identity document issued by a government or competent public authority, including a national identity card, passport, driver's license or another accepted government-issued identity document. This list is illustrative, not a global domain allowlist. Accepted documents may vary by country and provider.
+
+TripWith depends on a provider-neutral verification port. Domain code consumes lifecycle/result semantics and minimum provenance, not vendor-specific APIs, status names or payloads. Provider adapters own document acceptance, authenticity and expiration checks, supported-country/document policy and translation from provider results into TripWith semantics. The exact provider remains intentionally unselected.
+
+### Lifecycle and persistence direction
+
+The provider-neutral lifecycle must distinguish states conceptually equivalent to:
+
+- `PENDING` — verification has started or awaits a conclusive result;
+- `VERIFIED` — identity verification currently satisfies the normal-access gate;
+- `REJECTED` — an attempt reached a negative result and does not satisfy the gate;
+- `REVOKED` — a prior successful verification no longer satisfies the gate.
+
+These are TripWith lifecycle semantics, not an assumption about a vendor state machine. The existing `user_profiles.identity_verified_at` may remain as a compatible current-state field or projection, but one timestamp may be insufficient for Phase 8 lifecycle, idempotency, auditability and provenance. Exact tables, columns, transitions and migration shape require a separate reviewed Phase 8 design and are not decided here.
+
+### Backend-enforced normal-access gate
+
+Current successful identity verification is required for normal social/product functionality, at minimum:
+
+- Trips;
+- Matching and traveler discovery;
+- Swipes;
+- Events;
+- Event join requests and participation;
+- Explorer;
+- Chat and realtime social interaction.
+
+The gate is enforced by the backend, not merely by hidden client controls. HTTP controllers/services and WebSocket authorization paths must fail closed when the current account is not verification-eligible. Socket connection authentication or existing Socket.IO room membership is never proof of verification eligibility.
+
+An unverified account may access only the minimum flows needed to:
+
+- start, continue or inspect identity verification;
+- inspect the account's verification status;
+- manage the account and required legal/consent state;
+- access support needed to resolve verification or account problems.
+
+The exact endpoint allowlist is part of the Phase 8 implementation design. The default is denial: a route is not available to an unverified user merely because it predates Phase 8 or is protected by authentication.
+
+Existing Trust requirements remain cumulative rather than interchangeable. For example, a user requesting event participation must pass both the global identity-verification gate and that event's independent Trust Score threshold. A high Trust Score cannot compensate for absent/rejected/revoked verification, and verification cannot compensate for a low Trust Score.
+
+### Data minimization and Trust isolation
+
+Identity documents and raw verification evidence must not enter the Trust ledger or general TripWith domain records. In particular, `trust_score_events` and Trust-domain storage must never contain:
+
+- passport, national-identity-card or driver's-license images;
+- biometrics or biometric templates;
+- raw provider requests, responses, webhook payloads or extracted document data.
+
+Verification evidence belongs behind the verification/provider boundary. TripWith persists only the minimum provider-neutral state and provenance required for eligibility, idempotency, auditability and lifecycle handling. Exact retention, deletion and legal-access policy remains subject to provider, legal and privacy review.
+
+Trust remains unchanged in principle: PostgreSQL is the source of truth; `trust_score_events` is append-only; `tw_apply_trust_delta` alone maintains `users.trust_score_raw`; and the public score remains its generated clamp. A future approved domain event may affect Trust, but verification itself is not such an event merely because it establishes eligibility.
+
+### Smallest coherent Phase 8 scope
+
+Phase 8 owns:
+
+1. a provider-neutral identity-verification lifecycle and adapter boundary;
+2. backend-wide verification eligibility enforcement for normal product access;
+3. a Trust application layer over the existing ledger and projection without redesigning either;
+4. a read-only Trust context seam for future moderation;
+5. compatibility verification across Matching, Events, Explorer and Phase 7 Chat.
+
+The Trust application layer centralizes deterministic/idempotent domain-derived ledger inserts and safe reads. It does not embed trust mutation in unrelated services, write the projection directly, or make verification a bonus. The moderation seam is read-only: it supplies approved Trust context to a future moderation domain without selecting or executing moderation actions.
+
+### Explicitly out of scope
+
+Phase 8 does not include:
+
+- selection or integration of a specific identity-verification vendor;
+- moderator/admin UI or a new staff-authorization model;
+- automated moderation or speculative trust penalties;
+- TripWith storage or processing of identity-document images or biometrics;
+- a generic policy/rules engine;
+- opaque ML scoring;
+- a graph or vector database;
+- a second reputation store or redesign of the Trust ledger/projection.
+
+### Unresolved decisions
+
+The following remain explicit product/legal/security decisions and must not be invented during implementation:
+
+- which identity-verification vendor will be used;
+- exact accepted-document policy per country;
+- verification expiry and reverification policy;
+- revocation authority and process;
+- exact provider-neutral provenance retained by TripWith;
+- moderator/staff authorization model;
+- which moderation outcomes may later affect Trust;
+- exact user-facing Trust explainability.
