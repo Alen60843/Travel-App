@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { open, mkdir, readFile, rename, rm } from 'node:fs/promises';
+import { open, mkdir, readFile, rename, rm, lstat, unlink, readdir, rmdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import { OrchestratorError } from '../errors';
@@ -90,6 +90,78 @@ export class StateStore {
         cause: error,
         details: { runId: this.runId },
       });
+    }
+  }
+
+  /** Shared by host mutation commands and held throughout execution/integration.
+   * Keep the historical path so preflight callers also participate in exclusion.
+   */
+  async withRunMutationLock<T>(operation: () => Promise<T>): Promise<T> {
+    return this.withPreflightRetryLock(operation);
+  }
+
+  /** Serialize run mutations, including independent CLI processes. */
+  async withPreflightRetryLock<T>(operation: () => Promise<T>): Promise<T> {
+    const path = join(this.runDirectory, 'retry-preflight.lock');
+    let acquired = false;
+    for (let attempt = 0; attempt < 2 && !acquired; attempt += 1) {
+      try {
+        await mkdir(path, { mode: 0o700 });
+        acquired = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        try {
+          const details = await lstat(path);
+          if (!details.isDirectory() || details.isSymbolicLink()) {
+            throw new OrchestratorError('TASK_STATE_INVALID', 'Preflight lock path is not a real directory');
+          }
+          const owners = await readdir(path);
+          const owner = owners[0];
+          let alive = true;
+          if (owners.length === 1 && owner !== undefined && /^[1-9][0-9]*$/.test(owner)) {
+            const pid = Number(owner);
+            try { process.kill(pid, 0); } catch (error) {
+              alive = (error as NodeJS.ErrnoException).code !== 'ESRCH';
+            }
+          } else if (owners.length === 0) {
+            // A crash between directory creation and owner-file creation leaves
+            // an empty lock. A grace period protects an owner still starting.
+            alive = Date.now() - details.mtimeMs < 30_000;
+          } else {
+            throw new OrchestratorError('TASK_STATE_INVALID', 'Preflight lock directory has unexpected contents');
+          }
+          if (alive) throw new OrchestratorError('TASK_STATE_INVALID', 'Another preflight retry holds the run lock');
+          const assertSameDirectory = async (): Promise<void> => {
+            const current = await lstat(path);
+            if (current.dev !== details.dev || current.ino !== details.ino || current.birthtimeMs !== details.birthtimeMs) {
+              throw new OrchestratorError('TASK_STATE_INVALID', 'Preflight lock was replaced during stale-owner cleanup');
+            }
+          };
+          // Only the contender that removes this dead PID's specific file may
+          // retire the directory. A missing file must STOP cleanup, never fall
+          // through to removing a directory another contender may have acquired.
+          await assertSameDirectory();
+          if (owner !== undefined) await unlink(join(path, owner));
+          await assertSameDirectory();
+          await rmdir(path);
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code !== 'ENOENT' && code !== 'ENOTEMPTY' && code !== 'EEXIST') throw error;
+          // Another contender won retirement or installed a replacement. Do
+          // not retry cleanup against the replacement; report typed contention.
+          throw new OrchestratorError('TASK_STATE_INVALID', 'Preflight lock changed during stale-owner cleanup', { cause: error });
+        }
+      }
+    }
+    if (!acquired) throw new OrchestratorError('TASK_STATE_INVALID', 'Could not acquire preflight retry lock');
+    const ownerPath = join(path, String(process.pid));
+    try {
+      const owner = await open(ownerPath, 'wx', 0o600);
+      try { await owner.sync(); } finally { await owner.close(); }
+      return await operation();
+    } finally {
+      await unlink(ownerPath).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'ENOENT') throw error; });
+      await rmdir(path);
     }
   }
 

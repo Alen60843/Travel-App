@@ -112,13 +112,17 @@ export function reconcileInterruptedTasks(
     } else if (observation?.review !== undefined) {
       const reviewBlocked = observation.review.status === 'blocked'
         || (observation.finalReview === true && observation.review.status !== 'approved');
+      const reviewAlreadyRecorded = observation.reviewPath !== undefined
+        && task.reviewPaths.includes(observation.reviewPath);
       next = {
         ...task,
         status: reviewBlocked ? 'BLOCKED' : 'SUCCEEDED',
-        reviewRounds: task.reviewRounds + 1,
+        reviewRounds: reviewAlreadyRecorded ? task.reviewRounds : task.reviewRounds + 1,
         ...(observation.reviewPath === undefined
           ? {}
-          : { reviewPaths: [...task.reviewPaths, observation.reviewPath] }),
+          : { reviewPaths: reviewAlreadyRecorded
+            ? task.reviewPaths
+            : [...task.reviewPaths, observation.reviewPath] }),
         finishedAt: timestamp,
         ...(reviewBlocked
           ? {

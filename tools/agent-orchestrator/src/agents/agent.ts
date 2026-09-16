@@ -109,6 +109,13 @@ export interface AgentResult {
 export interface Agent {
   readonly name: AgentName;
 
+  /**
+   * Exact transport-contract identity used by this adapter for structured
+   * review stdout. Absent for legacy/test adapters and agents without that
+   * transport; the orchestrator persists it on every applicable attempt.
+   */
+  readonly structuredOutputContractId?: string | undefined;
+
   run(request: AgentRequest): Promise<AgentResult>;
 }
 

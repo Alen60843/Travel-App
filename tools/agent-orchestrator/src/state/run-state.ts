@@ -1,3 +1,4 @@
+import { assertReplanState, parseTaskReplan, parseReplanEvidenceNormalizations, parseReplanInterpretations, parseReplanProposals, parseReplanAuthorizations } from '../replan/model';
 import { ERROR_CODES, OrchestratorError, type ErrorCode } from '../errors';
 import { parseAdaptiveRunState } from '../adaptive/state-validation';
 import type { AdaptiveRunState } from '../adaptive/types';
@@ -8,6 +9,12 @@ import {
 } from '../recovery/policy';
 import { TASK_STATUSES, type TaskStatus } from '../tasks/scheduler';
 import type { AgentName, TaskSpec } from '../tasks/task-schema';
+import { canonicalHash as canonicalReviewHash, parseReviewCorrectionContinuations, type ReviewCorrectionContinuation } from '../review/correction-continuation';
+import {
+  parseReviewCorrectionVerificationRecoveries,
+  type ReviewCorrectionVerificationRecovery,
+} from '../review/correction-verification-recovery';
+import { parseAgentExecutableRepins, type AgentExecutableRepin } from '../agents/executable-repin';
 
 export const RUN_STATUSES = [
   'CREATED',
@@ -47,6 +54,8 @@ export interface AgentAttemptState {
   /** Effective configured budget and observed runtime, persisted for timeout diagnosis. */
   readonly timeoutMs?: number;
   readonly durationMs?: number;
+  /** Exact structured-review transport used by this attempt, when applicable. */
+  readonly structuredOutputContractId?: string;
 }
 
 /**
@@ -106,6 +115,85 @@ export interface AgentFailureRecoveryState {
   readonly reopenedTaskIds: readonly string[];
 }
 
+export interface AcceptedReviewArtifactState {
+  readonly round: number;
+  readonly path: string;
+  readonly sha256: string;
+}
+
+export interface ReviewInputArtifactState {
+  readonly path: string;
+  readonly sha256: string;
+}
+
+export interface ReviewDependencyCommitState {
+  readonly taskId: string;
+  readonly commitSha: string;
+}
+
+interface ReviewOutputRecoveryBaseState {
+  readonly recovery: number;
+  readonly authorizedAt: string;
+  readonly previousRunStatus: 'FAILED' | 'BLOCKED';
+  readonly previousTaskStatus: 'FAILED';
+  readonly error: StoredError;
+  readonly attempt: AgentAttemptState;
+  readonly previousHandoffOutcome: 'invalid';
+  readonly stdoutPath: string;
+  readonly stdoutSha256: string;
+  readonly reopenedTaskIds: readonly string[];
+}
+
+/** Historical task-global structured-review retry authorization. */
+export interface ReviewOutputRecoveryV1State extends ReviewOutputRecoveryBaseState {
+  readonly version?: undefined;
+}
+
+/**
+ * Append-only authorization evidence for one bounded retry of one explicit,
+ * attempted-but-unaccepted review round.
+ */
+export interface ReviewOutputRecoveryV2State extends ReviewOutputRecoveryBaseState {
+  readonly version: 2;
+  readonly runId: string;
+  readonly taskId: string;
+  /** Lineage round emitted by REVIEW_STARTED. */
+  readonly reviewRound: number;
+  /** Task-local round used by the canonical review artifact path. */
+  readonly taskReviewRound: number;
+  readonly preparedHeadSha: string;
+  readonly acceptedReviewArtifacts: readonly AcceptedReviewArtifactState[];
+}
+
+/**
+ * One explicit continuation after the v2 retry for the same round proved the
+ * superseded Claude prompt-only transport contract was defective. This is not
+ * another per-round retry budget: it is a one-time migration to a distinct,
+ * hash-identified adapter contract.
+ */
+export interface ReviewOutputRecoveryV3State extends ReviewOutputRecoveryBaseState {
+  readonly version: 3;
+  readonly runId: string;
+  readonly taskId: string;
+  readonly reviewRound: number;
+  readonly taskReviewRound: number;
+  readonly preparedHeadSha: string;
+  readonly acceptedReviewArtifacts: readonly AcceptedReviewArtifactState[];
+  readonly consumedRecovery: number;
+  readonly consumedRecoverySha256: string;
+  readonly malformedAttempts: readonly [number, number];
+  readonly oldContractId: string;
+  readonly newContractId: string;
+  readonly dependencyCommits: readonly ReviewDependencyCommitState[];
+  readonly promptArtifacts: readonly ReviewInputArtifactState[];
+  readonly authorizedBy: 'human';
+}
+
+export type ReviewOutputRecoveryState =
+  | ReviewOutputRecoveryV1State
+  | ReviewOutputRecoveryV2State
+  | ReviewOutputRecoveryV3State;
+
 export interface TaskRunState {
   readonly id: string;
   readonly status: TaskStatus;
@@ -114,8 +202,11 @@ export interface TaskRunState {
   /** HEAD after dependency commits are prepared, before this task agent starts. */
   readonly preparedHeadSha?: string;
   readonly preparation?: IntegrationPreparationState;
+  /** Host verification for an authorized dynamic review-correction task. */
+  readonly verification?: IntegrationPreparationState;
   readonly commit?: TaskCommitState;
   readonly agentAttempts: readonly AgentAttemptState[];
+  /** Task-local review completions (including reconciled verdicts), not the lineage's round number. */
   readonly reviewRounds: number;
   readonly handoffPath?: string;
   readonly reviewPaths: readonly string[];
@@ -142,6 +233,8 @@ export interface TaskRunState {
   readonly handoffRepairAttempts: readonly HandoffRepairAttemptRecord[];
   /** Explicit agent/process failure recoveries, oldest first; never rewritten or removed. */
   readonly agentFailureRecoveries?: readonly AgentFailureRecoveryState[];
+  /** Explicit structured-review retries, oldest first; v2 permits one entry per review round. */
+  readonly reviewOutputRecoveries?: readonly ReviewOutputRecoveryState[];
   /**
    * Crash-safety checkpoints for salvaging a timed-out writer's dirty
    * worktree (AgentOrchestrator.salvageTask). Present only once salvage has
@@ -151,8 +244,21 @@ export interface TaskRunState {
    */
   readonly salvage?: {
     readonly authorizedAt: string;
+    readonly phase?: 'AUTHORIZED' | 'VERIFYING' | 'FAILED' | 'VERIFIED';
+    readonly failures?: readonly SalvageFailureRecord[];
     readonly verification?: SalvageVerificationCheckpoint;
   };
+  readonly replan?: import('../replan/model').TaskReplanState;
+}
+
+export interface SalvageFailureRecord {
+  readonly id: string;
+  readonly failedAt: string;
+  readonly source: 'runtime' | 'legacy_event_finalization';
+  readonly reason: string;
+  readonly worktreeHeadSha: string;
+  readonly trackedDiffFingerprint: string;
+  readonly evidenceHash: string;
 }
 
 /**
@@ -260,6 +366,8 @@ export interface RunState {
    * this phase's tasks.
    */
   readonly agentExecutables?: Readonly<Partial<Record<AgentName, string>>>;
+  /** Append-only, explicitly authorized executable migrations. */
+  readonly agentExecutableRepins?: readonly AgentExecutableRepin[];
   /** Optional adaptive topology. Static v1 run files remain valid without it. */
   readonly adaptive?: AdaptiveRunState;
   /**
@@ -272,6 +380,15 @@ export interface RunState {
    * before. The most recent entry is the one currently in effect.
    */
   readonly recoveryPolicyHistory?: readonly RecoveryPolicySnapshot[];
+  /** Append-only explicit human semantic corrections for static replan evidence. */
+  readonly replanEvidenceNormalizations?: readonly import('../replan/model').ReplanEvidenceNormalization[];
+  readonly replanInterpretations?: readonly import('../replan/model').ReplanInterpretation[];
+  readonly replanProposals?: readonly import('../replan/model').ReplanProposal[];
+  readonly replanAuthorizations?: readonly import('../replan/model').ReplanAuthorization[];
+  /** Human-authorized, hash-bound static review correction continuations. */
+  readonly reviewCorrections?: readonly ReviewCorrectionContinuation[];
+  /** Hash-bound host-only recovery evidence for failed correction verification. */
+  readonly reviewCorrectionVerificationRecoveries?: readonly ReviewCorrectionVerificationRecovery[];
 }
 
 /** One authorized, hashed recovery-policy overlay snapshot — see RunState.recoveryPolicyHistory. */
@@ -284,6 +401,23 @@ export interface RecoveryPolicySnapshot {
 }
 
 export const RUN_EVENT_NAMES = [
+  'REPLAN_EVIDENCE_NORMALIZED',
+  'REPLAN_INTERPRETATION_AUTHORIZED',
+  'REPLAN_PROPOSED',
+  'REPLAN_AUTHORIZED',
+  'REPLAN_CHECKPOINT_PREPARING',
+  'REPLAN_CHECKPOINT_READY',
+  'REPLAN_COMPOSED_VERIFIED',
+  'REPLAN_RESOLVED',
+  'REVIEW_CORRECTION_AUTHORIZED',
+  'REVIEW_CORRECTION_TASK_CREATED',
+  'REVIEW_CORRECTION_VERIFICATION_FINISHED',
+  'REVIEW_CORRECTION_VERIFICATION_RECOVERY_AUTHORIZED',
+  'REVIEW_CORRECTION_VERIFICATION_RECOVERY_FINISHED',
+  'REVIEW_CORRECTION_VERIFICATION_RECOVERY_COMMITTED',
+  'REVIEW_CORRECTION_COMMITTED',
+  'REVIEW_CORRECTION_REOPENED',
+  'AGENT_EXECUTABLE_REPIN_AUTHORIZED',
   'RUN_CREATED',
   'RUN_RESUMED',
   'TASK_READY',
@@ -296,6 +430,9 @@ export const RUN_EVENT_NAMES = [
   'HANDOFF_WRITTEN',
   'HANDOFF_REPAIR_ATTEMPTED',
   'AGENT_RETRY_AUTHORIZED',
+  'REVIEW_OUTPUT_RETRY_AUTHORIZED',
+  'REVIEW_OUTPUT_CONTRACT_CONTINUATION_AUTHORIZED',
+  'PREFLIGHT_RETRY_AUTHORIZED',
   'TASK_DEPENDENCY_REOPENED',
   'REVIEW_STARTED',
   'FINDING_REPORTED',
@@ -337,6 +474,7 @@ export const RUN_EVENT_NAMES = [
   'SALVAGE_AUTHORIZED',
   'SALVAGE_VERIFIED',
   'SALVAGE_VERIFICATION_FAILED',
+  'SALVAGE_FAILED_FINALIZED',
   'RECOVERY_POLICY_AUTHORIZED',
 ] as const;
 export type RunEventName = (typeof RUN_EVENT_NAMES)[number];
@@ -493,6 +631,16 @@ function parseAttempt(value: unknown, path: string): AgentAttemptState {
     throw new OrchestratorError('STATE_CORRUPT', `${path}.outcome is invalid`);
   }
   const pid = value.pid === undefined ? undefined : integer(value.pid, `${path}.pid`, 1);
+  const structuredOutputContractId = optionalString(
+    value.structuredOutputContractId,
+    `${path}.structuredOutputContractId`,
+  );
+  if (structuredOutputContractId !== undefined && !/^[0-9a-f]{64}$/.test(structuredOutputContractId)) {
+    throw new OrchestratorError(
+      'STATE_CORRUPT',
+      `${path}.structuredOutputContractId must be a lowercase sha256 digest`,
+    );
+  }
   return {
     attempt: integer(value.attempt, `${path}.attempt`, 1),
     agent,
@@ -513,6 +661,7 @@ function parseAttempt(value: unknown, path: string): AgentAttemptState {
     ...(value.durationMs === undefined
       ? {}
       : { durationMs: integer(value.durationMs, `${path}.durationMs`) }),
+    ...(structuredOutputContractId === undefined ? {} : { structuredOutputContractId }),
   };
 }
 
@@ -582,6 +731,164 @@ function parseAgentFailureRecovery(
     error: parseStoredError(value.error, `${path}.error`),
     attempt: parseAttempt(value.attempt, `${path}.attempt`),
     reopenedTaskIds: stringArray(value.reopenedTaskIds, `${path}.reopenedTaskIds`),
+  };
+}
+
+function parseReviewOutputRecovery(
+  value: unknown,
+  path: string,
+  expectedRecovery: number,
+): ReviewOutputRecoveryState {
+  if (!isObject(value)) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path} must be an object`);
+  }
+  const recovery = integer(value.recovery, `${path}.recovery`, 1);
+  if (recovery !== expectedRecovery) {
+    throw new OrchestratorError(
+      'STATE_CORRUPT',
+      `${path}.recovery must be the append-only sequence number ${expectedRecovery}`,
+    );
+  }
+  const previousRunStatus = string(value.previousRunStatus, `${path}.previousRunStatus`);
+  if (previousRunStatus !== 'FAILED' && previousRunStatus !== 'BLOCKED') {
+    throw new OrchestratorError(
+      'STATE_CORRUPT',
+      `${path}.previousRunStatus must be FAILED or BLOCKED`,
+    );
+  }
+  if (value.previousTaskStatus !== 'FAILED' || value.previousHandoffOutcome !== 'invalid') {
+    throw new OrchestratorError(
+      'STATE_CORRUPT',
+      `${path} must archive a FAILED task with invalid output`,
+    );
+  }
+  const stdoutSha256 = string(value.stdoutSha256, `${path}.stdoutSha256`);
+  if (!/^[0-9a-f]{64}$/.test(stdoutSha256)) {
+    throw new OrchestratorError(
+      'STATE_CORRUPT',
+      `${path}.stdoutSha256 must be a lowercase sha256 digest`,
+    );
+  }
+  const common: ReviewOutputRecoveryBaseState = {
+    recovery,
+    authorizedAt: timestamp(value.authorizedAt, `${path}.authorizedAt`),
+    previousRunStatus,
+    previousTaskStatus: 'FAILED',
+    error: parseStoredError(value.error, `${path}.error`),
+    attempt: parseAttempt(value.attempt, `${path}.attempt`),
+    previousHandoffOutcome: 'invalid',
+    stdoutPath: string(value.stdoutPath, `${path}.stdoutPath`),
+    stdoutSha256,
+    reopenedTaskIds: stringArray(value.reopenedTaskIds, `${path}.reopenedTaskIds`),
+  };
+  const versionedFields = [
+    'runId', 'taskId', 'reviewRound', 'taskReviewRound', 'preparedHeadSha',
+    'acceptedReviewArtifacts', 'consumedRecovery', 'consumedRecoverySha256',
+    'malformedAttempts', 'oldContractId', 'newContractId', 'dependencyCommits',
+    'promptArtifacts', 'authorizedBy',
+  ] as const;
+  if (value.version === undefined) {
+    if (versionedFields.some((field) => value[field] !== undefined)) {
+      throw new OrchestratorError('STATE_CORRUPT', `${path} cannot mix v1 and versioned fields`);
+    }
+    return common;
+  }
+  if (value.version !== 2 && value.version !== 3) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path}.version must be 2 or 3 when present`);
+  }
+  const preparedHeadSha = string(value.preparedHeadSha, `${path}.preparedHeadSha`);
+  assertFullSha(preparedHeadSha, `${path}.preparedHeadSha`);
+  if (!Array.isArray(value.acceptedReviewArtifacts)) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path}.acceptedReviewArtifacts must be an array`);
+  }
+  const acceptedReviewArtifacts = value.acceptedReviewArtifacts.map((entry, index) => {
+    const artifactPath = `${path}.acceptedReviewArtifacts[${index}]`;
+    if (!isObject(entry)) throw new OrchestratorError('STATE_CORRUPT', `${artifactPath} must be an object`);
+    const sha256 = string(entry.sha256, `${artifactPath}.sha256`);
+    if (!/^[0-9a-f]{64}$/.test(sha256)) {
+      throw new OrchestratorError('STATE_CORRUPT', `${artifactPath}.sha256 must be a lowercase sha256 digest`);
+    }
+    return {
+      round: integer(entry.round, `${artifactPath}.round`, 1),
+      path: string(entry.path, `${artifactPath}.path`),
+      sha256,
+    };
+  });
+  const reviewRound = integer(value.reviewRound, `${path}.reviewRound`, 1);
+  const taskReviewRound = integer(value.taskReviewRound, `${path}.taskReviewRound`, 1);
+  if (taskReviewRound > reviewRound) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path}.taskReviewRound cannot exceed reviewRound`);
+  }
+  if (acceptedReviewArtifacts.length !== taskReviewRound - 1
+    || acceptedReviewArtifacts.some((artifact, index) => artifact.round !== index + 1)) {
+    throw new OrchestratorError(
+      'STATE_CORRUPT',
+      `${path}.acceptedReviewArtifacts must bind every accepted task-local round before taskReviewRound`,
+    );
+  }
+  const versioned = {
+    ...common,
+    runId: string(value.runId, `${path}.runId`),
+    taskId: string(value.taskId, `${path}.taskId`),
+    reviewRound,
+    taskReviewRound,
+    preparedHeadSha,
+    acceptedReviewArtifacts,
+  };
+  if (value.version === 2) {
+    const v3Only = versionedFields.slice(6);
+    if (v3Only.some((field) => value[field] !== undefined)) {
+      throw new OrchestratorError('STATE_CORRUPT', `${path} cannot mix v2 and v3 fields`);
+    }
+    return { ...versioned, version: 2 };
+  }
+  const digest = (input: unknown, field: string): string => {
+    const result = string(input, `${path}.${field}`);
+    if (!/^[0-9a-f]{64}$/.test(result)) {
+      throw new OrchestratorError('STATE_CORRUPT', `${path}.${field} must be a lowercase sha256 digest`);
+    }
+    return result;
+  };
+  if (value.authorizedBy !== 'human') {
+    throw new OrchestratorError('STATE_CORRUPT', `${path}.authorizedBy must be human`);
+  }
+  if (!Array.isArray(value.malformedAttempts) || value.malformedAttempts.length !== 2) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path}.malformedAttempts must contain exactly two attempts`);
+  }
+  const malformedAttempts = value.malformedAttempts.map((attempt, index) =>
+    integer(attempt, `${path}.malformedAttempts[${index}]`, 1));
+  if (malformedAttempts[0]! >= malformedAttempts[1]!) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path}.malformedAttempts must be strictly increasing`);
+  }
+  const parseArtifacts = (input: unknown, field: string): ReviewInputArtifactState[] => {
+    if (!Array.isArray(input)) throw new OrchestratorError('STATE_CORRUPT', `${path}.${field} must be an array`);
+    return input.map((entry, index) => {
+      const itemPath = `${path}.${field}[${index}]`;
+      if (!isObject(entry)) throw new OrchestratorError('STATE_CORRUPT', `${itemPath} must be an object`);
+      return { path: string(entry.path, `${itemPath}.path`), sha256: digest(entry.sha256, `${field}[${index}].sha256`) };
+    });
+  };
+  if (!Array.isArray(value.dependencyCommits)) {
+    throw new OrchestratorError('STATE_CORRUPT', `${path}.dependencyCommits must be an array`);
+  }
+  const dependencyCommits = value.dependencyCommits.map((entry, index) => {
+    const itemPath = `${path}.dependencyCommits[${index}]`;
+    if (!isObject(entry)) throw new OrchestratorError('STATE_CORRUPT', `${itemPath} must be an object`);
+    const commitSha = string(entry.commitSha, `${itemPath}.commitSha`);
+    assertFullSha(commitSha, `${itemPath}.commitSha`);
+    return { taskId: string(entry.taskId, `${itemPath}.taskId`), commitSha };
+  });
+  return {
+    ...versioned,
+    version: 3,
+    consumedRecovery: integer(value.consumedRecovery, `${path}.consumedRecovery`, 1),
+    consumedRecoverySha256: digest(value.consumedRecoverySha256, 'consumedRecoverySha256'),
+    malformedAttempts: malformedAttempts as unknown as readonly [number, number],
+    oldContractId: digest(value.oldContractId, 'oldContractId'),
+    newContractId: digest(value.newContractId, 'newContractId'),
+    dependencyCommits,
+    promptArtifacts: parseArtifacts(value.promptArtifacts, 'promptArtifacts'),
+    authorizedBy: 'human',
   };
 }
 
@@ -781,15 +1088,34 @@ function parseSalvageVerificationCheckpoint(value: unknown, path: string): Salva
 function parseSalvageState(
   value: unknown,
   path: string,
-): { readonly authorizedAt: string; readonly verification?: SalvageVerificationCheckpoint } {
+): NonNullable<TaskRunState['salvage']> {
   if (!isObject(value)) {
     throw new OrchestratorError('STATE_CORRUPT', `${path} must be an object`);
   }
+  const phase = value.phase === undefined ? undefined : string(value.phase, `${path}.phase`);
+  if (phase !== undefined && !['AUTHORIZED', 'VERIFYING', 'FAILED', 'VERIFIED'].includes(phase)) throw new OrchestratorError('STATE_CORRUPT', `${path}.phase is invalid`);
+  const failures = value.failures === undefined ? undefined : (() => {
+    if (!Array.isArray(value.failures)) throw new OrchestratorError('STATE_CORRUPT', `${path}.failures must be an array`);
+    return value.failures.map((raw, index): SalvageFailureRecord => {
+      const itemPath = `${path}.failures[${index}]`;
+      if (!isObject(raw)) throw new OrchestratorError('STATE_CORRUPT', `${itemPath} must be an object`);
+      const id = string(raw.id, `${itemPath}.id`); const head = string(raw.worktreeHeadSha, `${itemPath}.worktreeHeadSha`);
+      if (!/^[a-f0-9]{64}$/.test(id) || !/^[a-f0-9]{64}$/.test(string(raw.evidenceHash, `${itemPath}.evidenceHash`))) throw new OrchestratorError('STATE_CORRUPT', `${itemPath} has an invalid digest`);
+      assertFullSha(head, `${itemPath}.worktreeHeadSha`);
+      const source = string(raw.source, `${itemPath}.source`);
+      if (!['runtime', 'legacy_event_finalization'].includes(source)) throw new OrchestratorError('STATE_CORRUPT', `${itemPath}.source is invalid`);
+      return { id, failedAt: timestamp(raw.failedAt, `${itemPath}.failedAt`), source: source as SalvageFailureRecord['source'], reason: string(raw.reason, `${itemPath}.reason`), worktreeHeadSha: head, trackedDiffFingerprint: string(raw.trackedDiffFingerprint, `${itemPath}.trackedDiffFingerprint`), evidenceHash: string(raw.evidenceHash, `${itemPath}.evidenceHash`) };
+    });
+  })();
+  const verification = value.verification === undefined ? undefined : parseSalvageVerificationCheckpoint(value.verification, `${path}.verification`);
+  if (phase === 'FAILED' && (verification !== undefined || failures?.length === 0 || failures === undefined)) throw new OrchestratorError('STATE_CORRUPT', `${path} failed lifecycle lacks terminal evidence`);
+  if (phase === 'VERIFIED' && verification === undefined) throw new OrchestratorError('STATE_CORRUPT', `${path} verified lifecycle lacks checkpoint`);
+  if (verification !== undefined && phase !== undefined && phase !== 'VERIFIED') throw new OrchestratorError('STATE_CORRUPT', `${path} verification conflicts with phase`);
   return {
     authorizedAt: timestamp(value.authorizedAt, `${path}.authorizedAt`),
-    ...(value.verification === undefined
-      ? {}
-      : { verification: parseSalvageVerificationCheckpoint(value.verification, `${path}.verification`) }),
+    ...(phase === undefined ? {} : { phase: phase as Exclude<NonNullable<TaskRunState['salvage']>['phase'], undefined> }),
+    ...(failures === undefined ? {} : { failures }),
+    ...(verification === undefined ? {} : { verification }),
   };
 }
 
@@ -858,6 +1184,22 @@ function parseTask(value: unknown, key: string): TaskRunState {
       ),
     );
   }
+  let reviewOutputRecoveries: ReviewOutputRecoveryState[] | undefined;
+  if (value.reviewOutputRecoveries !== undefined) {
+    if (!Array.isArray(value.reviewOutputRecoveries)) {
+      throw new OrchestratorError(
+        'STATE_CORRUPT',
+        `${path}.reviewOutputRecoveries must be an array`,
+      );
+    }
+    reviewOutputRecoveries = value.reviewOutputRecoveries.map((recovery, index) =>
+      parseReviewOutputRecovery(
+        recovery,
+        `${path}.reviewOutputRecoveries[${index}]`,
+        index + 1,
+      ),
+    );
+  }
   return {
     id,
     status: status as TaskStatus,
@@ -878,6 +1220,9 @@ function parseTask(value: unknown, key: string): TaskRunState {
     ...(value.preparation === undefined
       ? {}
       : { preparation: parseTaskPreparation(value.preparation, `${path}.preparation`) }),
+    ...(value.verification === undefined
+      ? {}
+      : { verification: parseTaskPreparation(value.verification, `${path}.verification`) }),
     agentAttempts: value.agentAttempts.map((attempt, index) =>
       parseAttempt(attempt, `${path}.agentAttempts[${index}]`),
     ),
@@ -911,7 +1256,9 @@ function parseTask(value: unknown, key: string): TaskRunState {
         }),
     handoffRepairAttempts: normalizeHandoffRepairAttempts(value, path),
     ...(agentFailureRecoveries === undefined ? {} : { agentFailureRecoveries }),
+    ...(reviewOutputRecoveries === undefined ? {} : { reviewOutputRecoveries }),
     ...(value.salvage === undefined ? {} : { salvage: parseSalvageState(value.salvage, `${path}.salvage`) }),
+    ...(value.replan === undefined ? {} : { replan: parseTaskReplan(value.replan) }),
   };
 }
 
@@ -961,6 +1308,35 @@ export function validateRunState(value: unknown): RunState {
   const tasks = Object.fromEntries(
     Object.entries(value.tasks).map(([key, task]) => [key, parseTask(task, key)]),
   );
+  for (const [taskId, task] of Object.entries(tasks)) {
+    const explicitRounds = new Map<number, ReviewOutputRecoveryState>();
+    let contractContinuations = 0;
+    for (const recovery of task.reviewOutputRecoveries ?? []) {
+      if (recovery.version === undefined) continue;
+      if (recovery.runId !== runId || recovery.taskId !== taskId) {
+        throw new OrchestratorError('STATE_CORRUPT', `tasks.${taskId}.reviewOutputRecoveries identity mismatch`);
+      }
+      const prior = explicitRounds.get(recovery.reviewRound);
+      if (prior !== undefined && (recovery.version !== 3 || prior.version !== 2
+        || recovery.consumedRecovery !== prior.recovery
+        || recovery.consumedRecoverySha256 !== canonicalReviewHash(prior)
+        || recovery.malformedAttempts[0] !== prior.attempt.attempt
+        || recovery.malformedAttempts[1] !== recovery.attempt.attempt)) {
+        throw new OrchestratorError('STATE_CORRUPT', `tasks.${taskId}.reviewOutputRecoveries has an invalid duplicate round ${recovery.reviewRound}`);
+      }
+      if (prior === undefined && recovery.version === 3) {
+        throw new OrchestratorError('STATE_CORRUPT', `tasks.${taskId}.reviewOutputRecoveries contract continuation lacks its v2 source`);
+      }
+      if (recovery.version === 3
+        && (++contractContinuations > 1 || recovery.reviewRound !== 2 || recovery.taskReviewRound !== 2)) {
+        throw new OrchestratorError('STATE_CORRUPT', `tasks.${taskId}.reviewOutputRecoveries has an invalid contract continuation scope`);
+      }
+      explicitRounds.set(recovery.reviewRound, recovery);
+      if (!task.agentAttempts.some((attempt) => JSON.stringify(attempt) === JSON.stringify(recovery.attempt))) {
+        throw new OrchestratorError('STATE_CORRUPT', `tasks.${taskId}.reviewOutputRecoveries source attempt is missing`);
+      }
+    }
+  }
   const strategy = value.strategy === undefined ? undefined : string(value.strategy, 'strategy');
   if (strategy !== undefined && strategy !== 'adaptive') {
     throw new OrchestratorError('STATE_CORRUPT', 'strategy must be adaptive when present');
@@ -1019,6 +1395,27 @@ export function validateRunState(value: unknown): RunState {
       agentExecutables[agentName] = string(path, `agentExecutables.${agentName}`);
     }
   }
+  const agentExecutableRepins = value.agentExecutableRepins === undefined
+    ? undefined
+    : parseAgentExecutableRepins(value.agentExecutableRepins);
+  if (agentExecutableRepins !== undefined) {
+    const effective = { ...(agentExecutables ?? {}) };
+    for (const repin of agentExecutableRepins) {
+      if (repin.runId !== runId) throw new OrchestratorError('STATE_CORRUPT', 'Agent executable repin run identity mismatch');
+      if (agentExecutables?.[repin.agent] === undefined) {
+        throw new OrchestratorError('STATE_CORRUPT', 'Agent executable repin has no initial pinned executable');
+      }
+      if (effective[repin.agent] !== repin.oldExecutablePath) {
+        throw new OrchestratorError('STATE_CORRUPT', 'Agent executable repin history is not contiguous');
+      }
+      effective[repin.agent] = repin.replacement.path;
+      const source = tasks[repin.sourceFailure.taskId];
+      if (source === undefined || !source.agentAttempts.some((attempt) =>
+        attempt.attempt === repin.sourceFailure.attempt && attempt.agent === repin.agent && attempt.outcome === 'failed')) {
+        throw new OrchestratorError('STATE_CORRUPT', 'Agent executable repin source failure is missing');
+      }
+    }
+  }
   const adaptive = value.adaptive === undefined
     ? undefined
     : parseAdaptiveRunState(value.adaptive);
@@ -1056,6 +1453,56 @@ export function validateRunState(value: unknown): RunState {
       }
     }
   }
+  const replanEvidenceNormalizations = value.replanEvidenceNormalizations === undefined ? undefined : parseReplanEvidenceNormalizations(value.replanEvidenceNormalizations);
+  const replanInterpretations = value.replanInterpretations === undefined ? undefined : parseReplanInterpretations(value.replanInterpretations);
+  const replanProposals = value.replanProposals === undefined ? undefined : parseReplanProposals(value.replanProposals);
+  const replanAuthorizations = value.replanAuthorizations === undefined ? undefined : parseReplanAuthorizations(value.replanAuthorizations);
+  const reviewCorrections = value.reviewCorrections === undefined ? undefined : parseReviewCorrectionContinuations(value.reviewCorrections);
+  if (reviewCorrections !== undefined) {
+    if (strategy === 'adaptive') throw new OrchestratorError('STATE_CORRUPT', 'Adaptive runs cannot contain static review corrections');
+    for (const continuation of reviewCorrections) {
+      const auth = continuation.authorization;
+      if (auth.runId !== runId || tasks[auth.reviewTaskId] === undefined) {
+        throw new OrchestratorError('STATE_CORRUPT', 'Review correction run/source identity mismatch');
+      }
+      const correction = tasks[auth.correctionTask.id];
+      if (continuation.phase === 'CORRECTION_SUCCEEDED' || continuation.phase === 'REVIEW_REOPENED') {
+        if (correction?.status !== 'SUCCEEDED' || correction.commit?.sha !== continuation.correctionCommitSha) {
+          throw new OrchestratorError('STATE_CORRUPT', 'Review correction completion checkpoint mismatch');
+        }
+      }
+    }
+  }
+  const reviewCorrectionVerificationRecoveries = value.reviewCorrectionVerificationRecoveries === undefined
+    ? undefined
+    : parseReviewCorrectionVerificationRecoveries(value.reviewCorrectionVerificationRecoveries);
+  if (reviewCorrectionVerificationRecoveries !== undefined) {
+    for (const recovery of reviewCorrectionVerificationRecoveries) {
+      const continuation = reviewCorrections?.find((entry) =>
+        entry.authorization.id === recovery.correctionAuthorizationId
+        && entry.authorization.correctionTask.id === recovery.correctionTaskId);
+      const correction = tasks[recovery.correctionTaskId];
+      const providerAttempt = correction?.agentAttempts.find((attempt) => attempt.attempt === recovery.providerAttempt);
+      if (recovery.runId !== runId || continuation === undefined || correction === undefined
+        || providerAttempt?.outcome !== 'succeeded' || providerAttempt.finishedAt === undefined
+        || canonicalReviewHash(recovery.originalVerificationCommands)
+          !== canonicalReviewHash(continuation.authorization.correctionTask.verification)) {
+        throw new OrchestratorError('STATE_CORRUPT', 'Review correction verification recovery identity mismatch');
+      }
+      if ((recovery.correctionCommitSha !== undefined) !== (correction.status === 'SUCCEEDED')
+        || (recovery.correctionCommitSha !== undefined
+          && (correction.commit?.sha !== recovery.correctionCommitSha
+            || correction.commit.parentSha !== recovery.preparedHeadSha))) {
+        throw new OrchestratorError('STATE_CORRUPT', 'Review correction verification recovery commit mismatch');
+      }
+    }
+  }
+  assertReplanState({ runId, tasks, ...(strategy === undefined ? {} : { strategy }),
+    ...(replanEvidenceNormalizations === undefined ? {} : { replanEvidenceNormalizations }),
+    ...(replanInterpretations === undefined ? {} : { replanInterpretations }),
+    ...(replanProposals === undefined ? {} : { replanProposals }),
+    ...(replanAuthorizations === undefined ? {} : { replanAuthorizations }),
+  });
   return {
     schemaVersion: 1,
     runId,
@@ -1071,8 +1518,15 @@ export function validateRunState(value: unknown): RunState {
     integration,
     ...(integrationAttempts === undefined ? {} : { integrationAttempts }),
     ...(recoveryPolicyHistory === undefined ? {} : { recoveryPolicyHistory }),
+    ...(replanEvidenceNormalizations === undefined ? {} : { replanEvidenceNormalizations }),
+    ...(replanInterpretations === undefined ? {} : { replanInterpretations }),
+    ...(replanProposals === undefined ? {} : { replanProposals }),
+    ...(replanAuthorizations === undefined ? {} : { replanAuthorizations }),
+    ...(reviewCorrections === undefined ? {} : { reviewCorrections }),
+    ...(reviewCorrectionVerificationRecoveries === undefined ? {} : { reviewCorrectionVerificationRecoveries }),
     errors: value.errors.map((error, index) => parseStoredError(error, `errors[${index}]`)),
     ...(agentExecutables === undefined ? {} : { agentExecutables }),
+    ...(agentExecutableRepins === undefined ? {} : { agentExecutableRepins }),
     ...(adaptive === undefined ? {} : { adaptive }),
   };
 }

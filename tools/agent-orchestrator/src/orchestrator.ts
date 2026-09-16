@@ -1,18 +1,33 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { constants } from 'node:fs';
+import { lstat, mkdir, open, readFile, readlink, realpath, rename, rm, stat } from 'node:fs/promises';
+import { dirname, join, resolve, sep } from 'node:path';
 
 import {
   ClaudeAgent,
+  CLAUDE_TEXT_REVIEW_OUTPUT_CONTRACT_ID,
   CodexAgent,
+  extractClaudeStructuredReviewOutput,
+  extractStructuredHandoffFromStdout,
   parseJsonOrNull,
   readBoundedStdoutText,
   resolveAgentExecutable,
+  assertAuthorizedAgentExecutables,
+  effectiveAgentExecutables,
+  executableRepinId,
+  inspectAgentExecutable,
+  unusableExecutableState,
+  usesClaudeStructuredReviewOutput,
   type Agent,
+  type AgentExecutableRepin,
+  type AgentExecutableRepinIdentity,
   type AgentRequest,
   type AgentResult,
   type ExecutableSource,
 } from './agents';
+import { assertCodeInputHistory, changedCandidatePaths } from './replan/checkpoint';
+import { StaticReplanner, taskCodeInputs } from './replan/static-replanner';
+import { applyReplanOverlays, replanHash, type ReplanEvidenceNormalization, type ReplanInterpretation, type ReplanProposal } from './replan/model';
 import type { PhaseConfig } from './config';
 import { OrchestratorError, isOrchestratorError, type ErrorCode } from './errors';
 import {
@@ -25,6 +40,7 @@ import {
   integrateTaskCommits,
   integrationConflictError,
   resolveBaseSha,
+  taskCommitMessage,
   type IntegrationCommit,
   type OwnedWorktree,
 } from './git';
@@ -46,16 +62,44 @@ import {
   type RecoveryPolicyOverlay,
 } from './recovery/policy';
 import { extractStructuredPayload } from './protocol';
-import { parseReview, validateReview, type StructuredReview } from './review/findings';
+import { normalizeApprovedReview, parseReview, validateReview, type StructuredReview } from './review/findings';
+import { completedReviewRounds, REVIEW_MODES } from './review/lineage';
+import {
+  applyReviewCorrectionOverlays,
+  authorizationId,
+  baseCorrectionTask,
+  buildCorrectionTask,
+  canonicalHash,
+  correctionRequestHash,
+  correctionTaskIdSeed,
+  correctionVerification,
+  legacyCorrectionVerification,
+  supportsCanonicalApiCorrectionVerification,
+  validateCorrectionRequest,
+  type ReviewCorrectionAuthorization,
+  type ReviewCorrectionContinuation,
+} from './review/correction-continuation';
+import {
+  assertCorrectionVerificationEnvironment,
+  correctionVerificationRecoveryId,
+  type ReviewCorrectionVerificationRecovery,
+  type ReviewCorrectionVerificationRecoveryIdentity,
+} from './review/correction-verification-recovery';
 import {
   StateStore,
   assertResumeBaseUnmoved,
   createRunState,
+  validateRunState,
   reconcileInterruptedTasks,
   withUpdatedTimestamp,
+  type AcceptedReviewArtifactState,
   type AgentAttemptState,
   type AgentFailureRecoveryState,
   type HandoffRepairAttemptRecord,
+  type ReviewOutputRecoveryState,
+  type ReviewOutputRecoveryV2State,
+  type ReviewOutputRecoveryV3State,
+  type ReviewInputArtifactState,
   type RecoveryPolicySnapshot,
   type RunEventName,
   type RunState,
@@ -119,6 +163,8 @@ export interface OrchestratorOptions {
   readonly git?: GitClient;
   readonly clock?: () => Date;
   readonly signal?: AbortSignal;
+  /** Ephemeral host environment for correction verification; never persisted. */
+  readonly hostVerificationEnvironment?: NodeJS.ProcessEnv;
 }
 
 interface PreparedTask {
@@ -130,11 +176,39 @@ interface PreparedTask {
   readonly actualDependencyDiff: string;
 }
 
-const REVIEW_MODES = new Set(['review', 'synthesis', 'final_review']);
+interface CorrectionVerificationRecoveryEligibility {
+  readonly continuation: ReviewCorrectionContinuation;
+  readonly task: TaskSpec;
+  readonly taskState: TaskRunState;
+  readonly worktree: OwnedWorktree;
+  readonly handoff: StructuredHandoff;
+  readonly identity: ReviewCorrectionVerificationRecoveryIdentity;
+  readonly changedFiles: readonly string[];
+}
+
 const MAX_AGENT_DIFF_BYTES = 2 * 1024 * 1024;
 const INFRASTRUCTURE_FAILURES = new Set(['not_found', 'spawn_error', 'timed_out']);
 /** §6: bounded — a repair reformats existing text, it never does real work. */
 const HANDOFF_REPAIR_TIMEOUT_MS = 5 * 60 * 1000;
+
+/** Content/tree fingerprint stable across staging and the canonical commit. */
+async function correctionWorktreeFingerprint(worktreePath: string, paths: readonly string[]): Promise<string> {
+  const entries = [] as { path: string; kind: string; mode?: number; sha256?: string }[];
+  for (const path of [...paths].sort()) {
+    const absolute = join(worktreePath, path);
+    try {
+      const metadata = await lstat(absolute);
+      if (metadata.isDirectory()) throw new OrchestratorError('TASK_STATE_INVALID', `Correction changed path is a directory: ${path}`);
+      const bytes = metadata.isSymbolicLink() ? Buffer.from(await readlink(absolute), 'utf8') : await readFile(absolute);
+      entries.push({ path, kind: metadata.isSymbolicLink() ? 'symlink' : 'file', mode: metadata.mode & 0o777,
+        sha256: createHash('sha256').update(bytes).digest('hex') });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      entries.push({ path, kind: 'deleted' });
+    }
+  }
+  return canonicalHash(entries);
+}
 
 interface HandoffOutcomeRecord {
   readonly outcome: 'valid' | 'invalid';
@@ -168,7 +242,7 @@ type HandoffRecoveryEligibilityReasonCode =
 /** Stable, machine-readable eligibility-failure classification for salvage-task — same pattern as HandoffRecoveryEligibilityReasonCode. */
 type SalvageEligibilityReasonCode =
   | 'BLOCKED_WRITER_INELIGIBLE'
-  | 'SALVAGE_NOT_TIMED_OUT'
+  | 'SALVAGE_ATTEMPT_NOT_ELIGIBLE'
   | 'SALVAGE_COMMIT_ALREADY_RECORDED'
   | 'SALVAGE_WORKTREE_NOT_REGISTERED'
   | 'SALVAGE_WORKTREE_HEAD_MOVED'
@@ -219,6 +293,40 @@ export interface AgentFailureRetryResult {
   readonly reopenedTasks: readonly string[];
 }
 
+/** Result of an explicit structured-review retry authorization. No agent is run by this operation. */
+export interface ReviewOutputRetryResult {
+  readonly orchestrator: AgentOrchestrator;
+  readonly taskId: string;
+  readonly recovery: ReviewOutputRecoveryState;
+  readonly reopenedTasks: readonly string[];
+}
+
+/** Result of the one-time Claude review transport-contract continuation. */
+export interface ReviewOutputContractContinuationResult {
+  readonly orchestrator: AgentOrchestrator;
+  readonly taskId: string;
+  readonly recovery: ReviewOutputRecoveryV3State;
+  readonly reopenedTasks: readonly string[];
+  readonly created: boolean;
+}
+
+interface ReviewAttemptEventBinding {
+  readonly round: number;
+  readonly agent: AgentName;
+  readonly finishedStatus?: string;
+  readonly exitCode?: number | null;
+  readonly repairRejected?: true;
+  readonly reviewBlocked?: true;
+}
+
+export interface PreflightRetryResult {
+  readonly orchestrator: AgentOrchestrator;
+  readonly taskId: string;
+  readonly reopenedTasks: readonly string[];
+  readonly completedRounds: number;
+  readonly maxReviewRounds: number;
+}
+
 /** Result of AgentOrchestrator.salvageTask. */
 export interface SalvageResult {
   readonly orchestrator: AgentOrchestrator;
@@ -230,6 +338,25 @@ export interface SalvageResult {
 export interface RecoveryPolicyAuthorizationResult {
   readonly orchestrator: AgentOrchestrator;
   readonly policyHash: string;
+}
+
+export interface ReviewCorrectionAuthorizationResult {
+  readonly orchestrator: AgentOrchestrator;
+  readonly continuation: ReviewCorrectionContinuation;
+  readonly created: boolean;
+}
+
+export interface AgentExecutableRepinResult {
+  readonly orchestrator: AgentOrchestrator;
+  readonly repin: AgentExecutableRepin;
+  readonly created: boolean;
+}
+
+export interface ReviewCorrectionVerificationRecoveryResult {
+  readonly orchestrator: AgentOrchestrator;
+  readonly recovery: ReviewCorrectionVerificationRecovery;
+  readonly createdCommit: boolean;
+  readonly verificationExecuted: boolean;
 }
 
 export async function planPhase(
@@ -326,6 +453,7 @@ export class AgentOrchestrator {
   private readonly clock: () => Date;
   private readonly signal: AbortSignal | undefined;
   private readonly adaptiveConfig: AdaptivePhaseConfig | undefined;
+  private readonly hostVerificationEnvironment: NodeJS.ProcessEnv;
   /** Resolved solely from the most recently authorized recovery-policy overlay — see loadRunForContinuation and resolveHandoffRepairExecutor. */
   private readonly recoveryExecutors: readonly RecoveryExecutorConfig[] | undefined;
   private stateQueue: Promise<void> = Promise.resolve();
@@ -343,6 +471,7 @@ export class AgentOrchestrator {
     readonly signal?: AbortSignal;
     readonly adaptiveConfig?: AdaptivePhaseConfig;
     readonly recoveryExecutors?: readonly RecoveryExecutorConfig[];
+    readonly hostVerificationEnvironment?: NodeJS.ProcessEnv;
   }) {
     this.config = options.config;
     this.repositoryRoot = options.repositoryRoot;
@@ -356,6 +485,7 @@ export class AgentOrchestrator {
     this.signal = options.signal;
     this.adaptiveConfig = options.adaptiveConfig;
     this.recoveryExecutors = options.recoveryExecutors;
+    this.hostVerificationEnvironment = options.hostVerificationEnvironment ?? process.env;
   }
 
   static async start(phaseFile: string, options: OrchestratorOptions): Promise<AgentOrchestrator> {
@@ -398,6 +528,7 @@ export class AgentOrchestrator {
       // fresh re-resolution — this is the plan/runtime agreement itself.
       agents: createAgents(options.agents, plan.resolvedAgentExecutables),
       clock: options.clock ?? (() => new Date()),
+      ...(options.hostVerificationEnvironment === undefined ? {} : { hostVerificationEnvironment: options.hostVerificationEnvironment }),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     });
     await orchestrator.event('RUN_CREATED', undefined, {
@@ -456,6 +587,7 @@ export class AgentOrchestrator {
       worktrees: await WorktreeManager.create({ repositoryPath: plan.repositoryRoot, git }),
       agents: createAgents(options.agents, resolved),
       clock,
+      ...(options.hostVerificationEnvironment === undefined ? {} : { hostVerificationEnvironment: options.hostVerificationEnvironment }),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     });
     await orchestrator.event('RUN_CREATED', undefined, {
@@ -481,6 +613,7 @@ export class AgentOrchestrator {
     runId: string,
     options: OrchestratorOptions,
     allowAdaptive = true,
+    verifyAuthorizedExecutables = true,
   ): Promise<AgentOrchestrator> {
     const git = options.git ?? new GitClient();
     const repositoryRoot = await git.repositoryRoot(resolve(options.repositoryPath));
@@ -497,6 +630,7 @@ export class AgentOrchestrator {
         details: { expected: state.repositoryRoot, actual: repositoryRoot },
       });
     }
+    if (verifyAuthorizedExecutables) await assertAuthorizedAgentExecutables(state);
     const phaseSnapshot = join(stateStore.runDirectory, 'phase.yaml');
     let adaptiveConfig: AdaptivePhaseConfig | undefined;
     let config: PhaseConfig;
@@ -564,6 +698,10 @@ export class AgentOrchestrator {
     // behaves exactly as before — recoveryPolicyHistory is simply absent.
     const latestRecoveryPolicy = loadedState.recoveryPolicyHistory?.at(-1)?.policy;
     config = applyRecoveryPolicyOverlay(config, latestRecoveryPolicy);
+    if (loadedState.strategy !== 'adaptive') {
+      config = applyReplanOverlays(config, loadedState);
+      config = applyReviewCorrectionOverlays(config, loadedState);
+    }
     const orchestrator = new AgentOrchestrator({
       config,
       repositoryRoot,
@@ -582,12 +720,15 @@ export class AgentOrchestrator {
       // (agentExecutables undefined) and falls back to createAgents'/each
       // adapter's own bare command-name default, matching this orchestrator's
       // pre-existing behavior for that older state shape.
-      agents: createAgents(options.agents, loadedState.agentExecutables ?? {}),
+      agents: createAgents(options.agents, effectiveAgentExecutables(loadedState)),
       clock: options.clock ?? (() => new Date()),
+      ...(options.hostVerificationEnvironment === undefined ? {} : { hostVerificationEnvironment: options.hostVerificationEnvironment }),
       ...(adaptiveConfig === undefined ? {} : { adaptiveConfig }),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
       ...(latestRecoveryPolicy?.executors === undefined ? {} : { recoveryExecutors: latestRecoveryPolicy.executors }),
     });
+    await orchestrator.assertReviewOutputRecoveryBindings();
+    await orchestrator.assertReviewOutputContractContinuationBindings();
     // §15 crash safety: heal any adaptive unit left stale by a recovery
     // whose TaskRunState write landed but whose adaptive mirror didn't (see
     // reconcileRecoveredAdaptiveUnits) — evidence-gated, so a genuinely
@@ -599,12 +740,699 @@ export class AgentOrchestrator {
     // authorizeRecoveryPolicy). Every load re-checks this, so no
     // re-authorization is ever required to heal it.
     await orchestrator.reactivateBlockedRunAfterRecoveryEpoch();
+    await orchestrator.reconcileReviewCorrectionContinuations();
     return orchestrator;
   }
 
+  /** Persist an exact, human-authorized review correction grant. This invokes no provider. */
+  static async authorizeReviewCorrection(
+    runId: string,
+    reviewTaskId: string,
+    requestIndex: number,
+    options: OrchestratorOptions,
+  ): Promise<ReviewCorrectionAuthorizationResult> {
+    return AgentOrchestrator.withRunMutation(runId, options, async () => {
+      const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options, false);
+      const existing = orchestrator.state.reviewCorrections?.find(
+        (entry) => entry.authorization.reviewTaskId === reviewTaskId,
+      );
+      if (existing !== undefined) {
+        if (orchestrator.state.tasks[reviewTaskId]?.reviewPaths.at(-1) === existing.authorization.reviewArtifactPath) {
+          return { orchestrator, continuation: existing, created: false };
+        }
+        throw new OrchestratorError('TASK_STATE_INVALID', `Refusing review correction for ${reviewTaskId}: an accepted continuation already consumed this review lineage`);
+      }
+      const authorization = await orchestrator.checkReviewCorrectionEligibility(reviewTaskId, requestIndex);
+      const continuation: ReviewCorrectionContinuation = { authorization, phase: 'AUTHORIZED' };
+      // Authorization is its own durable checkpoint. A crash before task
+      // materialization is healed by loadRunForContinuation.
+      await orchestrator.mutate((state) => ({
+        ...state,
+        reviewCorrections: [...(state.reviewCorrections ?? []), continuation],
+      }));
+      await orchestrator.event('REVIEW_CORRECTION_AUTHORIZED', reviewTaskId, {
+        authorizationId: authorization.id,
+        reviewArtifactSha256: authorization.reviewArtifactSha256,
+        findingIds: authorization.findingIds,
+        correctionRequestHash: authorization.correctionRequestHash,
+        reviewedCodeInputsHash: authorization.reviewedCodeInputsHash,
+        sourceAttempt: authorization.sourceAttempt,
+        sourceRound: authorization.sourceRound,
+      });
+      orchestrator.config = applyReviewCorrectionOverlays(orchestrator.config, { reviewCorrections: [continuation] });
+      await orchestrator.reconcileReviewCorrectionContinuations();
+      return { orchestrator, continuation: orchestrator.state.reviewCorrections!.find(
+        (entry) => entry.authorization.id === authorization.id,
+      )!, created: true };
+    });
+  }
+
+  /** Persist one human-authorized executable migration without retrying or invoking an agent. */
+  static async repinAgentExecutable(
+    runId: string,
+    agent: AgentName,
+    replacementPath: string,
+    options: OrchestratorOptions,
+  ): Promise<AgentExecutableRepinResult> {
+    return AgentOrchestrator.withRunMutation(runId, options, async () => {
+      const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options, false, false);
+      const latest = orchestrator.state.agentExecutableRepins?.filter((entry) => entry.agent === agent).at(-1);
+      if (latest?.replacement.path === replacementPath) {
+        const inspected = await inspectAgentExecutable(replacementPath, agent);
+        if (inspected.sha256 !== latest.replacement.sha256) {
+          throw new OrchestratorError('TASK_STATE_INVALID', `Refusing executable repin for ${agent}: authorized replacement bytes changed`);
+        }
+        return { orchestrator, repin: latest, created: false };
+      }
+      const identity = await orchestrator.checkAgentExecutableRepinEligibility(agent, replacementPath);
+      // Close the practical validation/persistence TOCTOU window: the path,
+      // filesystem identity, executable bit, adapter/version, and bytes must
+      // still be identical immediately before the atomic state write.
+      const replacement = await inspectAgentExecutable(replacementPath, agent);
+      if (canonicalHash(replacement) !== canonicalHash(identity.replacement)
+        || await unusableExecutableState(identity.oldExecutablePath) !== identity.oldExecutableState) {
+        throw new OrchestratorError('TASK_STATE_INVALID', `Refusing executable repin for ${agent}: executable state changed during authorization`);
+      }
+      const repin: AgentExecutableRepin = {
+        id: executableRepinId(identity), ...identity, authorizedBy: 'human', authorizedAt: orchestrator.clock().toISOString(),
+      };
+      await orchestrator.mutate((state) => ({ ...state,
+        agentExecutableRepins: [...(state.agentExecutableRepins ?? []), repin],
+      }));
+      await orchestrator.event('AGENT_EXECUTABLE_REPIN_AUTHORIZED', identity.sourceFailure.taskId, {
+        repinId: repin.id, agent, oldExecutablePath: identity.oldExecutablePath,
+        oldExecutableState: identity.oldExecutableState, newExecutablePath: replacement.path,
+        newExecutableSha256: replacement.sha256, sourceAttempt: identity.sourceFailure.attempt,
+      });
+      return { orchestrator, repin, created: true };
+    });
+  }
+
+  /** Re-run only canonical host verification against an accepted correction worktree; never invokes a provider. */
+  static async retryReviewCorrectionVerification(
+    runId: string,
+    correctionTaskId: string,
+    options: OrchestratorOptions,
+  ): Promise<ReviewCorrectionVerificationRecoveryResult> {
+    return AgentOrchestrator.withRunMutation(runId, options, async () => {
+      const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options, false);
+      const existing = orchestrator.state.reviewCorrectionVerificationRecoveries?.find((entry) =>
+        entry.correctionTaskId === correctionTaskId);
+      if (existing?.correctionCommitSha !== undefined) {
+        return { orchestrator, recovery: existing, createdCommit: false, verificationExecuted: false };
+      }
+
+      // Fail before Jest (and before authorization persistence) when the host
+      // would otherwise fall through to apps/api/test/setup-env.ts defaults.
+      assertCorrectionVerificationEnvironment(orchestrator.hostVerificationEnvironment);
+      const checked = await orchestrator.checkCorrectionVerificationRecoveryEligibility(correctionTaskId, existing);
+      let recovery = existing;
+      if (recovery === undefined) {
+        recovery = {
+          id: correctionVerificationRecoveryId(checked.identity), ...checked.identity,
+          authorizedBy: 'human', authorizedAt: orchestrator.clock().toISOString(), attempts: [],
+        };
+        await orchestrator.mutate((state) => ({ ...state,
+          reviewCorrectionVerificationRecoveries: [
+            ...(state.reviewCorrectionVerificationRecoveries ?? []), recovery!,
+          ],
+        }));
+        await orchestrator.event('REVIEW_CORRECTION_VERIFICATION_RECOVERY_AUTHORIZED', correctionTaskId, {
+          recoveryId: recovery.id, correctionAuthorizationId: recovery.correctionAuthorizationId,
+          providerAttempt: recovery.providerAttempt, handoffSha256: recovery.handoffSha256,
+          preparedHeadSha: recovery.preparedHeadSha, worktreeDiffFingerprint: recovery.worktreeDiffFingerprint,
+          originalVerificationCommands: recovery.originalVerificationCommands,
+          normalizedVerificationCommands: recovery.normalizedVerificationCommands,
+        });
+      }
+
+      const passingAttempt = recovery.attempts.find((attempt) => attempt.result === 'passed');
+      let verificationExecuted = false;
+      if (passingAttempt === undefined) {
+        // Recheck every authorization binding immediately before execution.
+        await orchestrator.checkCorrectionVerificationRecoveryEligibility(correctionTaskId, recovery);
+        const startedAt = orchestrator.clock().toISOString();
+        const gate = await new IntegrationGate().run({
+          cwd: checked.worktree.path,
+          logsDirectory: join(orchestrator.stateStore.runDirectory, 'logs', correctionTaskId,
+            'review-correction-verification-recovery', `attempt-${recovery.attempts.length + 1}`),
+          commands: recovery.normalizedVerificationCommands,
+          env: orchestrator.hostVerificationEnvironment,
+          ...(orchestrator.signal === undefined ? {} : { signal: orchestrator.signal }),
+        });
+        verificationExecuted = true;
+        const postHandoffSha256 = createHash('sha256').update(await readFile(recovery.handoffPath)).digest('hex');
+        const postHeadSha = await orchestrator.git.resolveCommit(checked.worktree.path, 'HEAD');
+        const postChangedFiles = await changedCandidatePaths(orchestrator.git, checked.worktree.path, recovery.preparedHeadSha);
+        const postFingerprint = await correctionWorktreeFingerprint(checked.worktree.path, postChangedFiles);
+        const unchanged = postHandoffSha256 === recovery.handoffSha256
+          && postHeadSha === recovery.worktreeHeadSha
+          && postFingerprint === recovery.worktreeDiffFingerprint;
+        const attempt = {
+          attempt: recovery.attempts.length + 1,
+          startedAt,
+          finishedAt: orchestrator.clock().toISOString(),
+          result: gate.passed && unchanged ? 'passed' as const : 'failed' as const,
+          handoffSha256: postHandoffSha256,
+          worktreeHeadSha: postHeadSha,
+          worktreeDiffFingerprint: postFingerprint,
+          commands: gate.commands,
+        };
+        await orchestrator.mutate((state) => ({ ...state,
+          reviewCorrectionVerificationRecoveries: state.reviewCorrectionVerificationRecoveries!.map((entry) =>
+            entry.id === recovery!.id ? { ...entry, attempts: [...entry.attempts, attempt] } : entry),
+        }));
+        await orchestrator.event('REVIEW_CORRECTION_VERIFICATION_RECOVERY_FINISHED', correctionTaskId, {
+          recoveryId: recovery.id, attempt: attempt.attempt, result: attempt.result,
+          commands: attempt.commands,
+        });
+        recovery = orchestrator.state.reviewCorrectionVerificationRecoveries!.find((entry) => entry.id === recovery!.id)!;
+        if (attempt.result === 'failed') {
+          return { orchestrator, recovery, createdCommit: false, verificationExecuted };
+        }
+      }
+
+      const createdCommit = await orchestrator.finishCorrectionVerificationRecovery(correctionTaskId, recovery);
+      recovery = orchestrator.state.reviewCorrectionVerificationRecoveries!.find((entry) => entry.id === recovery!.id)!;
+      return { orchestrator, recovery, createdCommit, verificationExecuted };
+    });
+  }
+
+  private static async withRunMutation<T>(runId: string, options: OrchestratorOptions, operation: () => Promise<T>): Promise<T> {
+    const repositoryRoot = await (options.git ?? new GitClient()).repositoryRoot(resolve(options.repositoryPath));
+    const store = new StateStore(resolve(options.runsRoot ?? join(repositoryRoot, 'tools/agent-orchestrator/runs')), runId);
+    return store.withRunMutationLock(operation);
+  }
+
+  private async checkCorrectionVerificationRecoveryEligibility(
+    correctionTaskId: string,
+    existing?: ReviewCorrectionVerificationRecovery,
+  ): Promise<CorrectionVerificationRecoveryEligibility> {
+    const refuse = (reason: string): never => {
+      throw new OrchestratorError('TASK_STATE_INVALID',
+        `Refusing review correction verification recovery for ${correctionTaskId}: ${reason}`);
+    };
+    if (this.state.strategy !== undefined || this.state.adaptive !== undefined) refuse('only static runs are supported');
+    if (this.state.status !== 'BLOCKED') refuse(`run status is ${this.state.status}, not BLOCKED`);
+    if (Object.values(this.state.tasks).some((task) => ['READY', 'RUNNING'].includes(task.status))) refuse('run is not quiescent');
+    for (const task of Object.values(this.state.tasks)) {
+      for (const attempt of task.agentAttempts) {
+        if (attempt.finishedAt === undefined) refuse('an agent attempt is unfinished');
+        if (attempt.pid !== undefined) {
+          let dead = false;
+          try { process.kill(attempt.pid, 0); } catch (error) { dead = (error as NodeJS.ErrnoException).code === 'ESRCH'; }
+          if (!dead) refuse('a recorded provider process is still alive');
+        }
+      }
+    }
+    const integration = this.state.integration;
+    if (integration.status !== 'PENDING' || integration.integratedTaskCommits.length !== 0
+      || (integration.integrationFixCommits?.length ?? 0) !== 0 || integration.worktreePath !== undefined
+      || integration.branch !== undefined || integration.headSha !== undefined || integration.currentCommand !== undefined
+      || integration.preparation !== undefined || integration.error !== undefined) refuse('integration is not untouched');
+    const continuation = this.state.reviewCorrections?.find((entry) => entry.authorization.correctionTask.id === correctionTaskId);
+    if (continuation === undefined) refuse('task is not an authorized review correction');
+    const boundContinuation = continuation!;
+    if (boundContinuation.phase !== 'CORRECTION_RUNNING' || boundContinuation.correctionCommitSha !== undefined) {
+      refuse('correction continuation is not awaiting completion');
+    }
+    const task = this.config.tasks.find((entry) => entry.id === correctionTaskId);
+    const taskState = this.state.tasks[correctionTaskId];
+    if (task === undefined || taskState === undefined || task.mode !== 'correction' || !task.writer) refuse('correction task is missing');
+    const boundTask = task!;
+    const boundTaskState = taskState!;
+    if (boundTaskState.status !== 'BLOCKED' || boundTaskState.error?.code !== 'REVIEW_BLOCKED'
+      || boundTaskState.error.message !== 'Review correction host verification failed') {
+      refuse('task is not blocked specifically by correction host verification');
+    }
+    const providerAttempt = boundTaskState.agentAttempts.at(-1);
+    if (providerAttempt?.attempt === undefined || providerAttempt.outcome !== 'succeeded' || providerAttempt.finishedAt === undefined) {
+      refuse('latest provider attempt did not finish successfully');
+    }
+    if (boundTaskState.handoffOutcome !== 'valid' || boundTaskState.handoffPath === undefined) refuse('accepted provider handoff is missing');
+    if (boundTaskState.commit !== undefined) refuse('correction commit already exists');
+    if (boundTaskState.verification?.status !== 'FAILED' || boundTaskState.verification.commands.length === 0
+      || !boundTaskState.verification.commands.some((command) => command.required
+        && (command.exitCode !== 0 || command.termination !== null))) refuse('original host verification failure evidence is missing');
+    const originalVerification = boundTaskState.verification!;
+    const originalCommands = boundContinuation.authorization.correctionTask.verification ?? [];
+    if (originalVerification.commands.some((result, index) => {
+      const original = originalCommands[index];
+      return original === undefined || result.command !== original.command || result.required !== original.required
+        || result.timeoutMs !== (original.timeoutMs ?? result.timeoutMs);
+    })) refuse('original verification results do not match the authorized command prefix');
+
+    const artifact = await this.readAcceptedReviewArtifact(
+      boundContinuation.authorization.reviewTaskId, boundContinuation.authorization.reviewArtifactPath);
+    const request = validateCorrectionRequest(
+      artifact.review.additionalWorkRequests![boundContinuation.authorization.correctionRequestIndex],
+      boundContinuation.authorization.findingIds);
+    const legacyCommands = legacyCorrectionVerification(request);
+    const normalizedCommands = correctionVerification(request);
+    if (canonicalHash(originalCommands) !== canonicalHash(legacyCommands)) refuse('persisted verification is not the known legacy path contract');
+    if (canonicalHash(originalCommands) === canonicalHash(normalizedCommands)) refuse('persisted verification needs no path normalization');
+
+    const handoffBytes = await readFile(boundTaskState.handoffPath!);
+    const handoffSha256 = createHash('sha256').update(handoffBytes).digest('hex');
+    const handoff = parseHandoff(handoffBytes.toString('utf8'));
+    if (handoff.status !== 'complete') refuse('accepted correction handoff is not complete');
+    if (boundTaskState.worktreePath === undefined || boundTaskState.branch === undefined || boundTaskState.preparedHeadSha === undefined) {
+      refuse('preserved worktree checkpoint is incomplete');
+    }
+    const worktree = await this.worktrees.assertRegistered(boundTaskState.worktreePath!);
+    if (worktree.kind !== 'task' || worktree.runId !== this.state.runId || worktree.taskId !== correctionTaskId
+      || worktree.branch !== boundTaskState.branch || worktree.baseSha !== this.state.baseSha) refuse('worktree registration does not match');
+    const listed = (await this.worktrees.listGitWorktrees()).find((entry) => entry.path === worktree.path);
+    if (listed?.branch !== `refs/heads/${worktree.branch}`) refuse('worktree branch does not match');
+    const inspection = await inspectTaskCommits(this.git, worktree.path, boundTaskState.preparedHeadSha!);
+    const hasPassingCheckpoint = existing?.attempts.at(-1)?.result === 'passed';
+    if (inspection.commits.length === 0) {
+      if (inspection.headSha !== boundTaskState.preparedHeadSha || inspection.clean) refuse('preserved dirty tree is not at prepared HEAD');
+    } else if (!hasPassingCheckpoint || !inspection.clean || inspection.commits.length !== 1) {
+      refuse('worktree contains a non-reconcilable commit');
+    }
+    const changedFiles = [...await changedCandidatePaths(this.git, worktree.path, boundTaskState.preparedHeadSha!)].sort();
+    if (changedFiles.length === 0 || canonicalHash(changedFiles) !== canonicalHash([...handoff.filesChanged].sort())) {
+      refuse('current diff does not match handoff filesChanged evidence');
+    }
+    assertChangedFileOwnership(correctionTaskId, changedFiles, boundTask.files);
+    const diffCheck = await this.git.run(worktree.path, ['diff', '--check', boundTaskState.preparedHeadSha!], { allowFailure: true });
+    if (diffCheck.exitCode !== 0) refuse('worktree fails git diff --check');
+    const worktreeDiffFingerprint = await correctionWorktreeFingerprint(worktree.path, changedFiles);
+    const identity: ReviewCorrectionVerificationRecoveryIdentity = {
+      version: 1, runId: this.state.runId, correctionTaskId,
+      correctionAuthorizationId: boundContinuation.authorization.id,
+      providerAttempt: providerAttempt!.attempt,
+      handoffPath: boundTaskState.handoffPath!, handoffSha256,
+      preparedHeadSha: boundTaskState.preparedHeadSha!, worktreeHeadSha: inspection.headSha,
+      worktreeDiffFingerprint, originalVerificationCommands: originalCommands,
+      originalVerificationResults: originalVerification.commands,
+      normalizedVerificationCommands: normalizedCommands,
+    };
+    if (existing !== undefined) {
+      const stableIdentity = inspection.commits.length === 1 ? { ...identity, worktreeHeadSha: existing.worktreeHeadSha } : identity;
+      if (correctionVerificationRecoveryId(stableIdentity) !== existing.id
+        || handoffSha256 !== existing.handoffSha256 || worktreeDiffFingerprint !== existing.worktreeDiffFingerprint) {
+        refuse('handoff or worktree changed after recovery authorization');
+      }
+    }
+    return { continuation: boundContinuation, task: boundTask, taskState: boundTaskState, worktree, handoff, identity, changedFiles };
+  }
+
+  private async finishCorrectionVerificationRecovery(
+    correctionTaskId: string,
+    recovery: ReviewCorrectionVerificationRecovery,
+  ): Promise<boolean> {
+    const checked = await this.checkCorrectionVerificationRecoveryEligibility(correctionTaskId, recovery);
+    const passing = recovery.attempts.at(-1);
+    if (passing?.result !== 'passed' || passing.handoffSha256 !== recovery.handoffSha256
+      || passing.worktreeDiffFingerprint !== recovery.worktreeDiffFingerprint
+      || passing.worktreeHeadSha !== recovery.worktreeHeadSha) {
+      throw new OrchestratorError('TASK_STATE_INVALID', 'Recovery has no unchanged passing verification checkpoint');
+    }
+    const ensured = await ensureTaskCommit(this.git, {
+      worktreePath: checked.worktree.path,
+      baseSha: recovery.preparedHeadSha,
+      agent: checked.task.owner,
+      taskId: correctionTaskId,
+      summary: checked.handoff.summary,
+      allowEmpty: false,
+    });
+    if (ensured.commits.length !== 1 || ensured.changedFiles.length !== checked.changedFiles.length
+      || canonicalHash([...ensured.changedFiles].sort()) !== canonicalHash([...checked.changedFiles].sort())) {
+      throw new OrchestratorError('TASK_STATE_INVALID', 'Canonical correction commit changed the authorized file set');
+    }
+    const [parent, message] = await Promise.all([
+      this.git.resolveCommit(checked.worktree.path, `${ensured.commitSha}^`),
+      this.git.run(checked.worktree.path, ['show', '-s', '--format=%B', ensured.commitSha]),
+    ]);
+    if (parent !== recovery.preparedHeadSha
+      || message.stdout.trim() !== taskCommitMessage(checked.task.owner, correctionTaskId, checked.handoff.summary)
+      || await correctionWorktreeFingerprint(checked.worktree.path, checked.changedFiles) !== recovery.worktreeDiffFingerprint) {
+      throw new OrchestratorError('TASK_STATE_INVALID', 'Canonical correction commit does not match the verified checkpoint');
+    }
+    const commit: TaskCommitState = {
+      sha: ensured.commitSha, parentSha: recovery.preparedHeadSha, changedFiles: ensured.changedFiles,
+    };
+    await this.mutate((state) => {
+      const current = state.tasks[correctionTaskId]!;
+      const { error: _error, ...withoutError } = current;
+      return { ...state, status: 'RUNNING', tasks: { ...state.tasks, [correctionTaskId]: {
+        ...withoutError, status: 'SUCCEEDED', commit, handoffPath: recovery.handoffPath,
+        verification: {
+          status: 'SUCCEEDED', worktreePath: checked.worktree.path, headSha: recovery.worktreeHeadSha,
+          commands: passing.commands, startedAt: passing.startedAt, finishedAt: passing.finishedAt,
+        }, finishedAt: this.clock().toISOString(),
+      } }, reviewCorrectionVerificationRecoveries: state.reviewCorrectionVerificationRecoveries!.map((entry) =>
+        entry.id === recovery.id ? { ...entry, correctionCommitSha: ensured.commitSha } : entry) };
+    });
+    await this.event('TASK_COMMITTED', correctionTaskId, { commitSha: ensured.commitSha, changedFiles: ensured.changedFiles });
+    await this.event('TASK_SUCCEEDED', correctionTaskId, {
+      recoveryMode: 'review_correction_verification', commitSha: ensured.commitSha, handoffPath: recovery.handoffPath,
+    });
+    await this.event('REVIEW_CORRECTION_VERIFICATION_RECOVERY_COMMITTED', correctionTaskId, {
+      recoveryId: recovery.id, commitSha: ensured.commitSha,
+    });
+    await this.reconcileReviewCorrectionContinuations();
+    return ensured.created;
+  }
+
+  private async checkAgentExecutableRepinEligibility(
+    agent: AgentName,
+    replacementPath: string,
+  ): Promise<AgentExecutableRepinIdentity> {
+    const refuse = (reason: string): never => {
+      throw new OrchestratorError('TASK_STATE_INVALID', `Refusing executable repin for ${agent}: ${reason}`,
+        { details: { runId: this.state.runId, agent, reason } });
+    };
+    if (this.state.strategy !== undefined || this.state.adaptive !== undefined) refuse('only static runs are supported');
+    if (!['FAILED', 'BLOCKED'].includes(this.state.status)) refuse(`run status is ${this.state.status}, not terminal`);
+    if (Object.values(this.state.tasks).some((task) => ['PENDING', 'READY', 'RUNNING'].includes(task.status))) {
+      refuse('run contains non-terminal tasks');
+    }
+    const integration = this.state.integration;
+    if (integration.status !== 'PENDING' || integration.integratedTaskCommits.length !== 0
+      || (integration.integrationFixCommits?.length ?? 0) !== 0 || integration.worktreePath !== undefined
+      || integration.branch !== undefined || integration.headSha !== undefined || integration.currentCommand !== undefined
+      || integration.error !== undefined || integration.preparation !== undefined
+      || (this.state.integrationAttempts?.length ?? 0) !== 0) refuse('integration has started or has recovery state');
+    for (const task of Object.values(this.state.tasks)) {
+      for (const attempt of task.agentAttempts) {
+        if (attempt.finishedAt === undefined) refuse('an agent attempt is unfinished');
+        if (attempt.pid !== undefined && isProcessAlive(attempt.pid)) refuse('a recorded provider process is still alive');
+      }
+    }
+    const initial = this.state.agentExecutables?.[agent];
+    if (initial === undefined) refuse('the run has no persisted executable for this agent');
+    const oldExecutablePath = effectiveAgentExecutables(this.state)[agent]!;
+    const oldExecutableState = await unusableExecutableState(oldExecutablePath);
+    if (oldExecutableState === null) refuse('the currently effective executable is still usable');
+    if (replacementPath === oldExecutablePath) refuse('replacement path is the unusable effective executable');
+    const replacement = await inspectAgentExecutable(replacementPath, agent);
+
+    const candidates = this.config.tasks.filter((spec) => {
+      const task = this.state.tasks[spec.id];
+      const attempt = task?.agentAttempts.at(-1);
+      return spec.owner === agent && task?.status === 'FAILED' && task.error?.code === 'AGENT_FAILED'
+        && attempt?.agent === agent && attempt.outcome === 'failed' && attempt.finishedAt !== undefined
+        && task.error.message === `spawn ${oldExecutablePath} ENOENT`;
+    }).sort((left, right) => left.id.localeCompare(right.id));
+    if (candidates.length === 0) refuse('no failed task is bound to spawn ENOENT for the effective executable');
+    let sourceFailure: AgentExecutableRepinIdentity['sourceFailure'] | undefined;
+    let rejectedEvidence = '';
+    for (const spec of candidates) {
+      const task = this.state.tasks[spec.id]!;
+      const attempt = task.agentAttempts.at(-1)!;
+      if (task.commit !== undefined) { rejectedEvidence = 'the source task has a commit'; continue; }
+      if (task.handoffPath !== undefined || task.reviewPaths.length !== 0 || task.handoffOutcome !== undefined
+        || task.handoffRepairAttempts.length !== 0) { rejectedEvidence = 'the source task has accepted or evaluated structured output'; continue; }
+      if (task.worktreePath === undefined || task.branch === undefined || task.preparedHeadSha === undefined) {
+        rejectedEvidence = 'the source task has no complete preserved worktree checkpoint'; continue;
+      }
+      try {
+        const owned = await this.worktrees.assertRegistered(task.worktreePath);
+        if (owned.kind !== 'task' || owned.runId !== this.state.runId || owned.taskId !== task.id
+          || owned.branch !== task.branch || owned.baseSha !== this.state.baseSha) {
+          rejectedEvidence = 'the source task worktree registration does not match'; continue;
+        }
+        const listed = (await this.worktrees.listGitWorktrees()).find((worktree) => worktree.path === owned.path);
+        if (listed?.branch !== `refs/heads/${task.branch}`) {
+          rejectedEvidence = 'the source task worktree is missing or checked out on another branch'; continue;
+        }
+        const inspection = await inspectTaskCommits(this.git, owned.path, task.preparedHeadSha);
+        if (!inspection.clean || inspection.headSha !== task.preparedHeadSha || inspection.commits.length !== 0) {
+          rejectedEvidence = 'the source task worktree contains provider-produced or committed changes'; continue;
+        }
+      } catch (error) {
+        rejectedEvidence = `the source task worktree is invalid: ${errorText(error)}`; continue;
+      }
+      sourceFailure = { taskId: task.id, attempt: attempt.attempt, errorCode: 'AGENT_FAILED', errorMessage: task.error!.message };
+      break;
+    }
+    if (sourceFailure === undefined) refuse(rejectedEvidence || 'no failure has safe source evidence');
+    return { version: 1, runId: this.state.runId, agent, oldExecutablePath,
+      oldExecutableState: oldExecutableState!, replacement, sourceFailure: sourceFailure! };
+  }
+
+  private replanner(): StaticReplanner {
+    return new StaticReplanner({ config: this.config, state: () => this.state, store: this.stateStore,
+      git: this.git, worktrees: this.worktrees, clock: this.clock,
+      ...(this.signal === undefined ? {} : { signal: this.signal }),
+      save: async (state) => { await this.mutate(() => state); },
+      event: (name, taskId, detail) => this.event(name, taskId, detail),
+    });
+  }
+
+  private async readAcceptedReviewArtifact(taskId: string, path: string): Promise<{ review: StructuredReview; sha256: string }> {
+    if (!this.state.tasks[taskId]?.reviewPaths.includes(path) || resolve(path) !== path) {
+      throw new OrchestratorError('TASK_STATE_INVALID', 'Review correction: artifact is not the persisted accepted review');
+    }
+    const reviewsRoot = await realpath(join(this.stateStore.runDirectory, 'reviews'));
+    const actual = await realpath(path);
+    if (!actual.startsWith(`${reviewsRoot}${sep}`)) {
+      throw new OrchestratorError('TASK_STATE_INVALID', 'Review correction: artifact resolves outside the run review directory');
+    }
+    const before = await lstat(path);
+    if (!before.isFile() || before.isSymbolicLink() || before.size > 2 * 1024 * 1024) {
+      throw new OrchestratorError('TASK_STATE_INVALID', 'Review correction: artifact must be a bounded regular file');
+    }
+    const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const metadata = await handle.stat();
+      if (metadata.dev !== before.dev || metadata.ino !== before.ino) {
+        throw new OrchestratorError('TASK_STATE_INVALID', 'Review correction: artifact changed while opening');
+      }
+      const bytes = await handle.readFile();
+      const after = await handle.stat();
+      if (after.size !== metadata.size || after.mtimeMs !== metadata.mtimeMs || after.ctimeMs !== metadata.ctimeMs) {
+        throw new OrchestratorError('TASK_STATE_INVALID', 'Review correction: artifact changed while reading');
+      }
+      return { review: parseReview(bytes.toString('utf8')), sha256: createHash('sha256').update(bytes).digest('hex') };
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private async checkReviewCorrectionEligibility(taskId: string, requestIndex: number): Promise<ReviewCorrectionAuthorization> {
+    const refuse = (reason: string): never => {
+      throw new OrchestratorError('TASK_STATE_INVALID', `Refusing review correction for ${taskId}: ${reason}`,
+        { details: { runId: this.state.runId, taskId, reason } });
+    };
+    if (this.state.strategy !== undefined || this.state.adaptive !== undefined) refuse('only static runs are supported');
+    if (this.state.status !== 'BLOCKED') refuse(`run status is ${this.state.status}, not BLOCKED`);
+    const spec = this.config.tasks.find((task) => task.id === taskId);
+    const task = this.state.tasks[taskId];
+    if (spec === undefined || task === undefined) throw new OrchestratorError('TASK_STATE_INVALID', `Refusing review correction for ${taskId}: source task is missing`);
+    if (!['review', 'final_review'].includes(spec.mode) || spec.writer) refuse('source is not an eligible read-only review task');
+    const attempt = task.agentAttempts.at(-1);
+    if (task.status !== 'BLOCKED' || task.error?.code !== 'BLOCKED_FOR_HUMAN_REVIEW'
+      || attempt?.outcome !== 'succeeded' || attempt.finishedAt === undefined || task.handoffOutcome !== 'valid') {
+      refuse('source must be BLOCKED_FOR_HUMAN_REVIEW after a successful provider attempt and accepted review');
+    }
+    if (task.reviewPaths.length === 0 || task.preparedHeadSha === undefined || task.worktreePath === undefined || task.branch === undefined) refuse('source review checkpoints are incomplete');
+    const reviewedHeadSha = task.preparedHeadSha!;
+    const worktreePath = task.worktreePath!;
+    const sourceBranch = task.branch!;
+    if (attempt === undefined) refuse('source review attempt is missing');
+    const sourceAttempt = attempt!;
+    if (this.state.reviewCorrections?.some((entry) => entry.authorization.reviewTaskId === taskId)) {
+      refuse('a correction continuation already exists for this review task');
+    }
+    if (this.state.integration.status !== 'PENDING' || this.state.integration.integratedTaskCommits.length !== 0
+      || Object.keys(this.state.integration).some((key) => !['status', 'integratedTaskCommits'].includes(key))
+      || (this.state.integrationAttempts?.length ?? 0) !== 0) refuse('integration has started');
+    if ((this.state.replanProposals?.length ?? 0) !== (this.state.replanAuthorizations?.length ?? 0)
+      || Object.values(this.state.tasks).some((entry) => entry.replan !== undefined && entry.replan.phase !== 'RESOLVED')) refuse('previous replans are not resolved');
+    for (const entry of Object.values(this.state.tasks)) {
+      if (entry.id !== taskId && ['RUNNING', 'READY'].includes(entry.status)) refuse('run is not quiescent');
+      const entrySpec = this.config.tasks.find((candidate) => candidate.id === entry.id);
+      if (entry.status === 'PENDING' && entrySpec !== undefined
+        && entrySpec.dependsOn.every((dependency) => ['SUCCEEDED', 'SKIPPED'].includes(this.state.tasks[dependency]?.status ?? ''))) {
+        refuse('run has a runnable pending task');
+      }
+      for (const recorded of entry.agentAttempts) {
+        if (recorded.finishedAt === undefined) refuse('an agent attempt is unfinished');
+        if (recorded.pid !== undefined) {
+          let dead = false;
+          try { process.kill(recorded.pid, 0); } catch (error) { dead = (error as NodeJS.ErrnoException).code === 'ESRCH'; }
+          if (!dead) refuse('a recorded provider process is still alive');
+        }
+      }
+    }
+    if ((await this.worktrees.listOwned()).some((entry) => entry.runId === this.state.runId && entry.kind === 'integration')) refuse('integration worktree already exists');
+    const artifactPath = task.reviewPaths.at(-1)!;
+    const artifact = await this.readAcceptedReviewArtifact(taskId, artifactPath);
+    if (artifact.review.status !== 'changes_requested') refuse(`accepted review status is ${artifact.review.status}`);
+    const requests = artifact.review.additionalWorkRequests ?? [];
+    if (requests.length !== 1 || requestIndex !== 0) refuse('v1 requires exactly one correction request at index 0');
+    const findingIds = artifact.review.findings.map((finding) => finding.id);
+    const request = validateCorrectionRequest(requests[requestIndex], findingIds);
+    const referencedFindings = new Set((request.evidence ?? [])
+      .filter((evidence) => evidence.kind === 'finding').map((evidence) => evidence.reference));
+    if (!artifact.review.findings.some((finding) => referencedFindings.has(finding.id) && finding.severity !== 'low')) {
+      refuse('selected correction request references no material finding');
+    }
+    const sourceRound = Math.max(task.reviewRounds, task.reviewPaths.length);
+    const ancestorRounds = completedReviewRounds(spec, new TaskGraph(this.config.tasks),
+      (candidate) => this.state.tasks[candidate]?.status === 'SUCCEEDED');
+    if (ancestorRounds + sourceRound >= this.config.maxReviewRounds) refuse('review round budget is exhausted');
+    const worktree = await this.worktrees.assertRegistered(worktreePath);
+    if (worktree.runId !== this.state.runId || worktree.taskId !== taskId || worktree.kind !== 'task'
+      || worktree.branch !== sourceBranch || worktree.baseSha !== this.state.baseSha) refuse('source review worktree registration mismatch');
+    const inspection = await inspectTaskCommits(this.git, worktree.path, reviewedHeadSha);
+    if (!inspection.clean || inspection.headSha !== reviewedHeadSha || inspection.commits.length !== 0) refuse('reviewed worktree has drifted');
+    const reviewedCodeInputs = taskCodeInputs(this.config, this.state, spec);
+    try {
+      await assertCodeInputHistory(this.git, worktree.path, this.state.baseSha, reviewedHeadSha, reviewedCodeInputs);
+    } catch (error) {
+      refuse(`reviewed dependency/code inputs drifted: ${errorText(error)}`);
+    }
+    const requestHash = correctionRequestHash(requests[requestIndex]);
+    const correctionTask = buildCorrectionTask(this.config, spec, request, correctionTaskIdSeed(taskId, requestHash));
+    const identity = {
+      version: 1 as const, runId: this.state.runId, reviewTaskId: taskId,
+      reviewArtifactPath: artifactPath, reviewArtifactSha256: artifact.sha256, findingIds,
+      correctionRequestIndex: requestIndex, correctionRequestHash: requestHash,
+      reviewedHeadSha, reviewedCodeInputs,
+      reviewedCodeInputsHash: canonicalHash(reviewedCodeInputs), sourceAttempt: sourceAttempt.attempt,
+      sourceRound, correctionTask,
+    };
+    const authorization = { id: authorizationId(identity), ...identity, authorizedBy: 'human' as const,
+      authorizedAt: this.clock().toISOString() };
+    // Validate the exact prospective effective graph before authorization is
+    // durable. This includes task IDs/dependencies/cycles and parallel writer
+    // ownership; a refusal therefore leaves run.json and events untouched.
+    applyReviewCorrectionOverlays(this.config, {
+      reviewCorrections: [{ authorization, phase: 'AUTHORIZED' }],
+    });
+    return authorization;
+  }
+
+  private async assertReviewCorrectionBinding(continuation: ReviewCorrectionContinuation): Promise<void> {
+    const auth = continuation.authorization;
+    const source = this.state.tasks[auth.reviewTaskId];
+    const spec = this.config.tasks.find((task) => task.id === auth.reviewTaskId);
+    if (source === undefined || spec === undefined || !source.reviewPaths.includes(auth.reviewArtifactPath)) {
+      throw new OrchestratorError('STATE_CORRUPT', 'Review correction source no longer matches persisted state');
+    }
+    const artifact = await this.readAcceptedReviewArtifact(auth.reviewTaskId, auth.reviewArtifactPath);
+    if (artifact.sha256 !== auth.reviewArtifactSha256 || artifact.review.status !== 'changes_requested'
+      || correctionRequestHash(artifact.review.additionalWorkRequests?.[auth.correctionRequestIndex]) !== auth.correctionRequestHash
+      || canonicalHash(auth.reviewedCodeInputs) !== auth.reviewedCodeInputsHash
+      || source.agentAttempts.some((attempt) => attempt.attempt === auth.sourceAttempt && attempt.outcome === 'succeeded') !== true) {
+      throw new OrchestratorError('STATE_CORRUPT', 'Review correction identity binding no longer validates');
+    }
+    const findingIds = artifact.review.findings.map((finding) => finding.id);
+    if (canonicalHash(findingIds) !== canonicalHash(auth.findingIds)) throw new OrchestratorError('STATE_CORRUPT', 'Review correction finding binding mismatch');
+    const request = validateCorrectionRequest(artifact.review.additionalWorkRequests![auth.correctionRequestIndex], findingIds);
+    const baseTask = baseCorrectionTask(this.config,
+      { ...spec, dependsOn: spec.dependsOn.filter((id) => id !== auth.correctionTask.id) }, request,
+      correctionTaskIdSeed(auth.reviewTaskId, auth.correctionRequestHash));
+    const legacyTask = { ...baseTask, verification: legacyCorrectionVerification(request) };
+    const legacyMatches = canonicalHash(legacyTask) === canonicalHash(auth.correctionTask);
+    const canonicalMatches = supportsCanonicalApiCorrectionVerification(request)
+      && canonicalHash({ ...baseTask, verification: correctionVerification(request) }) === canonicalHash(auth.correctionTask);
+    if (!canonicalMatches && !legacyMatches) {
+      throw new OrchestratorError('STATE_CORRUPT', 'Review correction task widens or differs from the authorized request');
+    }
+    const recovery = this.state.reviewCorrectionVerificationRecoveries?.find((entry) =>
+      entry.correctionAuthorizationId === auth.id);
+    if (recovery !== undefined && (canonicalHash(recovery.normalizedVerificationCommands)
+      !== canonicalHash(correctionVerification(request))
+      || canonicalHash(recovery.originalVerificationCommands) !== canonicalHash(auth.correctionTask.verification))) {
+      throw new OrchestratorError('STATE_CORRUPT', 'Review correction verification recovery is not canonical');
+    }
+  }
+
+  private async reconcileReviewCorrectionContinuations(): Promise<void> {
+    for (const entry of this.state.reviewCorrections ?? []) {
+      await this.assertReviewCorrectionBinding(entry);
+      const auth = entry.authorization;
+      if (this.state.tasks[auth.correctionTask.id] === undefined) {
+        await this.mutate((state) => ({ ...state, status: 'RUNNING', tasks: { ...state.tasks, [auth.correctionTask.id]: {
+          id: auth.correctionTask.id,
+          status: auth.correctionTask.dependsOn.every((id) => ['SUCCEEDED', 'SKIPPED'].includes(state.tasks[id]?.status ?? '')) ? 'READY' : 'PENDING',
+          agentAttempts: [], reviewRounds: 0, reviewPaths: [], handoffRepairAttempts: [],
+        } } }));
+        await this.event('REVIEW_CORRECTION_TASK_CREATED', auth.correctionTask.id, { authorizationId: auth.id, reviewTaskId: auth.reviewTaskId });
+        if (this.state.tasks[auth.correctionTask.id]?.status === 'READY') {
+          await this.event('TASK_READY', auth.correctionTask.id, { reviewCorrectionAuthorizationId: auth.id });
+        }
+      }
+      const correction = this.state.tasks[auth.correctionTask.id]!;
+      if (correction.status === 'SUCCEEDED' && correction.commit !== undefined && entry.phase !== 'REVIEW_REOPENED') {
+        if (entry.phase !== 'CORRECTION_SUCCEEDED') {
+          await this.mutate((state) => ({ ...state, reviewCorrections: state.reviewCorrections!.map((candidate) =>
+            candidate.authorization.id === auth.id ? { ...candidate, phase: 'CORRECTION_SUCCEEDED', correctionCommitSha: correction.commit!.sha } : candidate) }));
+          await this.event('REVIEW_CORRECTION_COMMITTED', auth.correctionTask.id, { authorizationId: auth.id, commitSha: correction.commit.sha });
+        }
+        // Separate durable checkpoint: a crash after the commit but before
+        // this mutation is healed by the next load without duplicating work.
+        await this.mutate((state) => {
+          const source = state.tasks[auth.reviewTaskId]!;
+          const { error: _error, finishedAt: _finishedAt, startedAt: _startedAt, skipReason: _skipReason, ...reopenable } = source;
+          return { ...state, status: 'RUNNING', tasks: { ...state.tasks,
+            [auth.reviewTaskId]: { ...reopenable, status: 'READY', reviewRounds: Math.max(source.reviewRounds, auth.sourceRound) },
+          }, reviewCorrections: state.reviewCorrections!.map((candidate) => candidate.authorization.id === auth.id
+            ? { ...candidate, phase: 'REVIEW_REOPENED', correctionCommitSha: correction.commit!.sha, reviewReopenedAt: this.clock().toISOString() }
+            : candidate) };
+        });
+        await this.event('REVIEW_CORRECTION_REOPENED', auth.reviewTaskId, { authorizationId: auth.id, correctionTaskId: auth.correctionTask.id, nextRound: auth.sourceRound + 1 });
+      }
+    }
+  }
+
+  /** Calling this host API/CLI explicitly authorizes one deterministic semantic correction; it executes no work. */
+  static async normalizeReplanEvidence(runId: string, taskId: string, request: {
+    readonly requestIndex: number;
+    readonly evidenceIndex: number;
+    readonly normalizedKind: string;
+  }, options: OrchestratorOptions): Promise<ReplanEvidenceNormalization> {
+    return AgentOrchestrator.withRunMutation(runId, options, async () => {
+      const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options, false);
+      return orchestrator.replanner().normalizeEvidence(taskId, request.requestIndex, request.evidenceIndex, request.normalizedKind);
+    });
+  }
+
+  /** Explicitly authorizes one content-hashed, bounded interpretation; invokes no provider and changes no worktree. */
+  static async interpretReplan(runId: string, taskId: string, request: {
+    readonly requestIndex: number;
+    readonly resourceClaims?: readonly unknown[];
+    readonly evidenceTransformations?: readonly { readonly evidenceIndex: number; readonly normalizedKind?: string; readonly normalizedReference?: string }[];
+  }, options: OrchestratorOptions): Promise<ReplanInterpretation> {
+    return AgentOrchestrator.withRunMutation(runId, options, async () => {
+      const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options, false);
+      return orchestrator.replanner().interpret(taskId, request);
+    });
+  }
+
+  static async proposeReplan(runId: string, taskId: string, options: OrchestratorOptions): Promise<ReplanProposal> {
+    return AgentOrchestrator.withRunMutation(runId, options, async () => {
+      const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options, false);
+      return orchestrator.replanner().propose(taskId);
+    });
+  }
+
+  /** Calling this host API/CLI is the explicit human grant; no agent output enters this method. */
+  static async authorizeReplan(runId: string, proposalId: string, options: OrchestratorOptions): Promise<ReplanProposal> {
+    return AgentOrchestrator.withRunMutation(runId, options, async () => {
+      const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options, false);
+      return orchestrator.replanner().authorize(proposalId);
+    });
+  }
+
   static async resume(runId: string, options: OrchestratorOptions): Promise<AgentOrchestrator> {
+    return AgentOrchestrator.withRunMutation(runId, options, () => AgentOrchestrator.resumeLocked(runId, options));
+  }
+
+  private static async resumeLocked(runId: string, options: OrchestratorOptions): Promise<AgentOrchestrator> {
     const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options);
     await orchestrator.reconcile();
+    if (orchestrator.state.status === 'BLOCKED' && orchestrator.state.replanAuthorizations?.some((grant) => {
+      const proposal = orchestrator.state.replanProposals!.find((entry) => entry.id === grant.proposalId)!;
+      const source = orchestrator.state.tasks[proposal.sourceTaskId]!;
+      return source.replan?.phase !== 'RESOLVED' && orchestrator.state.tasks[proposal.overlay.followup.id]?.status === 'SUCCEEDED';
+    })) await orchestrator.mutate((state) => ({ ...state, status: 'RUNNING' }));
     await orchestrator.event('RUN_RESUMED');
     return orchestrator;
   }
@@ -617,6 +1445,14 @@ export class AgentOrchestrator {
    * normal resume performs the actual agent invocation.
    */
   static async retryAgentFailure(
+    runId: string,
+    taskId: string,
+    options: OrchestratorOptions,
+  ): Promise<AgentFailureRetryResult> {
+    return AgentOrchestrator.withRunMutation(runId, options, () => AgentOrchestrator.retryAgentFailureLocked(runId, taskId, options));
+  }
+
+  private static async retryAgentFailureLocked(
     runId: string,
     taskId: string,
     options: OrchestratorOptions,
@@ -706,6 +1542,311 @@ export class AgentOrchestrator {
     return { orchestrator, taskId, recovery, reopenedTasks };
   }
 
+  /** Authorize one fresh normal review invocation after malformed structured output. */
+  static async retryReviewOutput(
+    runId: string,
+    taskId: string,
+    options: OrchestratorOptions,
+  ): Promise<ReviewOutputRetryResult> {
+    const repositoryRoot = await (options.git ?? new GitClient()).repositoryRoot(resolve(options.repositoryPath));
+    const store = new StateStore(resolve(options.runsRoot ?? join(repositoryRoot, 'tools/agent-orchestrator/runs')), runId);
+    return store.withRunMutationLock(async () => {
+      const persisted = await store.load();
+      if (persisted.strategy === 'adaptive' || persisted.adaptive !== undefined) {
+        throw new OrchestratorError('TASK_STATE_INVALID', 'Structured-review retry supports static runs only');
+      }
+      const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options);
+      const checked = await orchestrator.checkReviewOutputRetryEligibility(taskId);
+      if (!checked.eligible) {
+        throw new OrchestratorError(
+          'TASK_STATE_INVALID',
+          `Refusing structured-review retry for ${taskId}: ${checked.reason}`,
+          { details: { runId, taskId, reason: checked.reason } },
+        );
+      }
+
+      const previous = orchestrator.state.tasks[taskId]!;
+      const reopenedTasks = orchestrator.dependencyOnlyDescendantsToReopen(taskId);
+      for (const id of reopenedTasks) {
+        const descendant = orchestrator.state.tasks[id]!;
+        if (descendant.reviewRounds !== 0 || descendant.preparation !== undefined
+          || descendant.salvage !== undefined || descendant.replan !== undefined
+          || (descendant.agentFailureRecoveries?.length ?? 0) > 0
+          || (descendant.reviewOutputRecoveries?.length ?? 0) > 0) {
+          throw new OrchestratorError(
+            'TASK_STATE_INVALID',
+            `Dependency-blocked task ${id} contains execution or recovery evidence`,
+          );
+        }
+      }
+      const recovery = {
+        version: 2,
+        runId,
+        taskId,
+        reviewRound: checked.reviewRound,
+        taskReviewRound: checked.taskReviewRound,
+        preparedHeadSha: previous.preparedHeadSha!,
+        acceptedReviewArtifacts: checked.acceptedReviewArtifacts,
+        recovery: (previous.reviewOutputRecoveries?.length ?? 0) + 1,
+        authorizedAt: orchestrator.clock().toISOString(),
+        previousRunStatus: orchestrator.state.status as 'FAILED' | 'BLOCKED',
+        previousTaskStatus: 'FAILED',
+        error: previous.error!,
+        attempt: previous.agentAttempts.at(-1)!,
+        previousHandoffOutcome: 'invalid',
+        stdoutPath: checked.stdoutPath,
+        stdoutSha256: checked.stdoutSha256,
+        reopenedTaskIds: reopenedTasks,
+      } satisfies ReviewOutputRecoveryState;
+
+      await orchestrator.mutate((state) => {
+        const tasks = { ...state.tasks };
+        const target = tasks[taskId]!;
+        const {
+          error: _error,
+          finishedAt: _finishedAt,
+          startedAt: _startedAt,
+          handoffOutcome: _handoffOutcome,
+          skipReason: _skipReason,
+          ...retryable
+        } = target;
+        tasks[taskId] = {
+          ...retryable,
+          status: 'READY',
+          reviewOutputRecoveries: [...(target.reviewOutputRecoveries ?? []), recovery],
+        };
+        for (const id of reopenedTasks) {
+          const { error: _dependencyError, finishedAt: _dependencyFinishedAt, ...descendant } = tasks[id]!;
+          tasks[id] = { ...descendant, status: 'PENDING' };
+        }
+        return { ...state, status: 'RUNNING', tasks };
+      });
+      await orchestrator.event('REVIEW_OUTPUT_RETRY_AUTHORIZED', taskId, {
+        recovery: recovery.recovery,
+        failedAttempt: recovery.attempt.attempt,
+        reviewRound: recovery.reviewRound,
+        errorCode: recovery.error.code,
+        stdoutPath: recovery.stdoutPath,
+        stdoutSha256: recovery.stdoutSha256,
+        reopenedTasks,
+      });
+      for (const id of reopenedTasks) {
+        await orchestrator.event('TASK_DEPENDENCY_REOPENED', id, { recoveredDependency: taskId });
+      }
+      await orchestrator.event('RUN_RESUMED', undefined, {
+        recoveryMode: 'structured_review_output_retry', taskId, reopenedTasks,
+      });
+      return { orchestrator, taskId, recovery, reopenedTasks };
+    });
+  }
+
+  /**
+   * Authorize one post-fix Claude invocation after the ordinary retry for the
+   * same review round also failed under the superseded prompt-only contract.
+   * Authorization is state-only; normal resume performs the sole invocation.
+   */
+  static async continueClaudeReviewAfterOutputContractFix(
+    runId: string,
+    taskId: string,
+    options: OrchestratorOptions,
+  ): Promise<ReviewOutputContractContinuationResult> {
+    const repositoryRoot = await (options.git ?? new GitClient()).repositoryRoot(resolve(options.repositoryPath));
+    const store = new StateStore(resolve(options.runsRoot ?? join(repositoryRoot, 'tools/agent-orchestrator/runs')), runId);
+    return store.withRunMutationLock(async () => {
+      const persisted = await store.load();
+      if (persisted.strategy === 'adaptive' || persisted.adaptive !== undefined) {
+        throw new OrchestratorError('TASK_STATE_INVALID', 'Claude review contract continuation supports static runs only');
+      }
+      const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options);
+      const existing = orchestrator.state.tasks[taskId]?.reviewOutputRecoveries?.find(
+        (entry): entry is ReviewOutputRecoveryV3State => entry.version === 3,
+      );
+      if (existing !== undefined) {
+        return {
+          orchestrator,
+          taskId,
+          recovery: existing,
+          reopenedTasks: existing.reopenedTaskIds,
+          created: false,
+        };
+      }
+      const checked = await orchestrator.checkReviewOutputRetryEligibility(taskId, true);
+      const refuse = (reason: string): never => {
+        throw new OrchestratorError(
+          'TASK_STATE_INVALID',
+          `Refusing Claude review contract continuation for ${taskId}: ${reason}`,
+          { details: { runId, taskId, reason } },
+        );
+      };
+      const eligibility = checked.eligible === true ? checked : refuse(checked.reason);
+
+      const spec = orchestrator.config.tasks.find((candidate) => candidate.id === taskId)!;
+      const previous = orchestrator.state.tasks[taskId]!;
+      if (spec.owner !== 'claude') refuse('task owner is not Claude');
+      const activeContractId = structuredOutputContractIdFor(orchestrator.agents.claude, spec.mode)
+        ?? refuse('active Claude adapter does not declare a structured-review contract');
+      if (eligibility.reviewRound !== 2 || eligibility.taskReviewRound !== 2) {
+        refuse('only the unaccepted second review round is supported');
+      }
+      const sameRound = (previous.reviewOutputRecoveries ?? []).filter(
+        (entry): entry is ReviewOutputRecoveryV2State =>
+          entry.version === 2 && entry.reviewRound === eligibility.reviewRound,
+      );
+      if (sameRound.length !== 1) refuse('the same round is not bound to exactly one consumed v2 retry');
+      const consumed = sameRound[0]!;
+      const currentAttempt = previous.agentAttempts.at(-1)!;
+      if (currentAttempt.attempt !== consumed.attempt.attempt + 1
+        || currentAttempt.agent !== 'claude' || consumed.attempt.agent !== 'claude') {
+        refuse('the two malformed Claude attempts are not consecutive');
+      }
+      const currentStdout = await readFile(eligibility.stdoutPath);
+      const consumedStdout = await readFile(consumed.stdoutPath);
+      if (createHash('sha256').update(consumedStdout).digest('hex') !== consumed.stdoutSha256) {
+        refuse('the consumed retry stdout evidence changed');
+      }
+      for (const [label, bytes] of [['consumed retry', consumedStdout], ['latest attempt', currentStdout]] as const) {
+        const raw = bytes.toString('utf8').trim();
+        if (raw.length === 0 || parseJsonOrNull(raw) !== null
+          || extractClaudeStructuredReviewOutput(raw) !== null) {
+          refuse(`${label} is not a prompt-only prose output-contract failure`);
+        }
+      }
+      const reopenedTasks = orchestrator.dependencyOnlyDescendantsToReopen(taskId);
+      for (const id of reopenedTasks) {
+        const descendant = orchestrator.state.tasks[id]!;
+        if (descendant.reviewRounds !== 0 || descendant.preparation !== undefined
+          || descendant.salvage !== undefined || descendant.replan !== undefined
+          || (descendant.agentFailureRecoveries?.length ?? 0) > 0
+          || (descendant.reviewOutputRecoveries?.length ?? 0) > 0) {
+          refuse(`dependency-blocked task ${id} contains execution or recovery evidence`);
+        }
+      }
+      const recovery = {
+        version: 3,
+        runId,
+        taskId,
+        reviewRound: eligibility.reviewRound,
+        taskReviewRound: eligibility.taskReviewRound,
+        preparedHeadSha: previous.preparedHeadSha!,
+        acceptedReviewArtifacts: eligibility.acceptedReviewArtifacts,
+        recovery: (previous.reviewOutputRecoveries?.length ?? 0) + 1,
+        authorizedAt: orchestrator.clock().toISOString(),
+        previousRunStatus: orchestrator.state.status as 'FAILED' | 'BLOCKED',
+        previousTaskStatus: 'FAILED',
+        error: previous.error!,
+        attempt: currentAttempt,
+        previousHandoffOutcome: 'invalid',
+        stdoutPath: eligibility.stdoutPath,
+        stdoutSha256: eligibility.stdoutSha256,
+        reopenedTaskIds: reopenedTasks,
+        consumedRecovery: consumed.recovery,
+        consumedRecoverySha256: canonicalHash(consumed),
+        malformedAttempts: [consumed.attempt.attempt, currentAttempt.attempt],
+        oldContractId: CLAUDE_TEXT_REVIEW_OUTPUT_CONTRACT_ID,
+        newContractId: activeContractId,
+        dependencyCommits: orchestrator.dependencyCommits(spec),
+        promptArtifacts: await orchestrator.reviewPromptArtifactEvidence(spec),
+        authorizedBy: 'human',
+      } satisfies ReviewOutputRecoveryV3State;
+
+      await orchestrator.mutate((state) => {
+        const tasks = { ...state.tasks };
+        const target = tasks[taskId]!;
+        const {
+          error: _error,
+          finishedAt: _finishedAt,
+          startedAt: _startedAt,
+          handoffOutcome: _handoffOutcome,
+          skipReason: _skipReason,
+          ...retryable
+        } = target;
+        tasks[taskId] = {
+          ...retryable,
+          status: 'READY',
+          reviewOutputRecoveries: [...(target.reviewOutputRecoveries ?? []), recovery],
+        };
+        for (const id of reopenedTasks) {
+          const { error: _dependencyError, finishedAt: _dependencyFinishedAt, ...descendant } = tasks[id]!;
+          tasks[id] = { ...descendant, status: 'PENDING' };
+        }
+        return { ...state, status: 'RUNNING', tasks };
+      });
+      await orchestrator.event('REVIEW_OUTPUT_CONTRACT_CONTINUATION_AUTHORIZED', taskId, {
+        recovery: recovery.recovery,
+        reviewRound: recovery.reviewRound,
+        malformedAttempts: recovery.malformedAttempts,
+        consumedRecovery: recovery.consumedRecovery,
+        oldContractId: recovery.oldContractId,
+        newContractId: recovery.newContractId,
+        reopenedTasks,
+      });
+      for (const id of reopenedTasks) {
+        await orchestrator.event('TASK_DEPENDENCY_REOPENED', id, { recoveredDependency: taskId });
+      }
+      await orchestrator.event('RUN_RESUMED', undefined, {
+        recoveryMode: 'claude_review_output_contract_continuation', taskId, reopenedTasks,
+      });
+      return { orchestrator, taskId, recovery, reopenedTasks, created: true };
+    });
+  }
+
+  /** Reconsider only a static review-round guard failure before any invocation. */
+  static async retryPreflight(
+    runId: string,
+    taskId: string,
+    options: OrchestratorOptions,
+  ): Promise<PreflightRetryResult> {
+    const repositoryRoot = await (options.git ?? new GitClient()).repositoryRoot(resolve(options.repositoryPath));
+    const store = new StateStore(resolve(options.runsRoot ?? join(repositoryRoot, 'tools/agent-orchestrator/runs')), runId);
+    return store.withPreflightRetryLock(async () => {
+      // Reject adaptive runs before loading can reconcile dynamic lifecycle.
+      const original = await store.load();
+      if (original.strategy === 'adaptive' || original.adaptive !== undefined) {
+        throw new OrchestratorError('TASK_STATE_INVALID', 'Preflight retry supports static runs only');
+      }
+      const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options);
+      const completedRounds = await orchestrator.checkPreflightRetryEligibility(taskId);
+      const reopenedTasks = orchestrator.dependencyOnlyDescendantsToReopen(taskId);
+      for (const id of reopenedTasks) {
+        const descendant = orchestrator.state.tasks[id]!;
+        if (descendant.reviewRounds !== 0 || descendant.preparation !== undefined || descendant.salvage !== undefined
+          || (descendant.agentFailureRecoveries?.length ?? 0) > 0) {
+          throw new OrchestratorError('TASK_STATE_INVALID', `Dependency-blocked task ${id} contains execution evidence`);
+        }
+      }
+      const previous = orchestrator.state.tasks[taskId]!;
+      if (JSON.stringify(await store.load()) !== JSON.stringify(orchestrator.state)) {
+        throw new OrchestratorError('TASK_STATE_INVALID', 'Run changed during preflight eligibility checks');
+      }
+      // Durably archive authorization and the complete terminal context BEFORE
+      // clearing current errors. If saving fails, the task remains terminal and
+      // retry-preflight can safely be repeated. No worktree is removed or reset.
+      await orchestrator.event('PREFLIGHT_RETRY_AUTHORIZED', taskId, {
+        recoveryMode: 'review_preflight_retry', previousErrorCode: previous.error!.code,
+        previousRunStatus: orchestrator.state.status, previousTask: previous,
+        completedRounds, maxReviewRounds: orchestrator.config.maxReviewRounds, reopenedTasks,
+      });
+      await orchestrator.mutate((state) => {
+        const tasks = { ...state.tasks };
+        const { error: _error, finishedAt: _finished, startedAt: _started, ...target } = tasks[taskId]!;
+        tasks[taskId] = { ...target, status: 'PENDING' };
+        for (const id of reopenedTasks) {
+          const { error: _dependencyError, finishedAt: _dependencyFinished, ...descendant } = tasks[id]!;
+          tasks[id] = { ...descendant, status: 'PENDING' };
+        }
+        const statuses = new TaskScheduler(orchestrator.config.tasks, orchestrator.config.concurrency,
+          taskStatusRecord({ ...state, tasks })).snapshot();
+        for (const id of [taskId, ...reopenedTasks]) tasks[id] = { ...tasks[id]!, status: statuses[id]! };
+        return { ...state, status: 'RUNNING', tasks };
+      });
+      for (const id of reopenedTasks) {
+        await orchestrator.event('TASK_DEPENDENCY_REOPENED', id, { recoveredDependency: taskId });
+      }
+      await orchestrator.event('RUN_RESUMED', undefined, { recoveryMode: 'review_preflight_retry', taskId, reopenedTasks });
+      return { orchestrator, taskId, reopenedTasks, completedRounds, maxReviewRounds: orchestrator.config.maxReviewRounds };
+    });
+  }
+
   /**
    * §8/§10/§15 (real Phase 5 dogfood recovery): explicit, narrow recovery for
    * a run whose top-level status already went terminal (FAILED) because one
@@ -738,6 +1879,14 @@ export class AgentOrchestrator {
     rawPolicy: unknown,
     options: OrchestratorOptions,
   ): Promise<RecoveryPolicyAuthorizationResult> {
+    return AgentOrchestrator.withRunMutation(runId, options, () => AgentOrchestrator.authorizeRecoveryPolicyLocked(runId, rawPolicy, options));
+  }
+
+  private static async authorizeRecoveryPolicyLocked(
+    runId: string,
+    rawPolicy: unknown,
+    options: OrchestratorOptions,
+  ): Promise<RecoveryPolicyAuthorizationResult> {
     const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options);
     const policy = parseRecoveryPolicyOverlay(rawPolicy);
     const policyHash = hashRecoveryPolicy(policy);
@@ -758,6 +1907,13 @@ export class AgentOrchestrator {
   }
 
   static async recoverHandoffFailures(
+    runId: string,
+    options: OrchestratorOptions,
+  ): Promise<HandoffRecoveryResult> {
+    return AgentOrchestrator.withRunMutation(runId, options, () => AgentOrchestrator.recoverHandoffFailuresLocked(runId, options));
+  }
+
+  private static async recoverHandoffFailuresLocked(
     runId: string,
     options: OrchestratorOptions,
   ): Promise<HandoffRecoveryResult> {
@@ -876,6 +2032,13 @@ export class AgentOrchestrator {
     runId: string,
     options: OrchestratorOptions,
   ): Promise<AgentOrchestrator> {
+    return AgentOrchestrator.withRunMutation(runId, options, () => AgentOrchestrator.retryIntegrationGateLocked(runId, options));
+  }
+
+  private static async retryIntegrationGateLocked(
+    runId: string,
+    options: OrchestratorOptions,
+  ): Promise<AgentOrchestrator> {
     const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options);
     const state = orchestrator.state;
     if (state.status !== 'BLOCKED') {
@@ -968,6 +2131,14 @@ export class AgentOrchestrator {
     options: OrchestratorOptions,
     fix: { readonly ownership: readonly string[]; readonly summary: string },
   ): Promise<AgentOrchestrator> {
+    return AgentOrchestrator.withRunMutation(runId, options, () => AgentOrchestrator.applyIntegrationFixLocked(runId, options, fix));
+  }
+
+  private static async applyIntegrationFixLocked(
+    runId: string,
+    options: OrchestratorOptions,
+    fix: { readonly ownership: readonly string[]; readonly summary: string },
+  ): Promise<AgentOrchestrator> {
     const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options);
     const state = orchestrator.state;
     if (state.status !== 'BLOCKED') {
@@ -1039,8 +2210,8 @@ export class AgentOrchestrator {
   }
 
   /**
-   * Salvages useful work a timed-out writer left behind in its dirty
-   * worktree. A dirty diff is only evidence, never success on its own:
+   * Salvages useful work a failed or timed-out writer left behind in its
+   * dirty worktree. A dirty diff is only evidence, never success on its own:
    * eligibility (ownership/foreign-commit/diff-check-clean) -> deterministic
    * salvage.verify (never trusting operator prose) -> a diff/config-bound
    * SALVAGE_VERIFIED checkpoint -> the Orchestrator (never salvage code
@@ -1056,6 +2227,14 @@ export class AgentOrchestrator {
     taskId: string,
     options: OrchestratorOptions,
   ): Promise<SalvageResult> {
+    return AgentOrchestrator.withRunMutation(runId, options, () => AgentOrchestrator.salvageTaskLocked(runId, taskId, options));
+  }
+
+  private static async salvageTaskLocked(
+    runId: string,
+    taskId: string,
+    options: OrchestratorOptions,
+  ): Promise<SalvageResult> {
     return AgentOrchestrator.recoverDirtyWriter(runId, taskId, options, false);
   }
 
@@ -1065,7 +2244,84 @@ export class AgentOrchestrator {
     taskId: string,
     options: OrchestratorOptions,
   ): Promise<SalvageResult> {
+    return AgentOrchestrator.withRunMutation(runId, options, () => AgentOrchestrator.verifyBlockedTaskLocked(runId, taskId, options));
+  }
+
+  private static async verifyBlockedTaskLocked(
+    runId: string,
+    taskId: string,
+    options: OrchestratorOptions,
+  ): Promise<SalvageResult> {
     return AgentOrchestrator.recoverDirtyWriter(runId, taskId, options, true);
+  }
+
+  /** Finalizes legacy event-backed verification failure provenance without executing commands or touching the worktree. */
+  static async finalizeFailedSalvage(runId: string, taskId: string, options: OrchestratorOptions) {
+    return AgentOrchestrator.withRunMutation(runId, options, async () => {
+      const orchestrator = await AgentOrchestrator.loadRunForContinuation(runId, options, false);
+      const state = orchestrator.state;
+      const task = state.tasks[taskId];
+      if (state.strategy !== undefined || state.adaptive !== undefined || state.status !== 'BLOCKED' || task?.status !== 'BLOCKED'
+        || task.salvage === undefined || task.salvage.verification !== undefined || task.commit !== undefined
+        || state.integration.status !== 'PENDING' || state.integration.integratedTaskCommits.length !== 0
+        || (state.integrationAttempts?.length ?? 0) !== 0 || Object.values(state.tasks).some((entry) => ['RUNNING', 'READY'].includes(entry.status))) {
+        throw new OrchestratorError('TASK_STATE_INVALID', `Refusing failed salvage finalization for ${taskId}: run is not a quiescent static blocked source before integration`);
+      }
+      if ((await orchestrator.worktrees.listOwned()).some((entry) => entry.runId === runId && entry.kind === 'integration')) throw new OrchestratorError('TASK_STATE_INVALID', 'Integration worktree already exists');
+      for (const entry of Object.values(state.tasks)) for (const attempt of entry.agentAttempts) {
+        if (attempt.finishedAt === undefined) throw new OrchestratorError('TASK_STATE_INVALID', 'Run contains an unfinished agent attempt');
+        if (attempt.pid !== undefined) { try { process.kill(attempt.pid, 0); throw new OrchestratorError('TASK_STATE_INVALID', 'Run contains a live recorded agent process'); } catch (error) { if (error instanceof OrchestratorError || (error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; } }
+      }
+      const checked = await orchestrator.checkSalvageEligibility(taskId, true);
+      if (!checked.eligible) throw new OrchestratorError('TASK_STATE_INVALID', `Refusing failed salvage finalization for ${taskId}: ${checked.reason}`);
+      const source = await readFile(orchestrator.stateStore.eventsPath, 'utf8');
+      const lines = source.split('\n').filter((line) => line.length > 0);
+      const events = lines.map((line, index) => {
+        try { return { raw: line, index, event: JSON.parse(line) as { name?: string; runId?: string; taskId?: string; timestamp?: string; data?: Record<string, unknown> } }; }
+        catch (error) { throw new OrchestratorError('STATE_CORRUPT', `Invalid event JSON at line ${index + 1}`, { cause: error }); }
+      });
+      const taskEvents = events.filter(({ event }) => event.runId === runId && event.taskId === taskId);
+      const failurePosition = taskEvents.map(({ event }) => event.name).lastIndexOf('SALVAGE_VERIFICATION_FAILED');
+      if (failurePosition < 0) throw new OrchestratorError('TASK_STATE_INVALID', 'No salvage verification failure event exists for this task');
+      const failureEvent = taskEvents[failurePosition]!;
+      const authorizedPosition = taskEvents.slice(0, failurePosition).map(({ event }) => event.name).lastIndexOf('SALVAGE_AUTHORIZED');
+      if (authorizedPosition < 0) throw new OrchestratorError('TASK_STATE_INVALID', 'Salvage failure has no preceding authorization event');
+      if (taskEvents.slice(authorizedPosition + 1, failurePosition).some(({ event }) => ['SALVAGE_AUTHORIZED', 'SALVAGE_VERIFIED', 'SALVAGE_VERIFICATION_FAILED'].includes(event.name ?? ''))) throw new OrchestratorError('TASK_STATE_INVALID', 'Legacy salvage lifecycle evidence is ambiguous or reordered');
+      if (taskEvents.slice(failurePosition + 1).some(({ event }) => ['SALVAGE_VERIFIED', 'SALVAGE_AUTHORIZED', 'SALVAGE_COMMAND_FINISHED', 'SALVAGE_VERIFICATION_FAILED'].includes(event.name ?? ''))) throw new OrchestratorError('TASK_STATE_INVALID', 'Salvage failure is contradicted by later lifecycle evidence');
+      const commandEvents = taskEvents.slice(authorizedPosition + 1, failurePosition).filter(({ event }) => event.name === 'SALVAGE_COMMAND_FINISHED');
+      const reason = typeof failureEvent.event.data?.reason === 'string' ? failureEvent.event.data.reason : '';
+      const lastCommand = commandEvents.at(-1)?.event.data;
+      if (reason !== 'verify_command_failed' || commandEvents.some(({ event }) => event.data?.hostVerification !== true)
+        || lastCommand?.required !== true || !(lastCommand.exitCode !== 0 || lastCommand.timedOut === true || lastCommand.signal !== null && lastCommand.signal !== undefined || lastCommand.termination !== null && lastCommand.termination !== undefined)) {
+        throw new OrchestratorError('TASK_STATE_INVALID', 'Legacy salvage events do not prove a required verification command failed');
+      }
+      const worktreeHeadSha = await orchestrator.git.resolveCommit(checked.worktree.path, 'HEAD');
+      if (worktreeHeadSha !== task.preparedHeadSha) throw new OrchestratorError('TASK_STATE_INVALID', 'Legacy failed salvage worktree HEAD changed');
+      const trackedDiffFingerprint = await computeTrackedDiffFingerprint(orchestrator.git, checked.worktree.path, task.preparedHeadSha!);
+      const authorizationEvent = taskEvents[authorizedPosition]!;
+      if (typeof authorizationEvent.event.timestamp !== 'string' || Date.parse(authorizationEvent.event.timestamp) < Date.parse(task.salvage.authorizedAt)) throw new OrchestratorError('TASK_STATE_INVALID', 'Salvage authorization event does not match persisted authorization');
+      const evidenceLines = [authorizationEvent, ...commandEvents, failureEvent].map(({ index, raw }) => ({ line: index + 1, sha256: createHash('sha256').update(raw).digest('hex') }));
+      const logEvidence = [] as { path: string; sha256: string }[];
+      for (const { event } of commandEvents) for (const key of ['stdoutPath', 'stderrPath'] as const) {
+        const path = event.data?.[key];
+        if (typeof path !== 'string' || !resolve(path).startsWith(`${resolve(orchestrator.stateStore.runDirectory)}/`)) throw new OrchestratorError('TASK_STATE_INVALID', `Legacy salvage command lacks bounded ${key} evidence`);
+        let content: Buffer;
+        try { content = await readFile(path); } catch (error) { throw new OrchestratorError('TASK_STATE_INVALID', `Legacy salvage ${key} evidence is unreadable`, { cause: error }); }
+        logEvidence.push({ path, sha256: createHash('sha256').update(content).digest('hex') });
+      }
+      const evidenceHash = replanHash({ evidenceLines, logEvidence });
+      const failedAt = typeof failureEvent.event.timestamp === 'string' && Number.isFinite(Date.parse(failureEvent.event.timestamp)) ? failureEvent.event.timestamp : (() => { throw new OrchestratorError('STATE_CORRUPT', 'Failure event timestamp is invalid'); })();
+      const body = { failedAt, source: 'legacy_event_finalization' as const, reason, worktreeHeadSha, trackedDiffFingerprint, evidenceHash };
+      const failure = { id: replanHash({ runId, taskId, ...body }), ...body };
+      if (task.salvage.phase === 'FAILED') {
+        if (task.salvage.failures?.some((entry) => entry.id === failure.id)) return failure;
+        throw new OrchestratorError('TASK_STATE_INVALID', 'Persisted failed lifecycle differs from legacy evidence');
+      }
+      if (task.salvage.phase !== undefined) throw new OrchestratorError('TASK_STATE_INVALID', 'Only an ambiguous legacy salvage lifecycle may be finalized');
+      await orchestrator.mutate((current) => updateTask(current, taskId, (entry) => ({ ...entry, salvage: { ...entry.salvage!, phase: 'FAILED', failures: [failure] } })));
+      await orchestrator.event('SALVAGE_FAILED_FINALIZED', taskId, { failureId: failure.id, evidenceHash, evidenceLines, logEvidence });
+      return failure;
+    });
   }
 
   private static async recoverDirtyWriter(
@@ -1092,12 +2348,17 @@ export class AgentOrchestrator {
       if (originalHandoff.status !== 'blocked') throw new OrchestratorError('TASK_STATE_INVALID', 'Expected blocked handoff');
       validateCanonicalFindingResponses(originalHandoff, orchestrator.requiredCanonicalFindings(taskId));
     }
-    const reopenedTasks = blockedWriter ? orchestrator.dependencyOnlyDescendantsToReopen(taskId) : undefined;
+    // Reopen attributable dependency-blocked descendants and make the run
+    // resumable again, the same way retry-agent and verify-blocked-task
+    // already do — otherwise a successfully salvaged task would leave the
+    // run's top-level status stuck at FAILED/BLOCKED forever, and any
+    // descendant that failed only because this task did would never unblock.
+    const reopenedTasks = orchestrator.dependencyOnlyDescendantsToReopen(taskId);
 
     if (orchestrator.state.tasks[taskId]?.salvage === undefined) {
       await orchestrator.mutate((state) => updateTask(state, taskId, (task) => ({
         ...task,
-        salvage: { authorizedAt: orchestrator.clock().toISOString() },
+        salvage: { authorizedAt: orchestrator.clock().toISOString(), phase: 'AUTHORIZED' },
       })));
       await orchestrator.event('SALVAGE_AUTHORIZED', taskId, blockedWriter
         ? { recoveryMode: 'blocked_writer_host_verification', originalHandoffPath: originalTask.handoffPath, error: originalTask.error, attempt: originalTask.agentAttempts.at(-1) }
@@ -1124,6 +2385,22 @@ export class AgentOrchestrator {
       && existingCheckpoint.verifyConfigFingerprint === verifyConfigFingerprint;
 
     if (!checkpointValid) {
+      await orchestrator.mutate((state) => updateTask(state, taskId, (task) => ({
+        ...task, salvage: { authorizedAt: task.salvage!.authorizedAt, phase: 'VERIFYING', ...(task.salvage!.failures === undefined ? {} : { failures: task.salvage!.failures }) },
+      })));
+      const recordFailure = async (reason: string, commandResults: readonly IntegrationCommandResult[] = []): Promise<void> => {
+        const failedAt = orchestrator.clock().toISOString();
+        const worktreeHeadSha = await orchestrator.git.resolveCommit(checked.worktree.path, 'HEAD');
+        const trackedDiffFingerprint = await computeTrackedDiffFingerprint(orchestrator.git, checked.worktree.path, preparedHeadSha);
+        const evidence = { runId, taskId, reason, failedAt, worktreeHeadSha, trackedDiffFingerprint, verifyConfigFingerprint, commandResults };
+        const evidenceHash = createHash('sha256').update(JSON.stringify(evidence)).digest('hex');
+        const body = { failedAt, source: 'runtime' as const, reason, worktreeHeadSha, trackedDiffFingerprint, evidenceHash };
+        const failure = { id: replanHash({ runId, taskId, ...body }), ...body };
+        await orchestrator.mutate((state) => updateTask(state, taskId, (task) => ({ ...task,
+          salvage: { ...task.salvage!, phase: 'FAILED', failures: [...(task.salvage!.failures ?? []), failure] },
+        })));
+        await orchestrator.event('SALVAGE_VERIFICATION_FAILED', taskId, { reason, failureId: failure.id, evidenceHash });
+      };
       // Unique attempt directories preserve command logs and evidence across retries.
       const logsDirectory = join(orchestrator.stateStore.runDirectory, 'logs', taskId,
         `salvage-${randomBytes(12).toString('hex')}`);
@@ -1185,6 +2462,7 @@ export class AgentOrchestrator {
         }
       }
       if (orchestrator.config.salvage.verify.length === 0) {
+        await recordFailure('no_verify_configured');
         throw new OrchestratorError(
           'SALVAGE_VERIFICATION_FAILED',
           `Refusing salvage for ${taskId}: no salvage.verify commands configured`,
@@ -1209,7 +2487,7 @@ export class AgentOrchestrator {
       // even one that happens to also report success.
       if (postFingerprint !== preFingerprint
         || await orchestrator.git.resolveCommit(checked.worktree.path, 'HEAD') !== preparedHeadSha) {
-        await orchestrator.event('SALVAGE_VERIFICATION_FAILED', taskId, { reason: 'verify_mutated_tracked_source' });
+        await recordFailure('verify_mutated_tracked_source', verified.commands);
         throw new OrchestratorError(
           'SALVAGE_VERIFICATION_FAILED',
           `Refusing salvage for ${taskId}: verify commands modified tracked source`,
@@ -1217,7 +2495,7 @@ export class AgentOrchestrator {
         );
       }
       if (!verified.passed) {
-        await orchestrator.event('SALVAGE_VERIFICATION_FAILED', taskId, { reason: 'verify_command_failed' });
+        await recordFailure('verify_command_failed', verified.commands);
         throw new OrchestratorError(
           'SALVAGE_VERIFICATION_FAILED',
           `Refusing salvage for ${taskId}: required verify command failed`,
@@ -1252,6 +2530,8 @@ export class AgentOrchestrator {
         ...task,
         salvage: {
           authorizedAt: task.salvage!.authorizedAt,
+          phase: 'VERIFIED',
+          ...(task.salvage!.failures === undefined ? {} : { failures: task.salvage!.failures }),
           verification: {
             worktreeHeadSha: preparedHeadSha,
             trackedDiffFingerprint: postFingerprint,
@@ -1290,7 +2570,7 @@ export class AgentOrchestrator {
     )).stdout;
     const synthesizedHandoff = {
       status: 'complete',
-      summary: `Salvaged timed-out writer work for ${taskId} after deterministic verification.`,
+      summary: `Salvaged dirty writer work for ${taskId} after deterministic verification.`,
       filesChanged: [...checked.changedFiles],
       decisions: [],
       tests: orchestrator.config.salvage.verify.map((command) => ({
@@ -1334,7 +2614,7 @@ export class AgentOrchestrator {
       baseSha: preparedHeadSha,
       agent: taskSpec.owner,
       taskId,
-      summary: blockedWriter ? `Recovered blocked writer after host verification for ${taskId}` : `Salvaged timed-out writer work for ${taskId}`,
+      summary: blockedWriter ? `Recovered blocked writer after host verification for ${taskId}` : `Salvaged dirty writer work for ${taskId}`,
     });
     assertChangedFileOwnership(taskId, ensured.changedFiles, taskSpec.files);
     if (JSON.stringify([...ensured.changedFiles].sort()) !== JSON.stringify([...checked.changedFiles].sort())) {
@@ -1351,7 +2631,7 @@ export class AgentOrchestrator {
       sha: ensured.commitSha,
       parentSha: preparedHeadSha,
       changedFiles: [...ensured.changedFiles],
-    }, reopenedTasks);
+    }, reopenedTasks, blockedWriter ? 'blocked_writer_host_verification' : 'salvage');
     // §12: same post-recovery adaptive completion lifecycle as handoff
     // repair — no salvage.verify rerun, no second commit, no repeat repair;
     // this only mirrors the already-accepted success into the adaptive layer.
@@ -1365,6 +2645,19 @@ export class AgentOrchestrator {
   }
 
   async execute(): Promise<RunState> {
+    return this.stateStore.withRunMutationLock(async () => {
+      if (replanHash(await this.stateStore.load()) !== replanHash(validateRunState(this.state))) {
+        throw new OrchestratorError('TASK_STATE_INVALID', 'Run changed after loading; resume again before execution');
+      }
+      return this.executeLocked();
+    });
+  }
+
+  private async executeLocked(): Promise<RunState> {
+    if (Object.values(this.state.tasks).some((task) => task.replan !== undefined && task.replan.phase !== 'RESOLVED')) {
+      await assertBaseBranchUnmoved(this.git, this.repositoryRoot, this.state.baseBranch, this.state.baseSha);
+    }
+    if (!await this.replanner().advance()) return this.state;
     while (this.state.status === 'RUNNING' || this.state.status === 'CREATED') {
       if (this.signal?.aborted === true) {
         await this.cancelRun('Orchestrator execution was aborted');
@@ -1379,6 +2672,7 @@ export class AgentOrchestrator {
       await this.advanceAdaptiveScheduling();
       await this.reconcileAdaptiveCorrectionFlow();
       await this.advanceAdaptiveScheduling();
+      if (!await this.replanner().advance()) return this.state;
       const scheduler = new TaskScheduler(
         this.config.tasks,
         this.config.concurrency,
@@ -1513,6 +2807,13 @@ export class AgentOrchestrator {
   }
 
   async cleanup(): Promise<readonly string[]> {
+    return this.stateStore.withRunMutationLock(() => this.cleanupLocked());
+  }
+
+  private async cleanupLocked(): Promise<readonly string[]> {
+    if (replanHash(await this.stateStore.load()) !== replanHash(validateRunState(this.state))) {
+      throw new OrchestratorError('TASK_STATE_INVALID', 'Run changed after loading; reload before cleanup');
+    }
     if (this.state.status === 'RUNNING' || Object.values(this.state.tasks).some(
       (task) => task.status === 'RUNNING',
     )) {
@@ -2085,6 +3386,14 @@ export class AgentOrchestrator {
   }
 
   private async executeTask(task: TaskSpec): Promise<void> {
+    const correctionContinuation = this.state.reviewCorrections?.find(
+      (entry) => entry.authorization.correctionTask.id === task.id && entry.phase === 'AUTHORIZED');
+    if (correctionContinuation !== undefined) {
+      await this.mutate((state) => ({ ...state, reviewCorrections: state.reviewCorrections!.map((entry) =>
+        entry.authorization.id === correctionContinuation.authorization.id
+          ? { ...entry, phase: 'CORRECTION_RUNNING' }
+          : entry) }));
+    }
     // Checked BEFORE prepareTask deliberately: prepareTask is what creates
     // the worktree and applies dependency commits. A task whose condition
     // says skip must never reach that point — no worktree, no agent
@@ -2107,9 +3416,11 @@ export class AgentOrchestrator {
       return;
     }
     if (REVIEW_MODES.has(task.mode)) {
-      const completedRounds = ancestorTasks(task, new TaskGraph(this.config.tasks))
-        .filter((ancestor) => REVIEW_MODES.has(ancestor.mode))
-        .filter((ancestor) => this.state.tasks[ancestor.id]?.status === 'SUCCEEDED').length;
+      const completedRounds = completedReviewRounds(
+        task,
+        new TaskGraph(this.config.tasks),
+        (taskId) => this.state.tasks[taskId]?.status === 'SUCCEEDED',
+      ) + this.state.tasks[task.id]!.reviewRounds;
       assertReviewRoundAllowed(completedRounds, this.config.maxReviewRounds);
       await this.event('REVIEW_STARTED', task.id, { round: completedRounds + 1 });
     }
@@ -2185,6 +3496,23 @@ export class AgentOrchestrator {
     let worktree: OwnedWorktree;
     if (current.worktreePath !== undefined) {
       worktree = await this.worktrees.assertRegistered(current.worktreePath);
+      const continuation = this.state.reviewCorrections?.find((entry) =>
+        entry.authorization.reviewTaskId === task.id && entry.phase === 'REVIEW_REOPENED');
+      if (continuation !== undefined) {
+        const correction = this.state.tasks[continuation.authorization.correctionTask.id];
+        if (correction?.status !== 'SUCCEEDED' || correction.commit?.sha !== continuation.correctionCommitSha) {
+          throw new OrchestratorError('TASK_STATE_INVALID', 'Reopened review correction commit is not durably successful');
+        }
+        const correctionCommit = correction.commit!;
+        const inspection = await inspectTaskCommits(this.git, worktree.path, continuation.authorization.reviewedHeadSha);
+        if (!inspection.clean) throw new OrchestratorError('TASK_STATE_INVALID', 'Reopened review worktree is dirty');
+        if (inspection.commits.length === 0 && inspection.headSha === continuation.authorization.reviewedHeadSha) {
+          const applied = await integrateTaskCommits(this.git, worktree.path, [{ taskId: correction.id, commitSha: correctionCommit.sha }]);
+          if (applied.status === 'conflict') throw integrationConflictError(applied);
+        }
+        const rerunHead = await this.git.resolveCommit(worktree.path, 'HEAD');
+        await assertCodeInputHistory(this.git, worktree.path, this.state.baseSha, rerunHead, this.dependencyCommits(task));
+      }
     } else {
       worktree = await this.worktrees.createTaskWorktree({
         runId: this.state.runId,
@@ -2210,11 +3538,35 @@ export class AgentOrchestrator {
       }));
     }
 
+    if ((task.checkpointInputs?.length ?? 0) > 0) {
+      await assertCodeInputHistory(this.git, worktree.path, this.state.baseSha,
+        await this.git.resolveCommit(worktree.path, 'HEAD'), this.dependencyCommits(task));
+      for (const input of task.checkpointInputs!) {
+        await this.mutate((state) => updateTask(state, input.sourceTaskId, (source) => ({
+          ...source, replan: { ...source.replan!, phase: 'FOLLOWUP_RUNNING' },
+        })));
+      }
+    }
     let inspection = await inspectTaskCommits(this.git, worktree.path, this.state.baseSha);
     if (!inspection.clean) {
       throw new OrchestratorError(
         'AGENT_FAILED',
         `Task ${task.id} worktree is dirty before invocation; preserving it for inspection`,
+      );
+    }
+    const contractContinuation = current.reviewOutputRecoveries?.find(
+      (entry): entry is ReviewOutputRecoveryV3State => entry.version === 3,
+    );
+    if (contractContinuation !== undefined) {
+      if (inspection.headSha !== contractContinuation.preparedHeadSha) {
+        throw new OrchestratorError('TASK_STATE_INVALID', 'Claude review contract continuation prepared HEAD changed');
+      }
+      await assertCodeInputHistory(
+        this.git,
+        worktree.path,
+        this.state.baseSha,
+        inspection.headSha,
+        contractContinuation.dependencyCommits,
       );
     }
     const preparationReusable = canReuseIntegrationPreparation(
@@ -2299,6 +3651,9 @@ export class AgentOrchestrator {
     }
     const graph = new TaskGraph(this.config.tasks);
     const ancestors = ancestorTasks(task, graph);
+    const authorizedReviewPath = this.state.reviewCorrections?.find(
+      (entry) => entry.authorization.correctionTask.id === task.id,
+    )?.authorization.reviewArtifactPath;
     const actualDependencyDiff = (
       await this.git.run(worktree.path, [
         'diff',
@@ -2319,13 +3674,14 @@ export class AgentOrchestrator {
       worktree,
       preparedHeadSha: inspection.headSha,
       dependencyHandoffs: await readArtifacts(
-        ancestors.flatMap((ancestor) => {
+        [...ancestors, ...(task.checkpointInputs ?? []).map((input) => graph.get(input.sourceTaskId))].flatMap((ancestor) => {
           const state = this.state.tasks[ancestor.id];
           return state?.handoffPath === undefined ? [] : [state.handoffPath];
         }),
       ),
       previousReviewFindings: (await readArtifacts(
-        ancestors.flatMap((ancestor) => this.state.tasks[ancestor.id]?.reviewPaths ?? []),
+        [...ancestors.flatMap((ancestor) => this.state.tasks[ancestor.id]?.reviewPaths ?? []),
+          ...(authorizedReviewPath === undefined ? [] : [authorizedReviewPath])],
       )).flatMap((artifact) => isRecord(artifact) && Array.isArray(artifact.findings)
         ? artifact.findings
         : []),
@@ -2336,7 +3692,33 @@ export class AgentOrchestrator {
   private async runTrackedAgent(prepared: PreparedTask, agent: Agent): Promise<AgentResult> {
     const task = prepared.task;
     const configuredTimeoutMs = task.timeoutMs ?? this.config.agentTimeoutMs;
-    const attemptNumber = await this.allocateAttempt(task.id, agent.name, configuredTimeoutMs);
+    const structuredOutputContractId = structuredOutputContractIdFor(agent, task.mode);
+    const contractContinuation = this.state.tasks[task.id]?.reviewOutputRecoveries?.find(
+      (entry): entry is ReviewOutputRecoveryV3State => entry.version === 3,
+    );
+    if (contractContinuation !== undefined) {
+      const postFixAttempts = this.state.tasks[task.id]!.agentAttempts.filter(
+        (attempt) => attempt.attempt > contractContinuation.attempt.attempt,
+      );
+      if (postFixAttempts.length > 0) {
+        throw new OrchestratorError(
+          'TASK_STATE_INVALID',
+          `Claude review contract continuation invocation is already consumed for ${task.id}`,
+        );
+      }
+      if (structuredOutputContractId !== contractContinuation.newContractId) {
+        throw new OrchestratorError(
+          'TASK_STATE_INVALID',
+          `Claude review contract changed before the authorized post-fix attempt for ${task.id}`,
+        );
+      }
+    }
+    const attemptNumber = await this.allocateAttempt(
+      task.id,
+      agent.name,
+      configuredTimeoutMs,
+      structuredOutputContractId,
+    );
     await this.event('AGENT_STARTED', task.id, {
       agent: agent.name, attempt: attemptNumber, timeoutMs: configuredTimeoutMs,
     });
@@ -2413,9 +3795,15 @@ export class AgentOrchestrator {
       return;
     }
     const taskState = this.state.tasks[prepared.task.id]!;
+    const contractContinuation = taskState.reviewOutputRecoveries?.find(
+      (entry): entry is ReviewOutputRecoveryV3State => entry.version === 3,
+    );
+    const contractFixInvocationConsumed = contractContinuation !== undefined
+      && taskState.agentAttempts.some((attempt) => attempt.attempt > contractContinuation.attempt.attempt);
     const retryAvailable =
       INFRASTRUCTURE_FAILURES.has(result.status)
-      && taskState.agentAttempts.length <= this.config.agentRetries;
+      && taskState.agentAttempts.length <= this.config.agentRetries
+      && !contractFixInvocationConsumed;
     const inspection = await inspectTaskCommits(
       this.git,
       prepared.worktree.path,
@@ -2481,6 +3869,18 @@ export class AgentOrchestrator {
     taskId: string,
     immediatelyRelevantFindings: readonly unknown[] = [],
   ): readonly RequiredCanonicalFinding[] {
+    const staticContinuation = this.state.reviewCorrections?.find(
+      (entry) => entry.authorization.correctionTask.id === taskId,
+    );
+    if (staticContinuation !== undefined) {
+      const auth = staticContinuation.authorization;
+      return auth.findingIds.map((findingId) => ({
+        findingId,
+        canonicalFindingKey: `${auth.reviewTaskId}:${auth.reviewArtifactSha256}:${findingId}`,
+        sourceWorkUnitId: auth.reviewTaskId,
+        artifactPath: auth.reviewArtifactPath,
+      }));
+    }
     const adaptive = this.state.adaptive;
     if (adaptive === undefined) return [];
     const unit = adaptive.workUnits.find((candidate) => candidate.id === taskId);
@@ -2540,6 +3940,11 @@ export class AgentOrchestrator {
       return;
     }
 
+    if (prepared.task.verification !== undefined) {
+      const verified = await this.verifyDynamicCorrection(prepared, handoffPath);
+      if (!verified) return;
+    }
+
     let commit: TaskCommitState | undefined;
     if (prepared.task.writer) {
       const ensured = await ensureTaskCommit(this.git, {
@@ -2566,8 +3971,61 @@ export class AgentOrchestrator {
 
     await this.submitAdditionalAdaptiveRequests(prepared.task.id, handoff.additionalWorkRequests, false);
     await this.succeedTask(prepared.task.id, handoffPath, commit);
+    await this.reconcileReviewCorrectionContinuations();
     await this.reconcileAdaptiveCorrectionFlow();
     await this.advanceAdaptiveScheduling();
+  }
+
+  private async verifyDynamicCorrection(prepared: PreparedTask, handoffPath: string): Promise<boolean> {
+    const commands = prepared.task.verification!;
+    const beforeHead = await this.git.resolveCommit(prepared.worktree.path, 'HEAD');
+    const beforeFingerprint = await computeTrackedDiffFingerprint(this.git, prepared.worktree.path, prepared.preparedHeadSha);
+    const changed = await changedCandidatePaths(this.git, prepared.worktree.path, prepared.preparedHeadSha);
+    assertChangedFileOwnership(prepared.task.id, changed, prepared.task.files);
+    const startedAt = this.clock().toISOString();
+    try {
+      assertCorrectionVerificationEnvironment(this.hostVerificationEnvironment);
+    } catch (error) {
+      const finishedAt = this.clock().toISOString();
+      await this.mutate((state) => updateTask(state, prepared.task.id, (task) => ({ ...task, verification: {
+        status: 'FAILED', worktreePath: prepared.worktree.path, headSha: beforeHead,
+        commands: [], startedAt, finishedAt,
+      } })));
+      await this.failTask(prepared.task.id, new OrchestratorError('REVIEW_BLOCKED', errorText(error)), 'BLOCKED', handoffPath);
+      return false;
+    }
+    await this.mutate((state) => updateTask(state, prepared.task.id, (task) => ({ ...task, verification: {
+      status: 'RUNNING', worktreePath: prepared.worktree.path, headSha: beforeHead,
+      commands: [], startedAt,
+    } })));
+    const result = await new IntegrationGate().run({
+      cwd: prepared.worktree.path,
+      logsDirectory: join(this.stateStore.runDirectory, 'logs', prepared.task.id, 'review-correction-verification'),
+      commands,
+      env: this.hostVerificationEnvironment,
+      ...(this.signal === undefined ? {} : { signal: this.signal }),
+      onCommandFinished: async (command) => {
+        await this.mutate((state) => updateTask(state, prepared.task.id, (task) => ({ ...task,
+          verification: { ...task.verification!, commands: [...task.verification!.commands, command] },
+        })));
+        await this.event('REVIEW_CORRECTION_VERIFICATION_FINISHED', prepared.task.id, {
+          command: command.command, exitCode: command.exitCode, timedOut: command.timedOut,
+        });
+      },
+    });
+    const afterHead = await this.git.resolveCommit(prepared.worktree.path, 'HEAD');
+    const afterFingerprint = await computeTrackedDiffFingerprint(this.git, prepared.worktree.path, prepared.preparedHeadSha);
+    const passed = result.passed && beforeHead === afterHead && beforeFingerprint === afterFingerprint;
+    await this.mutate((state) => updateTask(state, prepared.task.id, (task) => ({ ...task,
+      verification: { ...task.verification!, status: passed ? 'SUCCEEDED' : 'FAILED', finishedAt: this.clock().toISOString() },
+    })));
+    if (!passed) {
+      await this.failTask(prepared.task.id, new OrchestratorError('REVIEW_BLOCKED',
+        result.passed ? 'Review correction verification changed the verified code state' : 'Review correction host verification failed'),
+      'BLOCKED', handoffPath);
+      return false;
+    }
+    return true;
   }
 
   /**
@@ -2871,10 +4329,12 @@ export class AgentOrchestrator {
 
   private async finishReview(prepared: PreparedTask, result: AgentResult): Promise<void> {
     await this.assertReadOnlyTaskClean(prepared);
+    const attempt = this.state.tasks[prepared.task.id]?.agentAttempts.at(-1);
     const parsed = await this.parseOrRecoverReview(
       prepared.task,
       result.structuredHandoff,
       result.rawStdout ?? null,
+      attempt?.structuredOutputContractId,
     );
     await this.recordHandoffOutcome(prepared.task.id, parsed.outcome);
     if (parsed.review === null) {
@@ -2884,18 +4344,47 @@ export class AgentOrchestrator {
   }
 
   /**
-   * §10/§11 (real Phase 5 dogfood recovery): review parsing has no
-   * deterministic-key-repair or agent-repair tier — Fix A already gives
-   * reviews exact bare keys, so the only real failure mode left is framing
-   * (surrounding prose), which extractStructuredPayload alone resolves. A
-   * candidate that is syntactically valid JSON but semantically wrong (bad
-   * status, unknown key, missing evidence, ...) still fails validateReview
-   * exactly as before — this never loosens what a "valid" review means.
+   * One logical review round has one path in both the live and crash paths.
+   * Round 1 retains the historical `<task>.json` name.
+   */
+  private reviewArtifactPath(taskId: string): string {
+    const task = this.state.tasks[taskId]!;
+    const round = Math.max(task.reviewRounds, task.reviewPaths.length) + 1;
+    return this.reviewArtifactPathForRound(taskId, round);
+  }
+
+  private reviewArtifactPathForRound(taskId: string, round: number): string {
+    return join(this.stateStore.runDirectory, 'reviews',
+      round === 1 ? `${taskId}.json` : `${taskId}.round-${round}.json`);
+  }
+
+  /** Write-once artifact persistence makes replay of the same crashed round idempotent. */
+  private async persistReviewArtifact(taskId: string, review: StructuredReview): Promise<string> {
+    const path = this.reviewArtifactPath(taskId);
+    const expected = `${JSON.stringify(review, null, 2)}\n`;
+    try {
+      const existing = await readFile(path, 'utf8');
+      if (existing !== expected) {
+        throw new OrchestratorError('STATE_CORRUPT', `Review artifact path already contains different evidence: ${path}`);
+      }
+      return path;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    await atomicArtifactWrite(path, review);
+    return path;
+  }
+
+  /**
+   * Recover an approved verdict with material findings by changing only its
+   * status and revalidating, then fall back to the existing framing recovery.
+   * All other semantic errors remain blocked; no review repair invokes an agent.
    */
   private async parseOrRecoverReview(
     task: TaskSpec,
     rawStructuredHandoff: unknown,
     rawStdout: string | null,
+    structuredOutputContractId?: string,
   ): Promise<
     | { readonly review: StructuredReview; readonly error: null; readonly outcome: HandoffOutcomeRecord }
     | { readonly review: null; readonly error: unknown; readonly outcome: HandoffOutcomeRecord }
@@ -2907,16 +4396,34 @@ export class AgentOrchestrator {
       if (!isOrchestratorError(error, 'REVIEW_BLOCKED')) {
         throw error;
       }
-      const framed = extractStructuredPayload(rawStdout, validateReview);
-      const record: HandoffRepairAttemptRecord = framed.ok
-        ? { method: 'framing', succeeded: true, timestamp: this.clock().toISOString() }
+      const normalized = normalizeApprovedReview(rawStructuredHandoff);
+      const providerPayload = extractStructuredHandoffFromStdout({
+        agent: task.owner,
+        role: task.mode,
+        rawStdout,
+        ...(structuredOutputContractId === undefined ? {} : { structuredOutputContractId }),
+      });
+      const providerFramingRequired = task.owner === 'claude'
+        && usesClaudeStructuredReviewOutput(task.mode)
+        && structuredOutputContractId !== undefined;
+      const framingSource = providerFramingRequired
+        ? providerPayload === null || providerPayload === undefined
+          ? null
+          : typeof providerPayload === 'string'
+            ? providerPayload
+            : JSON.stringify(providerPayload) ?? null
+        : rawStdout;
+      const framed = normalized === null ? extractStructuredPayload(framingSource, validateReview) : null;
+      const recovered = normalized ?? (framed?.ok ? framed.value : null);
+      const record: HandoffRepairAttemptRecord = recovered !== null
+        ? { method: normalized !== null ? 'deterministic' : 'framing', succeeded: true, timestamp: this.clock().toISOString() }
         : { method: 'none', succeeded: false, failureReason: 'evidence_insufficient', timestamp: this.clock().toISOString() };
       await this.event('HANDOFF_REPAIR_ATTEMPTED', task.id, {
         method: record.method,
         succeeded: record.succeeded,
         ...(record.failureReason === undefined ? {} : { failureReason: record.failureReason }),
       });
-      if (!framed.ok) {
+      if (recovered === null) {
         return {
           review: null,
           error,
@@ -2924,7 +4431,7 @@ export class AgentOrchestrator {
         };
       }
       return {
-        review: framed.value,
+        review: recovered,
         error: null,
         outcome: { outcome: 'valid', repairAttempted: true, repairRecord: record },
       };
@@ -2937,12 +4444,7 @@ export class AgentOrchestrator {
    * (recoverHandoffFailures) goes through IDENTICAL gates.
    */
   private async finishParsedReview(prepared: PreparedTask, review: StructuredReview): Promise<void> {
-    const reviewPath = join(
-      this.stateStore.runDirectory,
-      'reviews',
-      `${prepared.task.id}.json`,
-    );
-    await atomicArtifactWrite(reviewPath, review);
+    const reviewPath = await this.persistReviewArtifact(prepared.task.id, review);
     for (const finding of review.findings) {
       await this.event('FINDING_REPORTED', prepared.task.id, {
         id: finding.id,
@@ -2998,6 +4500,7 @@ export class AgentOrchestrator {
         'BLOCKED',
         undefined,
         reviewPath,
+        true,
       );
       return;
     }
@@ -3008,7 +4511,7 @@ export class AgentOrchestrator {
         ...withoutError,
         status: 'SUCCEEDED',
         reviewRounds: task.reviewRounds + 1,
-        reviewPaths: [...task.reviewPaths, reviewPath],
+        reviewPaths: task.reviewPaths.includes(reviewPath) ? task.reviewPaths : [...task.reviewPaths, reviewPath],
         finishedAt: this.clock().toISOString(),
       };
     }));
@@ -3106,14 +4609,21 @@ export class AgentOrchestrator {
   }
 
   private dependencyCommits(task: TaskSpec): IntegrationCommit[] {
-    const graph = new TaskGraph(this.config.tasks);
-    return ancestorTasks(task, graph).flatMap((ancestor) => {
-      const commit = this.state.tasks[ancestor.id]?.commit;
-      return commit === undefined ? [] : [{ taskId: ancestor.id, commitSha: commit.sha }];
-    });
+    return taskCodeInputs(this.config, this.state, task);
   }
 
   private async integrateAndVerify(): Promise<void> {
+    for (const continuation of this.state.reviewCorrections ?? []) {
+      const source = this.state.tasks[continuation.authorization.reviewTaskId];
+      const latest = source?.reviewPaths.at(-1);
+      if (continuation.phase !== 'REVIEW_REOPENED' || source?.status !== 'SUCCEEDED'
+        || latest === undefined || (await this.readAcceptedReviewArtifact(source.id, latest)).review.status !== 'approved') {
+        throw new OrchestratorError('BLOCKED_FOR_HUMAN_REVIEW', 'Review correction continuation has not reached an approved rerun');
+      }
+    }
+    if (Object.values(this.state.tasks).some((task) => task.replan !== undefined && task.replan.phase !== 'RESOLVED')) {
+      throw new OrchestratorError('TASK_STATE_INVALID', 'Unresolved source checkpoints cannot enter whole-run integration');
+    }
     const commits = new TaskGraph(this.config.tasks).topologicalOrder().flatMap((task) => {
       const commit = this.state.tasks[task.id]?.commit;
       return commit === undefined ? [] : [{ taskId: task.id, commitSha: commit.sha }];
@@ -3381,6 +4891,7 @@ export class AgentOrchestrator {
     handoffPath: string,
     commit?: TaskCommitState,
     reopenedTasks?: readonly string[],
+    recoveryMode?: string,
   ): Promise<void> {
     await this.mutate((state) => {
       const succeeded = updateTask(state, taskId, (task) => {
@@ -3405,7 +4916,7 @@ export class AgentOrchestrator {
       return { ...succeeded, status: 'RUNNING', tasks };
     });
     await this.event('TASK_SUCCEEDED', taskId, reopenedTasks === undefined ? undefined : {
-      recoveryMode: 'blocked_writer_host_verification', commitSha: commit?.sha,
+      recoveryMode, commitSha: commit?.sha,
       handoffPath, reopenedTaskIds: reopenedTasks,
     });
     await this.finishAdaptiveUnit(taskId, 'SUCCEEDED');
@@ -3417,6 +4928,7 @@ export class AgentOrchestrator {
     status: 'FAILED' | 'BLOCKED',
     handoffPath?: string,
     reviewPath?: string,
+    consumeReviewRound = false,
   ): Promise<void> {
     const normalized = normalizeError(error, this.clock);
     await this.mutate((state) => ({
@@ -3426,7 +4938,8 @@ export class AgentOrchestrator {
         ...(handoffPath === undefined ? {} : { handoffPath }),
         ...(reviewPath === undefined
           ? {}
-          : { reviewPaths: [...task.reviewPaths, reviewPath] }),
+          : { reviewPaths: task.reviewPaths.includes(reviewPath) ? task.reviewPaths : [...task.reviewPaths, reviewPath] }),
+        ...(consumeReviewRound ? { reviewRounds: task.reviewRounds + 1 } : {}),
         finishedAt: this.clock().toISOString(),
         error: normalized,
       })),
@@ -3450,6 +4963,537 @@ export class AgentOrchestrator {
       'logs',
       `${this.state.runId}.${taskId}.${attempt.agent}.attempt-${attempt.attempt}.stdout.log`,
     );
+  }
+
+  /** Read-only checks for the single supported pre-invocation guard failure. */
+  private async checkPreflightRetryEligibility(taskId: string): Promise<number> {
+    const refuse = (reason: string): never => {
+      throw new OrchestratorError('TASK_STATE_INVALID', `Refusing preflight retry for ${taskId}: ${reason}`,
+        { details: { runId: this.state.runId, taskId, reason } });
+    };
+    if (!['FAILED', 'BLOCKED'].includes(this.state.status)) refuse('run must be terminal FAILED or BLOCKED');
+    if (Object.values(this.state.tasks).some((task) => ['PENDING', 'READY', 'RUNNING'].includes(task.status))) {
+      refuse('run contains non-terminal tasks');
+    }
+    const integration = this.state.integration;
+    if (integration.status !== 'PENDING' || integration.integratedTaskCommits.length > 0
+      || (integration.integrationFixCommits?.length ?? 0) > 0 || integration.worktreePath !== undefined
+      || integration.branch !== undefined || integration.headSha !== undefined || integration.currentCommand !== undefined
+      || integration.error !== undefined || integration.preparation !== undefined || (this.state.integrationAttempts?.length ?? 0) > 0) {
+      refuse('integration has started or has recovery state');
+    }
+    const task = this.config.tasks.find((candidate) => candidate.id === taskId);
+    const state = this.state.tasks[taskId];
+    if (task === undefined || state === undefined) return refuse('task is absent from persisted config/state');
+    if (!['FAILED', 'BLOCKED'].includes(state.status) || state.error?.code !== 'BLOCKED_FOR_HUMAN_REVIEW'
+      || !REVIEW_MODES.has(task.mode) || task.writer) {
+      refuse('requires a terminal read-only review-budget guard failure');
+    }
+    if (state.agentAttempts.length !== 0 || state.reviewRounds !== 0 || state.commit !== undefined
+      || state.handoffPath !== undefined || state.reviewPaths.length > 0 || state.handoffOutcome !== undefined
+      || state.handoffRepairAttempts.length > 0 || state.salvage !== undefined || state.skipReason !== undefined
+      || (state.agentFailureRecoveries?.length ?? 0) > 0) {
+      refuse('task contains invocation or structured-output evidence');
+    }
+    const exists = async (path: string): Promise<boolean> => {
+      try { await lstat(path); return true; } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+        throw error;
+      }
+    };
+    for (const directory of ['handoffs', 'reviews']) {
+      if (await exists(join(this.stateStore.runDirectory, directory, `${taskId}.json`))) refuse('a task artifact already exists on disk');
+    }
+    if (task.dependsOn.some((id) => !['SUCCEEDED', 'SKIPPED'].includes(this.state.tasks[id]?.status ?? ''))) {
+      refuse('dependencies are no longer satisfied');
+    }
+    for (const id of task.dependsOn) {
+      const dependency = this.state.tasks[id]!;
+      if (dependency.status !== 'SKIPPED') continue;
+      const condition = this.config.tasks.find((candidate) => candidate.id === id)?.condition;
+      if (condition === undefined || dependency.skipReason === undefined || !(await this.evaluateCondition(condition)).skip
+        || dependency.agentAttempts.length > 0 || dependency.commit !== undefined || dependency.handoffPath !== undefined
+        || dependency.reviewPaths.length > 0 || dependency.reviewRounds !== 0 || dependency.worktreePath !== undefined) {
+        refuse('a skipped dependency is not a pristine conditional skip');
+      }
+    }
+    if (task.condition !== undefined && (await this.evaluateCondition(task.condition)).skip) {
+      refuse('the current task condition says to skip');
+    }
+    const completedRounds = completedReviewRounds(task, new TaskGraph(this.config.tasks),
+      (id) => this.state.tasks[id]?.status === 'SUCCEEDED');
+    assertReviewRoundAllowed(completedRounds, this.config.maxReviewRounds);
+
+    const owned = await this.worktrees.listOwned();
+    if (owned.some((entry) => entry.runId === this.state.runId && entry.kind === 'integration')) {
+      refuse('an integration worktree is registered');
+    }
+    const branch = `agent/${this.state.runId}/${taskId}`;
+    const expectedPath = join(this.worktrees.ownedRoot, `${this.state.runId}-task-${taskId}`);
+    if (state.worktreePath === undefined) {
+      if (state.branch !== undefined || state.preparedHeadSha !== undefined || state.preparation !== undefined
+        || owned.some((entry) => entry.runId === this.state.runId && entry.taskId === taskId)
+        || await exists(expectedPath)
+        || (await this.git.run(this.repositoryRoot, ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], { allowFailure: true })).exitCode === 0) {
+        refuse('incomplete or orphaned worktree checkpoint');
+      }
+      return completedRounds;
+    }
+    if (state.worktreePath !== expectedPath || state.branch !== branch || state.preparedHeadSha === undefined) {
+      return refuse('prepared worktree checkpoint is incomplete or mismatched');
+    }
+    const worktree = await this.worktrees.assertRegistered(state.worktreePath);
+    const listed = (await this.worktrees.listGitWorktrees()).find((entry) => entry.path === worktree.path);
+    const directory = await lstat(worktree.path);
+    if (worktree.kind !== 'task' || worktree.status !== 'active' || worktree.runId !== this.state.runId
+      || worktree.taskId !== taskId || worktree.branch !== branch || worktree.baseSha !== this.state.baseSha
+      || worktree.baseBranch !== this.state.baseBranch || listed?.branch !== `refs/heads/${branch}`
+      || directory.isSymbolicLink() || !directory.isDirectory()) {
+      refuse('worktree registration does not match this task');
+    }
+    const inspection = await inspectTaskCommits(this.git, worktree.path, this.state.baseSha);
+    if (!inspection.clean || inspection.headSha !== state.preparedHeadSha) refuse('prepared worktree is dirty or HEAD moved');
+    // Ignored bootstrap output (e.g. node_modules) is retained, never deleted.
+    // Ordinary untracked files are included in inspectTaskCommits' clean check.
+    for (const marker of ['CHERRY_PICK_HEAD', 'MERGE_HEAD', 'REVERT_HEAD']) {
+      if ((await this.git.run(worktree.path, ['rev-parse', '--verify', '--quiet', marker], { allowFailure: true })).exitCode === 0) {
+        refuse('prepared worktree contains an unfinished Git operation');
+      }
+    }
+    const gitDirectory = (await this.git.run(worktree.path, ['rev-parse', '--absolute-git-dir'])).stdout.trim();
+    for (const marker of ['rebase-apply', 'rebase-merge', 'sequencer']) {
+      if (await exists(join(gitDirectory, marker))) refuse('prepared worktree contains an unfinished Git operation');
+    }
+    if (state.preparation !== undefined && (state.preparation.status !== 'SUCCEEDED'
+      || state.preparation.worktreePath !== worktree.path || state.preparation.headSha !== state.preparedHeadSha)) {
+      refuse('preparation checkpoint is not a completed match');
+    }
+    if (!canReuseIntegrationPreparation(state.preparation, worktree.path, state.preparedHeadSha, this.config.agentWorktree.prepare.length)) {
+      refuse('prepared environment cannot be reused by normal prepareTask');
+    }
+    const expected = this.dependencyCommits(task);
+    if (inspection.commits.length !== expected.length) refuse('prepared history has missing or foreign dependency commits');
+    for (const [index, sha] of inspection.commits.entries()) {
+      const source = expected[index]!.commitSha;
+      const message = (await this.git.run(worktree.path, ['show', '-s', '--format=%B', sha])).stdout;
+      const patch = async (commit: string) => (await this.git.run(worktree.path,
+        ['diff', '--binary', '--full-index', '--no-ext-diff', '--no-color', '--no-renames', `${commit}^`, commit])).stdout;
+      if (!message.includes(`(cherry picked from commit ${source})`) || await patch(sha) !== await patch(source)) {
+        refuse('prepared dependency history differs from canonical dependency commits');
+      }
+    }
+    return completedRounds;
+  }
+
+  /** Bind provider attempts to the review round announced immediately before execution. */
+  private async reviewAttemptEventBindings(taskId: string): Promise<Map<number, ReviewAttemptEventBinding>> {
+    const source = await readFile(this.stateStore.eventsPath, 'utf8');
+    const bindings = new Map<number, ReviewAttemptEventBinding>();
+    let activeRound: number | undefined;
+    let lastFinishedAttempt: number | undefined;
+    for (const [index, line] of source.split('\n').entries()) {
+      if (line.length === 0) continue;
+      let event: unknown;
+      try { event = JSON.parse(line); } catch (error) {
+        throw new OrchestratorError('STATE_CORRUPT', `Invalid event JSON at line ${index + 1}`, { cause: error });
+      }
+      if (!isRecord(event) || event.runId !== this.state.runId) {
+        throw new OrchestratorError('STATE_CORRUPT', `Event identity is invalid at line ${index + 1}`);
+      }
+      if (event.taskId !== taskId) continue;
+      const data = isRecord(event.data) ? event.data : {};
+      if (event.name === 'REVIEW_STARTED') {
+        if (!Number.isSafeInteger(data.round) || Number(data.round) < 1) {
+          throw new OrchestratorError('STATE_CORRUPT', `Review start round is invalid at line ${index + 1}`);
+        }
+        activeRound = Number(data.round);
+        lastFinishedAttempt = undefined;
+      } else if (event.name === 'AGENT_STARTED') {
+        if (activeRound === undefined || !Number.isSafeInteger(data.attempt) || Number(data.attempt) < 1
+          || (data.agent !== 'codex' && data.agent !== 'claude')) {
+          throw new OrchestratorError('STATE_CORRUPT', `Review attempt start is not round-bound at line ${index + 1}`);
+        }
+        const attempt = Number(data.attempt);
+        if (bindings.has(attempt)) {
+          throw new OrchestratorError('STATE_CORRUPT', `Review attempt ${attempt} has duplicate start evidence`);
+        }
+        bindings.set(attempt, { round: activeRound, agent: data.agent });
+      } else if (event.name === 'AGENT_FINISHED') {
+        if (!Number.isSafeInteger(data.attempt) || Number(data.attempt) < 1) {
+          throw new OrchestratorError('STATE_CORRUPT', `Review attempt finish is invalid at line ${index + 1}`);
+        }
+        const attempt = Number(data.attempt);
+        const binding = bindings.get(attempt);
+        if (binding === undefined || binding.finishedStatus !== undefined) {
+          throw new OrchestratorError('STATE_CORRUPT', `Review attempt ${attempt} has unbound finish evidence`);
+        }
+        bindings.set(attempt, {
+          ...binding,
+          ...(typeof data.status === 'string' ? { finishedStatus: data.status } : {}),
+          ...(typeof data.exitCode === 'number' || data.exitCode === null ? { exitCode: data.exitCode } : {}),
+        });
+        lastFinishedAttempt = attempt;
+      } else if (event.name === 'HANDOFF_REPAIR_ATTEMPTED' && lastFinishedAttempt !== undefined
+        && data.succeeded === false) {
+        bindings.set(lastFinishedAttempt, { ...bindings.get(lastFinishedAttempt)!, repairRejected: true });
+      } else if (event.name === 'TASK_FAILED' && lastFinishedAttempt !== undefined
+        && data.code === 'REVIEW_BLOCKED') {
+        bindings.set(lastFinishedAttempt, { ...bindings.get(lastFinishedAttempt)!, reviewBlocked: true });
+      }
+    }
+    return bindings;
+  }
+
+  private async reviewPromptArtifactEvidence(task: TaskSpec): Promise<ReviewInputArtifactState[]> {
+    const graph = new TaskGraph(this.config.tasks);
+    const ancestors = ancestorTasks(task, graph);
+    const authorizedReviewPath = this.state.reviewCorrections?.find(
+      (entry) => entry.authorization.correctionTask.id === task.id,
+    )?.authorization.reviewArtifactPath;
+    const paths = [...new Set([
+      ...ancestors.flatMap((ancestor) => {
+        const state = this.state.tasks[ancestor.id];
+        return [
+          ...(state?.handoffPath === undefined ? [] : [state.handoffPath]),
+          ...(state?.reviewPaths ?? []),
+        ];
+      }),
+      ...(authorizedReviewPath === undefined ? [] : [authorizedReviewPath]),
+    ])].sort();
+    return Promise.all(paths.map(async (path) => {
+      const details = await lstat(path).catch((error) => {
+        throw new OrchestratorError('TASK_STATE_INVALID', `Review prompt artifact is unavailable: ${path}`, { cause: error });
+      });
+      if (!details.isFile() || details.isSymbolicLink()) {
+        throw new OrchestratorError('TASK_STATE_INVALID', `Review prompt artifact is not a regular file: ${path}`);
+      }
+      return { path, sha256: createHash('sha256').update(await readFile(path)).digest('hex') };
+    }));
+  }
+
+  /** Revalidate every v2 retry authorization before any resumed work can execute. */
+  private async assertReviewOutputRecoveryBindings(): Promise<void> {
+    for (const [taskId, task] of Object.entries(this.state.tasks)) {
+      const recoveries = (task.reviewOutputRecoveries ?? []).filter((entry) => entry.version !== undefined);
+      if (recoveries.length === 0) continue;
+      const spec = this.config.tasks.find((entry) => entry.id === taskId);
+      if (spec === undefined || !REVIEW_MODES.has(spec.mode) || spec.writer) {
+        throw new OrchestratorError('STATE_CORRUPT', `Structured-review retry task ${taskId} is no longer a read-only review`);
+      }
+      const bindings = await this.reviewAttemptEventBindings(taskId);
+      for (const recovery of recoveries) {
+        if (task.reviewRounds < recovery.taskReviewRound && task.preparedHeadSha !== recovery.preparedHeadSha) {
+          throw new OrchestratorError('STATE_CORRUPT', `Structured-review retry ${taskId} prepared HEAD binding changed`);
+        }
+        if (recovery.error.code !== 'REVIEW_BLOCKED' || recovery.attempt.outcome !== 'succeeded'
+          || recovery.attempt.finishedAt === undefined || recovery.attempt.agent !== spec.owner) {
+          throw new OrchestratorError('STATE_CORRUPT', `Structured-review retry ${taskId} source failure binding is invalid`);
+        }
+        const eventBinding = bindings.get(recovery.attempt.attempt);
+        if (eventBinding?.round !== recovery.reviewRound || eventBinding.agent !== recovery.attempt.agent
+          || eventBinding.finishedStatus !== 'succeeded' || eventBinding.exitCode !== 0
+          || eventBinding.repairRejected !== true || eventBinding.reviewBlocked !== true) {
+          throw new OrchestratorError('STATE_CORRUPT', `Structured-review retry ${taskId} round event binding changed`);
+        }
+        const expectedStdoutPath = this.taskAttemptStdoutLogPath(taskId, recovery.attempt);
+        if (recovery.stdoutPath !== expectedStdoutPath) {
+          throw new OrchestratorError('STATE_CORRUPT', `Structured-review retry ${taskId} stdout path binding changed`);
+        }
+        const stdoutDetails = await lstat(recovery.stdoutPath).catch((error) => {
+          throw new OrchestratorError('STATE_CORRUPT', `Structured-review retry ${taskId} stdout is unavailable`, { cause: error });
+        });
+        if (!stdoutDetails.isFile() || stdoutDetails.isSymbolicLink()
+          || createHash('sha256').update(await readFile(recovery.stdoutPath)).digest('hex') !== recovery.stdoutSha256) {
+          throw new OrchestratorError('STATE_CORRUPT', `Structured-review retry ${taskId} stdout evidence changed`);
+        }
+        for (const artifact of recovery.acceptedReviewArtifacts) {
+          const expectedPath = this.reviewArtifactPathForRound(taskId, artifact.round);
+          if (artifact.path !== expectedPath || task.reviewPaths[artifact.round - 1] !== artifact.path) {
+            throw new OrchestratorError('STATE_CORRUPT', `Structured-review retry ${taskId} accepted history binding changed`);
+          }
+          const details = await lstat(artifact.path).catch((error) => {
+            throw new OrchestratorError('STATE_CORRUPT', `Structured-review retry ${taskId} accepted artifact is unavailable`, { cause: error });
+          });
+          const bytes = details.isFile() && !details.isSymbolicLink() ? await readFile(artifact.path) : undefined;
+          if (bytes === undefined || createHash('sha256').update(bytes).digest('hex') !== artifact.sha256) {
+            throw new OrchestratorError('STATE_CORRUPT', `Structured-review retry ${taskId} accepted artifact changed`);
+          }
+          try { parseReview(bytes.toString('utf8')); } catch (error) {
+            throw new OrchestratorError('STATE_CORRUPT', `Structured-review retry ${taskId} accepted artifact is invalid`, { cause: error });
+          }
+        }
+      }
+    }
+  }
+
+  /** Revalidate the v3 contract migration before any post-fix invocation. */
+  private async assertReviewOutputContractContinuationBindings(): Promise<void> {
+    for (const [taskId, task] of Object.entries(this.state.tasks)) {
+      const recovery = task.reviewOutputRecoveries?.find(
+        (entry): entry is ReviewOutputRecoveryV3State => entry.version === 3,
+      );
+      if (recovery === undefined) continue;
+      const spec = this.config.tasks.find((entry) => entry.id === taskId);
+      const prior = task.reviewOutputRecoveries?.find(
+        (entry): entry is ReviewOutputRecoveryV2State => entry.version === 2
+          && entry.recovery === recovery.consumedRecovery,
+      );
+      if (spec === undefined || spec.owner !== 'claude' || spec.writer
+        || !['review', 'final_review'].includes(spec.mode)
+        || prior === undefined || canonicalHash(prior) !== recovery.consumedRecoverySha256
+        || recovery.oldContractId !== CLAUDE_TEXT_REVIEW_OUTPUT_CONTRACT_ID
+        || recovery.preparedHeadSha !== task.preparedHeadSha
+        || JSON.stringify(this.dependencyCommits(spec)) !== JSON.stringify(recovery.dependencyCommits)
+        || recovery.malformedAttempts[0] !== prior.attempt.attempt
+        || recovery.malformedAttempts[1] !== recovery.attempt.attempt) {
+        throw new OrchestratorError('STATE_CORRUPT', `Claude review contract continuation ${taskId} binding changed`);
+      }
+      const promptArtifacts = await this.reviewPromptArtifactEvidence(spec).catch((error) => {
+        throw new OrchestratorError('STATE_CORRUPT', `Claude review contract continuation ${taskId} prompt evidence is invalid`, { cause: error });
+      });
+      if (JSON.stringify(promptArtifacts) !== JSON.stringify(recovery.promptArtifacts)) {
+        throw new OrchestratorError('STATE_CORRUPT', `Claude review contract continuation ${taskId} prompt artifacts changed`);
+      }
+      for (const source of [prior, recovery]) {
+        const raw = (await readFile(source.stdoutPath)).toString('utf8').trim();
+        if (raw.length === 0 || parseJsonOrNull(raw) !== null
+          || extractClaudeStructuredReviewOutput(raw) !== null) {
+          throw new OrchestratorError('STATE_CORRUPT', `Claude review contract continuation ${taskId} source output is not the bound prompt-only failure`);
+        }
+      }
+      const postFixAttempts = task.agentAttempts.filter(
+        (attempt) => attempt.attempt > recovery.attempt.attempt,
+      );
+      if (postFixAttempts.length > 1
+        || postFixAttempts.some((attempt) => attempt.agent !== 'claude')
+        || (task.status === 'READY' && postFixAttempts.length !== 0)) {
+        throw new OrchestratorError('STATE_CORRUPT', `Claude review contract continuation ${taskId} exceeded its one-invocation budget`);
+      }
+      if (postFixAttempts.length === 0) {
+        const activeContractId = structuredOutputContractIdFor(this.agents.claude, spec.mode);
+        if (activeContractId !== recovery.newContractId) {
+          throw new OrchestratorError(
+            'TASK_STATE_INVALID',
+            `Claude review contract changed before the authorized post-fix attempt for ${taskId}`,
+          );
+        }
+      } else if (postFixAttempts[0]!.structuredOutputContractId !== recovery.newContractId) {
+        throw new OrchestratorError(
+          'STATE_CORRUPT',
+          `Claude review contract continuation ${taskId} attempt provenance changed`,
+        );
+      }
+    }
+  }
+
+  /** Fail-closed eligibility for one bounded structured-review retry per review round. */
+  private async checkReviewOutputRetryEligibility(
+    taskId: string,
+    allowConsumedRound = false,
+  ): Promise<
+    | { readonly eligible: true; readonly stdoutPath: string; readonly stdoutSha256: string;
+      readonly reviewRound: number; readonly taskReviewRound: number;
+      readonly acceptedReviewArtifacts: readonly AcceptedReviewArtifactState[] }
+    | { readonly eligible: false; readonly reason: string }
+  > {
+    const refuse = (reason: string) => ({ eligible: false as const, reason });
+    if (this.state.strategy === 'adaptive' || this.state.adaptive !== undefined) {
+      return refuse('only static runs are supported');
+    }
+    if (this.state.status !== 'FAILED' && this.state.status !== 'BLOCKED') {
+      return refuse(`run status is ${this.state.status}, not FAILED or BLOCKED`);
+    }
+    if (Object.values(this.state.tasks).some((task) =>
+      task.status === 'PENDING' || task.status === 'READY' || task.status === 'RUNNING')) {
+      return refuse('run still contains non-terminal tasks');
+    }
+    for (const candidate of Object.values(this.state.tasks)) {
+      for (const candidateAttempt of candidate.agentAttempts) {
+        if (candidateAttempt.finishedAt === undefined) return refuse('run contains an unfinished agent attempt');
+        if (candidateAttempt.pid !== undefined && isProcessAlive(candidateAttempt.pid)) {
+          return refuse('a recorded provider process is still alive');
+        }
+      }
+    }
+    const integration = this.state.integration;
+    if (integration.status !== 'PENDING' || integration.integratedTaskCommits.length > 0
+      || (integration.integrationFixCommits?.length ?? 0) > 0 || integration.worktreePath !== undefined
+      || integration.branch !== undefined || integration.headSha !== undefined
+      || integration.currentCommand !== undefined || integration.error !== undefined
+      || integration.preparation !== undefined || (this.state.integrationAttempts?.length ?? 0) > 0) {
+      return refuse('integration has started or has recovery state');
+    }
+    if ((await this.worktrees.listOwned()).some((entry) =>
+      entry.runId === this.state.runId && entry.kind === 'integration')) {
+      return refuse('an integration worktree is registered');
+    }
+
+    const spec = this.config.tasks.find((task) => task.id === taskId);
+    const task = this.state.tasks[taskId];
+    if (spec === undefined || task === undefined) return refuse('task id does not exist in this run');
+    if (!REVIEW_MODES.has(spec.mode) || !['review', 'final_review'].includes(spec.mode)) {
+      return refuse('task mode must be review or final_review');
+    }
+    if (spec.writer) return refuse('review task must be read-only');
+    if (task.status !== 'FAILED' || task.error?.code !== 'REVIEW_BLOCKED') {
+      return refuse('task must be FAILED with error code REVIEW_BLOCKED');
+    }
+    const attempt = task.agentAttempts.at(-1);
+    if (attempt?.outcome !== 'succeeded' || attempt.finishedAt === undefined) {
+      return refuse('last agent attempt must have a completed succeeded process outcome');
+    }
+    if (attempt.agent !== spec.owner) return refuse('last attempt agent does not match the task owner');
+    if (task.commit !== undefined) return refuse('a task commit is already recorded');
+    if (task.handoffOutcome !== 'invalid') return refuse('task does not record rejected structured output');
+    if (task.salvage !== undefined || task.replan !== undefined) return refuse('task has unrelated recovery state');
+
+    // A completed local review round has exactly one canonical, strictly
+    // parsed artifact. Anything else is ambiguous persisted history and must
+    // not be rebound to a new retry authorization.
+    if (task.reviewPaths.length !== task.reviewRounds) {
+      return refuse('accepted review paths do not exactly match completed review rounds');
+    }
+    const taskReviewRound = task.reviewRounds + 1;
+    let completedRounds: number;
+    try {
+      completedRounds = completedReviewRounds(
+        spec,
+        new TaskGraph(this.config.tasks),
+        (id) => this.state.tasks[id]?.status === 'SUCCEEDED',
+      ) + task.reviewRounds;
+      assertReviewRoundAllowed(completedRounds, this.config.maxReviewRounds);
+    } catch (error) {
+      return refuse(`current review lineage is not eligible: ${errorText(error)}`);
+    }
+    const reviewRound = completedRounds + 1;
+    const acceptedReviewArtifacts: AcceptedReviewArtifactState[] = [];
+    for (const [index, path] of task.reviewPaths.entries()) {
+      const round = index + 1;
+      const expectedPath = this.reviewArtifactPathForRound(taskId, round);
+      if (path !== expectedPath) return refuse(`accepted review round ${round} does not use its canonical artifact path`);
+      try {
+        const details = await lstat(path);
+        if (!details.isFile() || details.isSymbolicLink()) return refuse(`accepted review round ${round} is not a regular artifact`);
+        const bytes = await readFile(path);
+        parseReview(bytes.toString('utf8'));
+        acceptedReviewArtifacts.push({ round, path, sha256: createHash('sha256').update(bytes).digest('hex') });
+      } catch (error) {
+        return refuse(`accepted review round ${round} is invalid: ${errorText(error)}`);
+      }
+    }
+    if (task.handoffPath !== undefined && !task.reviewPaths.includes(task.handoffPath)) {
+      return refuse('task handoff path is not attributable to accepted review history');
+    }
+    try {
+      await lstat(this.reviewArtifactPathForRound(taskId, taskReviewRound));
+      return refuse(`task review round ${taskReviewRound} already has an artifact`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        return refuse(`current review artifact path is invalid: ${errorText(error)}`);
+      }
+    }
+    if (this.state.reviewCorrections?.some((entry) =>
+      entry.authorization.reviewTaskId === taskId && entry.authorization.sourceRound >= taskReviewRound)) {
+      return refuse(`task review round ${taskReviewRound} has already been consumed by a correction continuation`);
+    }
+
+    let attemptBindings: Map<number, ReviewAttemptEventBinding>;
+    try { attemptBindings = await this.reviewAttemptEventBindings(taskId); } catch (error) {
+      return refuse(`review attempt round evidence is invalid: ${errorText(error)}`);
+    }
+    const currentBinding = attemptBindings.get(attempt.attempt);
+    if (currentBinding?.round !== reviewRound || currentBinding.agent !== attempt.agent
+      || currentBinding.finishedStatus !== 'succeeded' || currentBinding.exitCode !== 0
+      || currentBinding.repairRejected !== true || currentBinding.reviewBlocked !== true) {
+      return refuse(`last provider attempt is not durably bound to unaccepted review round ${reviewRound}`);
+    }
+    for (const recovery of task.reviewOutputRecoveries ?? []) {
+      const legacyBinding = recovery.version === undefined ? attemptBindings.get(recovery.attempt.attempt) : undefined;
+      const recoveredRound = recovery.version === undefined ? legacyBinding?.round : recovery.reviewRound;
+      if (recoveredRound === undefined) {
+        return refuse(`historical structured-review retry ${recovery.recovery} has no provable round`);
+      }
+      if (recovery.version === undefined && (legacyBinding?.repairRejected !== true || legacyBinding.reviewBlocked !== true)) {
+        return refuse(`historical structured-review retry ${recovery.recovery} lacks rejected-output evidence`);
+      }
+      if (recoveredRound === reviewRound && !allowConsumedRound) {
+        return refuse(`structured-review retry budget for round ${reviewRound} is exhausted`);
+      }
+    }
+    const unsatisfied = spec.dependsOn.filter((id) => {
+      const status = this.state.tasks[id]?.status;
+      return status !== 'SUCCEEDED' && status !== 'SKIPPED';
+    });
+    if (unsatisfied.length > 0) return refuse(`dependencies are no longer satisfied: ${unsatisfied.join(', ')}`);
+    for (const id of spec.dependsOn) {
+      const dependency = this.state.tasks[id]!;
+      if (dependency.status !== 'SKIPPED') continue;
+      const dependencySpec = this.config.tasks.find((candidate) => candidate.id === id);
+      if (dependencySpec?.condition === undefined || dependency.skipReason === undefined
+        || !(await this.evaluateCondition(dependencySpec.condition)).skip
+        || dependency.agentAttempts.length > 0 || dependency.commit !== undefined
+        || dependency.handoffPath !== undefined || dependency.reviewPaths.length > 0
+        || dependency.reviewRounds !== 0 || dependency.worktreePath !== undefined) {
+        return refuse(`skipped dependency ${id} is no longer a pristine conditional skip`);
+      }
+    }
+    if (spec.condition !== undefined && (await this.evaluateCondition(spec.condition)).skip) {
+      return refuse('the current task condition says to skip');
+    }
+    if (task.worktreePath === undefined || task.branch === undefined || task.preparedHeadSha === undefined) {
+      return refuse('preserved task worktree/checkpoint is incomplete');
+    }
+
+    let worktree: OwnedWorktree;
+    try {
+      worktree = await this.worktrees.assertRegistered(task.worktreePath);
+      const listed = (await this.worktrees.listGitWorktrees()).find((entry) => entry.path === worktree.path);
+      if (worktree.kind !== 'task' || worktree.status !== 'active' || worktree.runId !== this.state.runId
+        || worktree.taskId !== taskId || worktree.branch !== task.branch || worktree.baseSha !== this.state.baseSha
+        || listed?.branch !== `refs/heads/${task.branch}`) {
+        return refuse('preserved worktree registration does not match the task checkpoint');
+      }
+      const inspection = await inspectTaskCommits(this.git, worktree.path, this.state.baseSha);
+      if (!inspection.clean) return refuse('preserved read-only worktree is dirty');
+      if (inspection.headSha !== task.preparedHeadSha) return refuse('preserved worktree HEAD moved');
+
+      const expected = this.dependencyCommits(spec);
+      if (inspection.commits.length !== expected.length) {
+        return refuse('prepared history has missing or foreign dependency commits');
+      }
+      const patch = async (sha: string) => (await this.git.run(worktree.path,
+        ['diff', '--binary', '--full-index', '--no-ext-diff', '--no-color', '--no-renames', `${sha}^`, sha])).stdout;
+      for (const [index, sha] of inspection.commits.entries()) {
+        const source = expected[index]!.commitSha;
+        const message = (await this.git.run(worktree.path, ['show', '-s', '--format=%B', sha])).stdout;
+        if (!message.includes(`(cherry picked from commit ${source})`) || await patch(sha) !== await patch(source)) {
+          return refuse('prepared dependency history differs from current dependency commits');
+        }
+      }
+      if (task.preparation !== undefined && (task.preparation.status !== 'SUCCEEDED'
+        || task.preparation.worktreePath !== worktree.path || task.preparation.headSha !== task.preparedHeadSha)) {
+        return refuse('preparation checkpoint is not a completed match');
+      }
+    } catch (error) {
+      return refuse(`preserved worktree checkpoint is invalid: ${errorText(error)}`);
+    }
+
+    const stdoutPath = this.taskAttemptStdoutLogPath(taskId, attempt);
+    try {
+      const details = await lstat(stdoutPath);
+      if (!details.isFile() || details.isSymbolicLink()) return refuse('original agent stdout is not a regular file');
+      const stdout = await readFile(stdoutPath);
+      return {
+        eligible: true,
+        stdoutPath,
+        stdoutSha256: createHash('sha256').update(stdout).digest('hex'),
+        reviewRound,
+        taskReviewRound,
+        acceptedReviewArtifacts,
+      };
+    } catch (error) {
+      return refuse(`original agent stdout is unavailable: ${errorText(error)}`);
+    }
   }
 
   /**
@@ -3575,15 +5619,16 @@ export class AgentOrchestrator {
   }
 
   /**
-   * Salvage eligibility for a timed-out writer's dirty worktree — the
-   * structural mirror of checkAgentFailureRetryEligibility, inverted on
+   * Salvage eligibility for a failed or timed-out writer's dirty worktree —
+   * the structural mirror of checkAgentFailureRetryEligibility, inverted on
    * dirtiness: retry-agent requires a CLEAN preserved worktree (no partial
    * work); salvage requires a DIRTY one whose every changed tracked file is
    * inside the task's own ownership globs, with no foreign commits and no
-   * unexpected untracked files. AGENT_FAILED (a process crash) is
-   * deliberately out of scope here — only a completed AGENT_TIMEOUT attempt
-   * qualifies; a crashed process is a different failure shape and folding it
-   * in without a real example to validate against would be scope creep.
+   * unexpected untracked files. AGENT_FAILED and AGENT_TIMEOUT are both
+   * accepted eligibility classes for a completed final attempt — the class
+   * is derived only from persisted error code + attempt outcome, never
+   * inferred from provider stderr/error prose; every check below still
+   * applies identically regardless of which of the two failed the attempt.
    */
   private async checkSalvageEligibility(taskId: string, blockedWriter = false): Promise<
     | {
@@ -3598,10 +5643,15 @@ export class AgentOrchestrator {
     const taskSpec = this.config.tasks.find((task) => task.id === taskId);
     const taskState = this.state.tasks[taskId];
     if (taskSpec === undefined || taskState === undefined) {
-      return { eligible: false, reason: 'task id does not exist in this run', reasonCode: 'SALVAGE_NOT_TIMED_OUT' };
+      return { eligible: false, reason: 'task id does not exist in this run', reasonCode: 'SALVAGE_ATTEMPT_NOT_ELIGIBLE' };
+    }
+    if (taskState.replan !== undefined) {
+      return { eligible: false, reason: 'source is reserved by a replan', reasonCode: 'BLOCKED_WRITER_INELIGIBLE' };
     }
     const lastAttempt = taskState.agentAttempts.at(-1);
-    const timedOut = taskState.error?.code === 'AGENT_TIMEOUT' && lastAttempt?.outcome === 'timed_out';
+    const salvageableAttempt =
+      (taskState.error?.code === 'AGENT_TIMEOUT' && lastAttempt?.outcome === 'timed_out')
+      || (taskState.error?.code === 'AGENT_FAILED' && lastAttempt?.outcome === 'failed');
     if (blockedWriter && (
       this.state.strategy === 'adaptive' || this.state.adaptive !== undefined
       || this.state.status !== 'BLOCKED' || taskState.status !== 'BLOCKED'
@@ -3613,11 +5663,11 @@ export class AgentOrchestrator {
     )) {
       return { eligible: false, reason: 'requires a static blocked writer with a succeeded process, accepted blocked handoff, and required salvage.verify commands', reasonCode: 'BLOCKED_WRITER_INELIGIBLE' };
     }
-    if (!blockedWriter && ((taskState.status !== 'FAILED' && taskState.status !== 'BLOCKED') || !timedOut)) {
+    if (!blockedWriter && ((taskState.status !== 'FAILED' && taskState.status !== 'BLOCKED') || !salvageableAttempt)) {
       return {
         eligible: false,
-        reason: 'task did not end in a completed AGENT_TIMEOUT agent attempt',
-        reasonCode: 'SALVAGE_NOT_TIMED_OUT',
+        reason: 'task did not end in a completed AGENT_TIMEOUT or AGENT_FAILED agent attempt',
+        reasonCode: 'SALVAGE_ATTEMPT_NOT_ELIGIBLE',
       };
     }
     if (taskState.commit !== undefined) {
@@ -3945,7 +5995,14 @@ export class AgentOrchestrator {
     const worktree = await this.worktrees.assertRegistered(taskState.worktreePath!);
     const lastAttempt = taskState.agentAttempts.at(-1)!;
     const rawStdout = await readBoundedStdoutText(this.taskAttemptStdoutLogPath(task.id, lastAttempt));
-    const rawStructuredHandoff = parseJsonOrNull(rawStdout);
+    const rawStructuredHandoff = extractStructuredHandoffFromStdout({
+      agent: lastAttempt.agent,
+      role: task.mode,
+      rawStdout,
+      ...(lastAttempt.structuredOutputContractId === undefined
+        ? {}
+        : { structuredOutputContractId: lastAttempt.structuredOutputContractId }),
+    });
     const taskDiff = (await this.git.run(worktree.path, [
       'diff', '--no-ext-diff', '--no-color', taskState.preparedHeadSha!,
     ])).stdout;
@@ -3978,7 +6035,14 @@ export class AgentOrchestrator {
     const worktree = await this.worktrees.assertRegistered(taskState.worktreePath!);
     const lastAttempt = taskState.agentAttempts.at(-1)!;
     const rawStdout = await readBoundedStdoutText(this.taskAttemptStdoutLogPath(task.id, lastAttempt));
-    const rawStructuredHandoff = parseJsonOrNull(rawStdout);
+    const rawStructuredHandoff = extractStructuredHandoffFromStdout({
+      agent: lastAttempt.agent,
+      role: task.mode,
+      rawStdout,
+      ...(lastAttempt.structuredOutputContractId === undefined
+        ? {}
+        : { structuredOutputContractId: lastAttempt.structuredOutputContractId }),
+    });
     const prepared: PreparedTask = {
       task,
       worktree,
@@ -3988,7 +6052,12 @@ export class AgentOrchestrator {
       actualDependencyDiff: '',
     };
     await this.assertReadOnlyTaskClean(prepared);
-    const parsed = await this.parseOrRecoverReview(task, rawStructuredHandoff, rawStdout);
+    const parsed = await this.parseOrRecoverReview(
+      task,
+      rawStructuredHandoff,
+      rawStdout,
+      lastAttempt.structuredOutputContractId,
+    );
     await this.recordHandoffOutcome(task.id, parsed.outcome);
     if (parsed.review === null) {
       throw parsed.error;
@@ -4099,21 +6168,34 @@ export class AgentOrchestrator {
           }
           try {
             if (source === undefined) {
+              const contractContinuation = taskState.reviewOutputRecoveries?.find(
+                (entry): entry is ReviewOutputRecoveryV3State => entry.version === 3,
+              );
+              if (contractContinuation !== undefined && lastAttempt !== undefined
+                && lastAttempt.attempt > contractContinuation.attempt.attempt) {
+                // Allocation is the durable one-invocation boundary. If the
+                // host died before stdout appeared, replay cannot prove the
+                // provider was never started, so the v3 attempt is consumed.
+                observation.handoffInvalid = true;
+              }
               observations[task.id] = observation;
               continue;
             }
+            const structuredHandoff = extractStructuredHandoffFromStdout({
+              agent: lastAttempt!.agent,
+              role: task.mode,
+              rawStdout: source,
+              ...(lastAttempt!.structuredOutputContractId === undefined
+                ? {}
+                : { structuredOutputContractId: lastAttempt!.structuredOutputContractId }),
+            });
             if (REVIEW_MODES.has(task.mode)) {
-              const review = parseReview(source);
-              const reviewPath = join(
-                this.stateStore.runDirectory,
-                'reviews',
-                `${task.id}.json`,
-              );
-              await atomicArtifactWrite(reviewPath, review);
+              const review = parseReview(structuredHandoff);
+              const reviewPath = await this.persistReviewArtifact(task.id, review);
               observation.review = review;
               observation.reviewPath = reviewPath;
             } else {
-              const handoff = parseHandoff(source);
+              const handoff = parseHandoff(structuredHandoff);
               observation.handoff = handoff;
               observation.handoffPath = await writeHandoff(
                 join(this.stateStore.runDirectory, 'handoffs'),
@@ -4184,6 +6266,7 @@ export class AgentOrchestrator {
     taskId: string,
     agent: 'codex' | 'claude',
     timeoutMs: number,
+    structuredOutputContractId?: string,
   ): Promise<number> {
     let allocatedAttempt = 0;
     const operation = this.stateQueue.then(async () => {
@@ -4197,6 +6280,7 @@ export class AgentOrchestrator {
         agent,
         startedAt: this.clock().toISOString(),
         timeoutMs,
+        ...(structuredOutputContractId === undefined ? {} : { structuredOutputContractId }),
       };
       const next = withUpdatedTimestamp(
         updateTask(this.state, taskId, (value) => ({
@@ -4226,6 +6310,21 @@ export class AgentOrchestrator {
       ...(data === undefined ? {} : { data }),
     });
   }
+}
+
+function structuredOutputContractIdFor(
+  agent: Agent,
+  role: AgentRequest['role'],
+): string | undefined {
+  if (agent.name !== 'claude' || !usesClaudeStructuredReviewOutput(role)) return undefined;
+  const contractId = agent.structuredOutputContractId;
+  if (contractId !== undefined && !/^[0-9a-f]{64}$/.test(contractId)) {
+    throw new OrchestratorError(
+      'TASK_STATE_INVALID',
+      'Claude adapter structured-output contract ID must be a lowercase sha256 digest',
+    );
+  }
+  return contractId;
 }
 
 /**

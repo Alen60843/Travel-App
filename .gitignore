@@ -11,3 +11,4 @@ coverage/
 .agent-worktrees/
 tools/agent-orchestrator/runs/*
 !tools/agent-orchestrator/runs/.gitkeep
+tools/agent-orchestrator/memory/

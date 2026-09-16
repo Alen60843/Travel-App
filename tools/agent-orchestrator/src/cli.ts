@@ -10,6 +10,16 @@ import { AgentOrchestrator, planOrchestrationPhase, type AnyPlanResult, type Pla
 import { StateStore, type RunState } from './state';
 import { loadAnyPhaseConfig } from './workflow/solver-verifier';
 import { loadAdaptivePhaseConfig, runtimePhaseConfig } from './adaptive';
+import { applyRecoveryPolicyOverlay } from './recovery/policy';
+import { applyReplanOverlays } from './replan/model';
+import { applyReviewCorrectionOverlays } from './review/correction-continuation';
+import { diagnoseFailure } from './failure-intelligence/classifier';
+import { mapFailureToActions } from './action-mapping/mapper';
+import type { ActionCandidate } from './action-mapping/types';
+import { MemoryStore, projectDiagnosisToMemory } from './memory';
+import { resolveAgentExecutable } from './agents/executable-resolution';
+import { ClaudeCoordinatorReasoner } from './coordinator-providers';
+import { coordinateShadowRun } from './coordinator-shadow';
 
 const USAGE = `TripWith local agent orchestrator
 
@@ -20,10 +30,24 @@ Usage:
   pnpm agents:status <run-id>
   pnpm agents:cleanup <run-id>
   pnpm agents:metrics <run-id>
+  pnpm agents:diagnose <run-id> [task-id]
+  pnpm agents:coordinate-shadow:claude <run-id> [task-id]
+  pnpm agents:remember-diagnosis <run-id> [task-id]
   pnpm agents:recover-handoffs <run-id>
   pnpm agents:retry-agent <run-id> <task-id>
+  pnpm agents:repin-agent-executable <run-id> <agent> <absolute-executable-path>
+  pnpm agents:retry-review-correction-verification <run-id> <correction-task-id>
+  pnpm agents:retry-review-output <run-id> <task-id>
+  pnpm agents:continue-claude-review-output <run-id> <task-id>
+  pnpm agents:retry-preflight <run-id> <task-id>
+  pnpm agents:propose-replan <run-id> <task-id>
+  pnpm agents:authorize-replan <run-id> <proposal-id>
+  pnpm agents:authorize-review-correction <run-id> <review-task-id> [request-index]
+  pnpm agents:normalize-replan-evidence <run-id> <task-id> <evidence-index> file
+  pnpm agents:interpret-replan <run-id> <task-id> <interpretation-file>
   pnpm agents:salvage-task <run-id> <task-id>
   pnpm agents:verify-blocked-task <run-id> <task-id>
+  pnpm agents:finalize-failed-salvage <run-id> <task-id>
   pnpm agents:authorize-recovery-policy <run-id> <policy-file>
   pnpm agents:retry-integration <run-id>
   pnpm agents:apply-integration-fix <run-id> <summary> <ownership-glob> [more-globs...]
@@ -32,6 +56,21 @@ Planning is read-only. Running or resuming may invoke locally authenticated paid
 No command merges into the phase branch or pushes to a remote.
 metrics is read-only: it recomputes a summary from persisted run artifacts and never
 touches agents, worktrees, or state.
+diagnose is read-only: it deterministically classifies only the current active blocker
+from persisted evidence and recommends, but never executes or authorizes, a bounded action.
+coordinate-shadow:claude is an explicit read-only, non-authoritative provider call. It loads
+diagnosis, Memory, and bounded navigation context; prints a shadow Coordinator result; and
+never executes, authorizes, persists, retries, resumes, or mutates the selected run.
+remember-diagnosis explicitly persists only the current structured diagnosis and mapped
+candidate facts in repository Memory. It never mutates the run or executes a candidate.
+normalize-replan-evidence explicitly records one deterministic test-to-file interpretation
+for the exact persisted handoff entry and dirty source tree. It invokes no provider or task,
+creates no commit, and never rewrites the handoff. Inspect it, then propose-replan separately.
+propose-replan validates one blocked static writer's persisted scope-gap request and
+persists a hash-pinned proposal without providers or worktree changes. Inspect the proposal
+before authorize-replan explicitly grants its follow-up and pristine downstream overlay.
+Authorization creates a noncanonical checkpoint but invokes no providers; agents:resume
+executes the follow-up and deterministic composed verification before source promotion.
 recover-handoffs recovers a run's persisted FAILED/HANDOFF_INVALID or FAILED/REVIEW_BLOCKED
 tasks whose agent process already succeeded, using a bounded, mostly local repair (never
 rerunning the original implementation/review); it refuses (all-or-nothing) if any targeted
@@ -41,13 +80,39 @@ retry-agent authorizes one additional attempt only for a FAILED agent/process-la
 with no commit, accepted structured artifact, dirty work, or unsatisfied dependency. It
 archives the failure and reopens only dependency-blocked descendants attributable to that
 task. It never invokes an agent itself; run agents:resume afterward.
+repin-agent-executable records one explicit, SHA-bound migration from an unusable
+persisted provider executable. It invokes no agent and retries no task; inspect the
+record, then use retry-agent and resume separately.
+retry-review-correction-verification is a host-only recovery for an accepted static
+review correction blocked by the legacy filtered-package path defect. It regenerates
+only the canonical corrected command list, requires an explicit test database target,
+invokes no provider, and commits/reopens the existing review only after verification.
+retry-review-output authorizes one bounded fresh invocation for a static read-only review or
+final_review task whose process succeeded but whose output failed strict review validation.
+It requires an unchanged pristine prepared worktree and dependency history, archives the
+original error/attempt/stdout hash, and invokes no provider. Run agents:resume afterward.
+continue-claude-review-output is the narrower one-time continuation for a Claude review round
+whose ordinary structured-review retry was already consumed under the superseded prompt-only
+text contract. It binds both malformed successful attempts, the consumed recovery, old/new
+adapter contract identities, prepared HEAD, dependencies, and prompt artifacts. Authorization
+invokes no provider; one later resume may invoke Claude at most once under the repaired contract.
+retry-preflight rechecks only a static pre-invocation review-round guard failure with
+zero agent attempts and no accepted output. It requires a quiescent terminal run,
+the current condition and review limit to pass, and any prepared worktree to be pristine.
+It reopens scheduler state without running agents; inspect, then run agents:resume.
+authorize-review-correction grants exactly one hash-bound correction request from an
+accepted changes_requested review. It invokes no provider, preserves the original review,
+and materializes one narrowly owned correction task; run agents:resume afterward.
 verify-blocked-task explicitly verifies a valid blocked writer from the host CLI using
 salvage.verify in its preserved worktree, retaining the original blocked handoff. It
 invokes no agent, rejects adaptive runs, and requires agents:resume afterward.
 
-salvage-task recovers useful work left behind by a task whose process timed out
-(AGENT_TIMEOUT) with a dirty, evidence-backed worktree diff -- the inverse case from
-retry-agent, which requires a CLEAN worktree. It refuses unless every changed tracked file is
+salvage-task recovers useful work left behind by a writer whose final attempt ended
+AGENT_TIMEOUT or AGENT_FAILED with a dirty, evidence-backed worktree diff -- the inverse case
+from retry-agent, which requires a CLEAN worktree. Neither path infers recoverability from
+provider stderr/error prose -- only the persisted error code and attempt outcome decide the
+eligibility class; the diff itself must still prove safe through every check below regardless
+of which of the two failed the attempt. It refuses unless every changed tracked file is
 inside the task's own ownership globs, there are no foreign commits or unexpected untracked
 files, and git diff --check passes. A dirty diff is only evidence, never success on its own:
 it runs agentWorktree.prepare (if configured) and the phase's salvage.verify commands --
@@ -55,7 +120,8 @@ categorically separate from prepare, and required for any task to be salvageable
 then the Orchestrator itself creates the commit, the same way agents:apply-integration-fix
 does. It never invokes an agent for the base flow; a task with a required canonical finding
 still needs one bounded, evidence-only repair call to complete its findingResponses, exactly
-like recover-handoffs. Run agents:resume afterward to continue the run.
+like recover-handoffs. It reopens only dependency-blocked descendants attributable to that
+task, the same way retry-agent does. Run agents:resume afterward to continue the run.
 authorize-recovery-policy loads and validates a recovery-only policy overlay (YAML file,
 salvage.verify and/or executors only) and appends one immutable, hashed snapshot to the run's
 recoveryPolicyHistory -- it NEVER edits the run's immutable phase.yaml snapshot, NEVER invokes
@@ -83,6 +149,67 @@ async function main(argv: readonly string[]): Promise<number> {
     process.stdout.write(`${USAGE}\n`);
     return command === undefined ? 1 : 0;
   }
+  if (command === 'propose-replan' || command === 'authorize-replan') {
+    if (argument === undefined || extra.length !== 1) {
+      process.stderr.write(`Usage: ${command} <run-id> <${command === 'propose-replan' ? 'task-id' : 'proposal-id'}>\n`);
+      return 1;
+    }
+    const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
+    const proposal = command === 'propose-replan'
+      ? await AgentOrchestrator.proposeReplan(argument, extra[0]!, { repositoryPath })
+      : await AgentOrchestrator.authorizeReplan(argument, extra[0]!, { repositoryPath });
+    process.stdout.write(`${JSON.stringify({ proposal, manualNextStep: command === 'propose-replan'
+      ? `Inspect the complete proposal, then explicitly authorize with pnpm agents:authorize-replan ${argument} ${proposal.id}`
+      : `Run pnpm agents:resume ${argument} to execute the authorized follow-up` }, null, 2)}\n`);
+    return 0;
+  }
+  if (command === 'authorize-review-correction') {
+    const [taskId, requestIndexText = '0'] = extra;
+    if (argument === undefined || taskId === undefined || extra.length > 2 || !/^(0|[1-9][0-9]*)$/.test(requestIndexText)) {
+      process.stderr.write('Usage: authorize-review-correction <run-id> <review-task-id> [request-index]\n');
+      return 1;
+    }
+    const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
+    const result = await AgentOrchestrator.authorizeReviewCorrection(argument, taskId, Number(requestIndexText), { repositoryPath });
+    process.stdout.write(`${JSON.stringify({ runId: argument, created: result.created,
+      continuation: result.continuation,
+      manualNextStep: `Inspect the authorization, then run pnpm agents:resume ${argument}`,
+    }, null, 2)}\n`);
+    return 0;
+  }
+  if (command === 'normalize-replan-evidence') {
+    const [taskId, evidenceIndexText, normalizedKind] = extra;
+    if (argument === undefined || taskId === undefined || evidenceIndexText === undefined || normalizedKind === undefined
+      || extra.length !== 3 || !/^(0|[1-9][0-9]*)$/.test(evidenceIndexText) || !Number.isSafeInteger(Number(evidenceIndexText))) {
+      process.stderr.write('Usage: normalize-replan-evidence <run-id> <task-id> <evidence-index> file\n');
+      return 1;
+    }
+    const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
+    const normalization = await AgentOrchestrator.normalizeReplanEvidence(argument, taskId,
+      { requestIndex: 0, evidenceIndex: Number(evidenceIndexText), normalizedKind }, { repositoryPath });
+    process.stdout.write(`${JSON.stringify({ normalization,
+      manualNextStep: `Inspect the normalization, then run pnpm agents:propose-replan ${argument} ${taskId}` }, null, 2)}\n`);
+    return 0;
+  }
+  if (command === 'interpret-replan') {
+    const [taskId, interpretationFile] = extra;
+    if (argument === undefined || taskId === undefined || interpretationFile === undefined || extra.length !== 2) {
+      process.stderr.write('Usage: interpret-replan <run-id> <task-id> <interpretation-file>\n'); return 1;
+    }
+    const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
+    const request = parseStrictYaml(await readFile(resolve(interpretationFile), 'utf8')) as Parameters<typeof AgentOrchestrator.interpretReplan>[2];
+    const interpretation = await AgentOrchestrator.interpretReplan(argument, taskId, request, { repositoryPath });
+    process.stdout.write(`${JSON.stringify({ interpretation, manualNextStep: `Inspect the interpretation, then run pnpm agents:propose-replan ${argument} ${taskId}` }, null, 2)}\n`);
+    return 0;
+  }
+  if (command === 'finalize-failed-salvage') {
+    const [taskId] = extra;
+    if (argument === undefined || taskId === undefined || extra.length !== 1) { process.stderr.write('Usage: finalize-failed-salvage <run-id> <task-id>\n'); return 1; }
+    const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
+    const failure = await AgentOrchestrator.finalizeFailedSalvage(argument, taskId, { repositoryPath });
+    process.stdout.write(`${JSON.stringify({ failure, manualNextStep: `Inspect the finalized evidence, then create an interpretation or proposal for ${taskId}` }, null, 2)}\n`);
+    return 0;
+  }
   if (command === 'apply-integration-fix') {
     const [summary, ...ownership] = extra;
     if (argument === undefined || summary === undefined || ownership.length === 0) {
@@ -103,6 +230,25 @@ async function main(argv: readonly string[]): Promise<number> {
     }, null, 2)}\n`);
     return 0;
   }
+  if (command === 'retry-preflight') {
+    const [taskId] = extra;
+    if (argument === undefined || taskId === undefined || extra.length !== 1) {
+      process.stderr.write(`${USAGE}\n`);
+      return 1;
+    }
+    const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
+    const result = await AgentOrchestrator.retryPreflight(argument, taskId, { repositoryPath });
+    process.stdout.write(`${JSON.stringify({
+      runId: result.orchestrator.snapshot().runId,
+      runStatus: result.orchestrator.snapshot().status,
+      taskId: result.taskId,
+      reopenedTasks: result.reopenedTasks,
+      completedRounds: result.completedRounds,
+      maxReviewRounds: result.maxReviewRounds,
+      manualNextStep: `Inspect the reopened task, then run pnpm agents:resume ${argument}`,
+    }, null, 2)}\n`);
+    return 0;
+  }
   if (command === 'retry-agent') {
     const [taskId] = extra;
     if (argument === undefined || taskId === undefined || extra.length !== 1) {
@@ -120,6 +266,91 @@ async function main(argv: readonly string[]): Promise<number> {
       archivedRecovery: result.recovery.recovery,
       reopenedTasks: result.reopenedTasks,
       manualNextStep: 'Run `pnpm agents:resume <run-id>` to execute the authorized retry.',
+    }, null, 2)}\n`);
+    return 0;
+  }
+  if (command === 'repin-agent-executable') {
+    const [agent, replacementPath] = extra;
+    if (argument === undefined || (agent !== 'codex' && agent !== 'claude')
+      || replacementPath === undefined || extra.length !== 2) {
+      process.stderr.write('Usage: repin-agent-executable <run-id> <codex|claude> <absolute-executable-path>\n');
+      return 1;
+    }
+    const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
+    const result = await AgentOrchestrator.repinAgentExecutable(argument, agent, replacementPath, { repositoryPath });
+    process.stdout.write(`${JSON.stringify({
+      runId: argument,
+      created: result.created,
+      repin: result.repin,
+      manualNextStep: 'Inspect the repin, then run retry-agent for the bound failed task; run resume afterward.',
+    }, null, 2)}\n`);
+    return 0;
+  }
+  if (command === 'retry-review-correction-verification') {
+    const [taskId] = extra;
+    if (argument === undefined || taskId === undefined || extra.length !== 1) {
+      process.stderr.write('Usage: retry-review-correction-verification <run-id> <correction-task-id>\n');
+      return 1;
+    }
+    const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
+    const result = await AgentOrchestrator.retryReviewCorrectionVerification(argument, taskId, { repositoryPath });
+    process.stdout.write(`${JSON.stringify({
+      runId: argument,
+      recoveryId: result.recovery.id,
+      verificationExecuted: result.verificationExecuted,
+      correctionCommitSha: result.recovery.correctionCommitSha,
+      createdCommit: result.createdCommit,
+      manualNextStep: result.recovery.correctionCommitSha === undefined
+        ? 'Corrected host verification remains blocked; inspect the persisted logs and evidence.'
+        : `Inspect the correction commit, then run pnpm agents:resume ${argument} for round-2 review.`,
+    }, null, 2)}\n`);
+    return 0;
+  }
+  if (command === 'retry-review-output') {
+    const [taskId] = extra;
+    if (argument === undefined || taskId === undefined || extra.length !== 1) {
+      process.stderr.write(`${USAGE}\n`);
+      return 1;
+    }
+    const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
+    const result = await AgentOrchestrator.retryReviewOutput(argument, taskId, { repositoryPath });
+    process.stdout.write(`${JSON.stringify({
+      runId: result.orchestrator.snapshot().runId,
+      runStatus: result.orchestrator.snapshot().status,
+      taskId: result.taskId,
+      archivedRecovery: result.recovery.recovery,
+      ...(result.recovery.version === 2 ? { reviewRound: result.recovery.reviewRound } : {}),
+      originalStdoutSha256: result.recovery.stdoutSha256,
+      reopenedTasks: result.reopenedTasks,
+      manualNextStep: 'Run `pnpm agents:resume <run-id>` to execute the authorized review retry.',
+    }, null, 2)}\n`);
+    return 0;
+  }
+  if (command === 'continue-claude-review-output') {
+    const [taskId] = extra;
+    if (argument === undefined || taskId === undefined || extra.length !== 1) {
+      process.stderr.write('Usage: continue-claude-review-output <run-id> <task-id>\n');
+      return 1;
+    }
+    const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
+    const result = await AgentOrchestrator.continueClaudeReviewAfterOutputContractFix(
+      argument,
+      taskId,
+      { repositoryPath },
+    );
+    process.stdout.write(`${JSON.stringify({
+      runId: result.orchestrator.snapshot().runId,
+      runStatus: result.orchestrator.snapshot().status,
+      taskId: result.taskId,
+      created: result.created,
+      archivedRecovery: result.recovery.recovery,
+      reviewRound: result.recovery.reviewRound,
+      malformedAttempts: result.recovery.malformedAttempts,
+      consumedRecovery: result.recovery.consumedRecovery,
+      oldContractId: result.recovery.oldContractId,
+      newContractId: result.recovery.newContractId,
+      reopenedTasks: result.reopenedTasks,
+      manualNextStep: 'Inspect the contract continuation, then run `pnpm agents:resume <run-id>` for its sole post-fix invocation.',
     }, null, 2)}\n`);
     return 0;
   }
@@ -159,6 +390,78 @@ async function main(argv: readonly string[]): Promise<number> {
       runId: result.orchestrator.snapshot().runId,
       policyHash: result.policyHash,
       manualNextStep: 'Run `pnpm agents:recover-handoffs <run-id>` or `pnpm agents:salvage-task <run-id> <task-id>` to use this authorized policy.',
+    }, null, 2)}\n`);
+    return 0;
+  }
+  if (command === 'diagnose') {
+    const [taskId] = extra;
+    if (argument === undefined || extra.length > 1) {
+      process.stderr.write('Usage: diagnose <run-id> [task-id]\n');
+      return 1;
+    }
+    const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
+    const diagnosis = await loadDiagnosis(repositoryPath, argument, taskId);
+    const actionCandidates = mapFailureToActions(diagnosis);
+    const primary = actionCandidates[0];
+    const recommendedAction = primary === undefined ? undefined : legacyRecommendation(primary);
+    process.stdout.write(`${JSON.stringify({
+      diagnosis: {
+        ...diagnosis,
+        actionCandidates,
+        ...(recommendedAction === undefined ? {} : { recommendedAction }),
+      },
+    }, null, 2)}\n`);
+    return 0;
+  }
+  if (command === 'coordinate-shadow-claude') {
+    const [taskId] = extra;
+    if (argument === undefined || extra.length > 1) {
+      process.stderr.write('Usage: coordinate-shadow-claude <run-id> [task-id]\n');
+      return 1;
+    }
+    const cancellation = installCancellationSignal();
+    try {
+      const repositoryRoot = await new GitClient().repositoryRoot(process.cwd());
+      const executable = await resolveAgentExecutable('claude');
+      if (executable === null) {
+        throw new Error('Claude executable could not be resolved for Shadow Coordinator');
+      }
+      const reasoner = new ClaudeCoordinatorReasoner({
+        executable: executable.path,
+        workingDirectory: repositoryRoot,
+        abortSignal: cancellation.signal,
+      });
+      const report = await coordinateShadowRun({
+        repositoryRoot,
+        runId: argument,
+        ...(taskId === undefined ? {} : { taskId }),
+        reasoner,
+      });
+      process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+      return 0;
+    } finally {
+      cancellation.dispose();
+    }
+  }
+  if (command === 'remember-diagnosis') {
+    const [taskId] = extra;
+    if (argument === undefined || extra.length > 1) {
+      process.stderr.write('Usage: remember-diagnosis <run-id> [task-id]\n');
+      return 1;
+    }
+    const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
+    const diagnosis = await loadDiagnosis(repositoryPath, argument, taskId);
+    const entries = projectDiagnosisToMemory(diagnosis, mapFailureToActions(diagnosis));
+    const memory = new MemoryStore(repositoryPath);
+    const results = [];
+    for (const entry of entries) results.push(await memory.putMemory(entry));
+    process.stdout.write(`${JSON.stringify({
+      runId: argument,
+      diagnosisStatus: diagnosis.status,
+      projected: entries.length,
+      created: results.filter((result) => result.status === 'created').length,
+      alreadyPresent: results.filter((result) => result.status === 'already_present').length,
+      entries: results.map((result) => ({ id: result.entry.id, kind: result.entry.kind, status: result.status })),
     }, null, 2)}\n`);
     return 0;
   }
@@ -236,31 +539,48 @@ async function main(argv: readonly string[]): Promise<number> {
   if (command === 'metrics') {
     const { store } = await locateRun(repositoryPath, argument);
     const state = await store.load();
-    const config = state.strategy === 'adaptive'
+    const baseConfig = state.strategy === 'adaptive'
       ? runtimePhaseConfig(await loadAdaptivePhaseConfig(join(store.runDirectory, 'phase.yaml')), state.adaptive!)
       : await loadAnyPhaseConfig(join(store.runDirectory, 'phase.yaml'));
+    const recoveredConfig = applyRecoveryPolicyOverlay(baseConfig, state.recoveryPolicyHistory?.at(-1)?.policy);
+    const config = state.strategy === 'adaptive' ? recoveredConfig
+      : applyReviewCorrectionOverlays(applyReplanOverlays(recoveredConfig, state), state);
     const metrics = await computeRunMetrics(store.runDirectory, state, config);
     process.stdout.write(`${JSON.stringify(metrics, null, 2)}\n`);
     return 0;
   }
   if (command === 'cleanup') {
     const { repositoryRoot, store } = await locateRun(repositoryPath, argument);
-    const state = await store.load();
-    if (state.status === 'RUNNING' || Object.values(state.tasks).some(
-      (task) => task.status === 'RUNNING',
-    )) {
-      throw new Error('Refusing cleanup while the run or a task is RUNNING');
-    }
-    const manager = await WorktreeManager.create({ repositoryPath: repositoryRoot });
-    const cleaned = await manager.cleanupRun(state.runId);
-    process.stdout.write(
-      `${JSON.stringify({ runId: state.runId, cleaned: cleaned.map(({ entry }) => entry.path) }, null, 2)}\n`,
-    );
-    return 0;
+    return store.withRunMutationLock(async () => {
+      const state = await store.load();
+      if (state.status === 'RUNNING' || Object.values(state.tasks).some(
+        (task) => task.status === 'RUNNING',
+      )) {
+        throw new Error('Refusing cleanup while the run or a task is RUNNING');
+      }
+      const manager = await WorktreeManager.create({ repositoryPath: repositoryRoot });
+      const cleaned = await manager.cleanupRun(state.runId);
+      process.stdout.write(
+        `${JSON.stringify({ runId: state.runId, cleaned: cleaned.map(({ entry }) => entry.path) }, null, 2)}\n`,
+      );
+      return 0;
+    });
   }
 
   process.stderr.write(`Unknown command: ${command}\n${USAGE}\n`);
   return 1;
+}
+
+function legacyRecommendation(candidate: ActionCandidate) {
+  return {
+    id: candidate.id.toLowerCase().replaceAll('_', '-'),
+    ...(candidate.command === undefined
+      ? {}
+      : { command: `pnpm ${candidate.command.script} ${candidate.command.args.join(' ')}` }),
+    requiresHumanAuthorization: candidate.authority.required,
+    execution: candidate.execution,
+    reason: candidate.reason,
+  };
 }
 
 function installCancellationSignal(): {
@@ -293,6 +613,18 @@ async function locateRun(
       runId,
     ),
   };
+}
+
+async function loadDiagnosis(repositoryPath: string, runId: string, taskId?: string) {
+  const { store } = await locateRun(repositoryPath, runId);
+  const state = await store.load();
+  const baseConfig = state.strategy === 'adaptive'
+    ? runtimePhaseConfig(await loadAdaptivePhaseConfig(join(store.runDirectory, 'phase.yaml')), state.adaptive!)
+    : await loadAnyPhaseConfig(join(store.runDirectory, 'phase.yaml'));
+  const recoveredConfig = applyRecoveryPolicyOverlay(baseConfig, state.recoveryPolicyHistory?.at(-1)?.policy);
+  const config = state.strategy === 'adaptive' ? recoveredConfig
+    : applyReviewCorrectionOverlays(applyReplanOverlays(recoveredConfig, state), state);
+  return diagnoseFailure({ store, state, config, ...(taskId === undefined ? {} : { taskId }) });
 }
 
 // §15/§14: verified against real --help output before being hard-coded, not
@@ -408,6 +740,7 @@ export function renderStatus(state: RunState): string {
       })(),
       reviewRounds: task.reviewRounds,
       commitSha: task.commit?.sha ?? null,
+      ...(task.replan === undefined ? {} : { replan: task.replan }),
       error: task.error ?? null,
     }])),
     integration: state.integration,

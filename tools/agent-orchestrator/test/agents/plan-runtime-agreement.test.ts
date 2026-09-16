@@ -35,7 +35,7 @@ test('a real (non-injected) agent spawns the exact executable planPhase resolved
       '#!/bin/sh',
       'cat > /dev/null',
       "cat <<'JSON'",
-      '{"status":"approved","findings":[]}',
+      '{"type":"result","subtype":"success","is_error":false,"result":"","structured_output":{"status":"approved","findings":[]}}',
       'JSON',
       'exit 0',
       '',

@@ -19,11 +19,11 @@ import { SEMANTIC_ROLE_BY_TASK_MODE, type SolverVerifierRole } from '../workflow
  *   avg correction rounds
  *   success rate by provider / model / role / effort / task type
  *
- * tokensUsed and costUsd are ALWAYS null. Neither adapter's invocation
- * (claude -p --output-format text; codex exec) exposes structured usage
- * data through the single JSON handoff/review object this orchestrator reads
- * from stdout — there is no wrapper carrying it. Inventing a number here
- * would be worse than the honest "unknown" the brief explicitly asks for.
+ * tokensUsed and costUsd are ALWAYS null. AgentResult does not project usage
+ * from either provider transport into persisted task state. Claude's review
+ * envelope now contains usage metadata, but raw stdout is audit evidence and
+ * not a metrics state contract; inventing or opportunistically reparsing a
+ * number here would be worse than the honest "unknown" the brief asks for.
  */
 
 export interface TaskMetrics {
