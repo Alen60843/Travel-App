@@ -58,8 +58,11 @@ combinator-free object. It bounds known fields, decision and action enums,
 reference count, reference kinds, and string lengths, and rejects unknown
 fields. `actionId` and the three reference payload fields are optional at the
 transport layer because their conditional relationships require branching.
-The flat reference item similarly requires only `kind` while exposing the
-known `reference`, `memoryId`, and `path` fields.
+The flat reference item similarly requires `kind`, exposes the known
+`reference`, `memoryId`, and `path` fields, and requires exactly two total
+properties: `kind` plus one payload. This prevents multi-payload objects but
+cannot prove that the chosen payload matches the chosen kind without
+reintroducing branching.
 
 Claude returns a JSON provider envelope. A small generic envelope helper,
 shared with the existing structured-review path, accepts only a verified
@@ -76,6 +79,11 @@ rules. Coordinator Core remains the current-state authority for action
 selection, evidence existence, historical/current separation, and status truth
 tables. Flattening the transport schema grants the model no additional
 authority.
+
+The prompt supplies the exact two-field shape for every reference kind and
+distinguishes a semantic evidence reference such as `run.status` from the JSON
+location where that value appears. This guides provider output but does not
+replace transport or runtime validation.
 
 ## Bounded process behavior
 

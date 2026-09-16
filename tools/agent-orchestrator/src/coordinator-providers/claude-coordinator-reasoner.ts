@@ -26,6 +26,8 @@ export const CLAUDE_COORDINATOR_CAPABILITY_PROFILE: CapabilityProfile = Object.f
 const referenceSchema = {
   type: 'object',
   additionalProperties: false,
+  minProperties: 2,
+  maxProperties: 2,
   required: ['kind'],
   properties: {
     kind: { type: 'string', enum: ['current_evidence', 'memory', 'repository_hint'] },
@@ -149,6 +151,14 @@ export function buildClaudeCoordinatorPrompt(context: ContextBundle): string {
     'Do not authorize, execute, retry, modify files, use tools, propose shell commands, or claim that an action happened.',
     'The reason must be a concise conclusion and evidence summary, never private chain-of-thought.',
     'Every supporting reference must exactly match a reference present in the supplied context.',
+    'Supporting references must use EXACTLY these shapes:',
+    'current evidence:{"kind":"current_evidence","reference":"<exact current evidence reference>"}',
+    'Memory:{"kind":"memory","memoryId":"<exact memory fact id>"}',
+    'Repository hint:{"kind":"repository_hint","path":"<exact repository hint path>"}',
+    'Each reference object has exactly two fields: kind plus its one semantic payload field.',
+    'Never add path or memoryId to current_evidence; reference or path to memory; reference or memoryId to repository_hint; or JSON-pointer/location metadata.',
+    'reference means the exact semantic evidence reference value already present in ContextBundle (for example run.status), never its JSON location (for example current.diagnosis.evidence[0].reference). Repository path is allowed only for repository_hint.',
+    'no_action and human_required must not include actionId; select_action must include actionId.',
     'Return only the proposal required by the supplied structured-output schema.',
     `ContextBundle:${canonicalJson(context)}`,
   ].join('\n');

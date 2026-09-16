@@ -15,6 +15,7 @@ import {
   CLAUDE_COORDINATOR_PROPOSAL_SCHEMA,
   ClaudeCoordinatorReasoner,
   ClaudeCoordinatorReasonerError,
+  buildClaudeCoordinatorPrompt,
 } from '../../src/coordinator-providers';
 import type { ContextBundle } from '../../src/context-builder';
 import { matchCapabilities } from '../../src/role-capabilities';
@@ -110,16 +111,39 @@ test('flat transport schema bounds known proposal and reference fields without c
   assert.equal(schema.properties.supportingReferences.maxItems, 16);
   const reference = schema.properties.supportingReferences.items;
   assert.equal(reference.additionalProperties, false);
+  assert.equal(reference.minProperties, 2);
+  assert.equal(reference.maxProperties, 2);
   assert.deepEqual(reference.required, ['kind']);
   assert.deepEqual(reference.properties.kind.enum,
     ['current_evidence', 'memory', 'repository_hint']);
   assert.deepEqual(Object.keys(reference.properties), ['kind', 'reference', 'memoryId', 'path']);
 });
 
+test('prompt states exact proposal and supporting-reference semantic shapes', () => {
+  const prompt = buildClaudeCoordinatorPrompt(context);
+  assert.match(prompt,
+    /current evidence:\{"kind":"current_evidence","reference":"<exact current evidence reference>"\}/u);
+  assert.match(prompt, /Memory:\{"kind":"memory","memoryId":"<exact memory fact id>"\}/u);
+  assert.match(prompt,
+    /Repository hint:\{"kind":"repository_hint","path":"<exact repository hint path>"\}/u);
+  assert.match(prompt, /exactly two fields: kind plus its one semantic payload field/u);
+  assert.match(prompt, /Never add path or memoryId to current_evidence/u);
+  assert.match(prompt, /reference or path to memory/u);
+  assert.match(prompt, /reference or memoryId to repository_hint/u);
+  assert.match(prompt, /JSON-pointer\/location metadata/u);
+  assert.match(prompt, /reference means the exact semantic evidence reference value/u);
+  assert.match(prompt, /for example run\.status/u);
+  assert.match(prompt, /never its JSON location/u);
+  assert.match(prompt, /current\.diagnosis\.evidence\[0\]\.reference/u);
+  assert.match(prompt, /no_action and human_required must not include actionId/u);
+  assert.match(prompt, /select_action must include actionId/u);
+});
+
 test('runtime parser accepts all three valid proposal variants under the flat transport schema', () => {
   const proposals = [
     {
-      version: 1, decision: 'no_action', reason: 'No action.', supportingReferences: [],
+      version: 1, decision: 'no_action', reason: 'No action.',
+      supportingReferences: [{ kind: 'current_evidence', reference: 'run.status' }],
     },
     {
       version: 1, decision: 'select_action', actionId: 'RETRY_REVIEW_OUTPUT',
@@ -146,9 +170,11 @@ test('runtime parser rejects semantic combinations intentionally representable b
     { ...base, decision: 'no_action', actionId: 'RETRY_REVIEW_OUTPUT' },
     { ...base, decision: 'select_action' },
     { ...base, decision: 'no_action', supportingReferences: [{ kind: 'memory', path: 'wrong' }] },
-    { ...base, decision: 'no_action', supportingReferences: [
-      { kind: 'current_evidence', reference: 'run.status', memoryId: 'extra' },
-    ] },
+    { ...base, decision: 'no_action', supportingReferences: [{
+      kind: 'current_evidence',
+      reference: 'run.status',
+      path: 'current.diagnosis.evidence[0].reference',
+    }] },
   ]) assert.throws(() => parseCoordinatorProposal(proposal));
 });
 
