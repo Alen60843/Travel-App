@@ -1,5 +1,4 @@
-import { createHash } from 'node:crypto';
-
+import { canonicalHash as hashCanonicalJson } from '../canonical-json';
 import type { IntegrationCommand, PhaseConfig } from '../config';
 import { OrchestratorError } from '../errors';
 import { parseWorkRequestDraft } from '../adaptive/validation';
@@ -36,13 +35,7 @@ export interface ReviewCorrectionContinuation {
 }
 
 export function canonicalHash(value: unknown): string {
-  const canonical = (item: unknown): unknown => Array.isArray(item)
-    ? item.map(canonical)
-    : item !== null && typeof item === 'object'
-      ? Object.fromEntries(Object.entries(item).filter(([, child]) => child !== undefined)
-        .sort(([left], [right]) => left.localeCompare(right)).map(([key, child]) => [key, canonical(child)]))
-      : item;
-  return createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex');
+  return hashCanonicalJson(value);
 }
 
 export function authorizationId(value: Omit<ReviewCorrectionAuthorization, 'id' | 'authorizedBy' | 'authorizedAt'>): string {

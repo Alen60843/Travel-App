@@ -16,6 +16,7 @@ import { applyReviewCorrectionOverlays } from './review/correction-continuation'
 import { diagnoseFailure } from './failure-intelligence/classifier';
 import { mapFailureToActions } from './action-mapping/mapper';
 import type { ActionCandidate } from './action-mapping/types';
+import { MemoryStore, projectDiagnosisToMemory } from './memory';
 
 const USAGE = `TripWith local agent orchestrator
 
@@ -27,6 +28,7 @@ Usage:
   pnpm agents:cleanup <run-id>
   pnpm agents:metrics <run-id>
   pnpm agents:diagnose <run-id> [task-id]
+  pnpm agents:remember-diagnosis <run-id> [task-id]
   pnpm agents:recover-handoffs <run-id>
   pnpm agents:retry-agent <run-id> <task-id>
   pnpm agents:repin-agent-executable <run-id> <agent> <absolute-executable-path>
@@ -52,6 +54,8 @@ metrics is read-only: it recomputes a summary from persisted run artifacts and n
 touches agents, worktrees, or state.
 diagnose is read-only: it deterministically classifies only the current active blocker
 from persisted evidence and recommends, but never executes or authorizes, a bounded action.
+remember-diagnosis explicitly persists only the current structured diagnosis and mapped
+candidate facts in repository Memory. It never mutates the run or executes a candidate.
 normalize-replan-evidence explicitly records one deterministic test-to-file interpretation
 for the exact persisted handoff entry and dirty source tree. It invokes no provider or task,
 creates no commit, and never rewrites the handoff. Inspect it, then propose-replan separately.
@@ -389,20 +393,7 @@ async function main(argv: readonly string[]): Promise<number> {
       return 1;
     }
     const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
-    const { store } = await locateRun(repositoryPath, argument);
-    const state = await store.load();
-    const baseConfig = state.strategy === 'adaptive'
-      ? runtimePhaseConfig(await loadAdaptivePhaseConfig(join(store.runDirectory, 'phase.yaml')), state.adaptive!)
-      : await loadAnyPhaseConfig(join(store.runDirectory, 'phase.yaml'));
-    const recoveredConfig = applyRecoveryPolicyOverlay(baseConfig, state.recoveryPolicyHistory?.at(-1)?.policy);
-    const config = state.strategy === 'adaptive' ? recoveredConfig
-      : applyReviewCorrectionOverlays(applyReplanOverlays(recoveredConfig, state), state);
-    const diagnosis = await diagnoseFailure({
-      store,
-      state,
-      config,
-      ...(taskId === undefined ? {} : { taskId }),
-    });
+    const diagnosis = await loadDiagnosis(repositoryPath, argument, taskId);
     const actionCandidates = mapFailureToActions(diagnosis);
     const primary = actionCandidates[0];
     const recommendedAction = primary === undefined ? undefined : legacyRecommendation(primary);
@@ -412,6 +403,28 @@ async function main(argv: readonly string[]): Promise<number> {
         actionCandidates,
         ...(recommendedAction === undefined ? {} : { recommendedAction }),
       },
+    }, null, 2)}\n`);
+    return 0;
+  }
+  if (command === 'remember-diagnosis') {
+    const [taskId] = extra;
+    if (argument === undefined || extra.length > 1) {
+      process.stderr.write('Usage: remember-diagnosis <run-id> [task-id]\n');
+      return 1;
+    }
+    const repositoryPath = await new GitClient().repositoryRoot(process.cwd());
+    const diagnosis = await loadDiagnosis(repositoryPath, argument, taskId);
+    const entries = projectDiagnosisToMemory(diagnosis, mapFailureToActions(diagnosis));
+    const memory = new MemoryStore(repositoryPath);
+    const results = [];
+    for (const entry of entries) results.push(await memory.putMemory(entry));
+    process.stdout.write(`${JSON.stringify({
+      runId: argument,
+      diagnosisStatus: diagnosis.status,
+      projected: entries.length,
+      created: results.filter((result) => result.status === 'created').length,
+      alreadyPresent: results.filter((result) => result.status === 'already_present').length,
+      entries: results.map((result) => ({ id: result.entry.id, kind: result.entry.kind, status: result.status })),
     }, null, 2)}\n`);
     return 0;
   }
@@ -563,6 +576,18 @@ async function locateRun(
       runId,
     ),
   };
+}
+
+async function loadDiagnosis(repositoryPath: string, runId: string, taskId?: string) {
+  const { store } = await locateRun(repositoryPath, runId);
+  const state = await store.load();
+  const baseConfig = state.strategy === 'adaptive'
+    ? runtimePhaseConfig(await loadAdaptivePhaseConfig(join(store.runDirectory, 'phase.yaml')), state.adaptive!)
+    : await loadAnyPhaseConfig(join(store.runDirectory, 'phase.yaml'));
+  const recoveredConfig = applyRecoveryPolicyOverlay(baseConfig, state.recoveryPolicyHistory?.at(-1)?.policy);
+  const config = state.strategy === 'adaptive' ? recoveredConfig
+    : applyReviewCorrectionOverlays(applyReplanOverlays(recoveredConfig, state), state);
+  return diagnoseFailure({ store, state, config, ...(taskId === undefined ? {} : { taskId }) });
 }
 
 // §15/§14: verified against real --help output before being hard-coded, not
