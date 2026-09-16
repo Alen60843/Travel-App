@@ -110,6 +110,33 @@ tasks:
         - do not expose trust_score_raw, source users, reports, moderation notes,
           provider evidence, document metadata or the raw ledger by default
 
+      Trust application mechanics are in scope; new Trust mutation policy is not.
+      This phase may implement one authoritative Trust repository/application
+      boundary, append-only transactional persistence, deterministic/versioned
+      idempotency, identical-replay recognition, same-key/different-semantics
+      conflict detection, projection-consistency checks, safe current-score reads
+      and the read-only moderation context seam.
+
+      Do not invent numerical Trust deltas or a new Event, Review, no-show or
+      Moderation outcome-to-Trust policy. Existing TrustEventType enum members are
+      vocabulary, not approval of a numerical scoring policy. Do not connect
+      Events, Reviews or Moderation to new Trust mutations, and do not add any
+      automatic production Trust producer, unless canonical repository evidence
+      already explicitly approves its business effect.
+
+      Do not compensate for missing policy with a generic public/client API that
+      accepts a delta, TrustEventType or arbitrary ledger payload. If a low-level
+      repository primitive necessarily accepts a delta internally, keep it behind
+      the Trust application boundary. That primitive is infrastructure, not an
+      approved domain producer, and no new production caller may use it to create
+      a policy-bearing effect without explicit canonical repository evidence.
+
+      Reversal mechanics remain in scope because their numerical effect is
+      mechanically derived from an existing original ledger row rather than a new
+      scoring decision. Enforce the same subject, exact negative delta, an existing
+      non-reversal original, at most one reversal, append-only persistence and
+      concurrency safety.
+
       Verification itself creates no Trust event, delta, multiplier or bonus.
       Add focused unit and real PostgreSQL concurrency/invariant tests, including
       lifecycle replay/conflict, ledger replay/conflict, reversal exactness and
@@ -119,9 +146,13 @@ tasks:
       HUMAN_REQUIRED boundary: do not choose a vendor, accepted-document policy,
       expiry/reverification policy, external revocation authority, exact provider
       provenance retention, moderator authorization, moderation-to-Trust mapping
-      or full explainability policy. If correctness genuinely depends on one,
-      return a blocked handoff that names the missing decision and evidence rather
-      than inventing it.
+      or full explainability policy. This boundary also includes any new
+      domain-event-to-Trust-delta policy not already defined by canonical
+      repository evidence. If implementation genuinely requires deciding how many
+      Trust points an event, review, no-show or moderation outcome is worth, return
+      a blocked handoff that names the missing decision and evidence rather than
+      inventing it. This does not block the repository/application infrastructure,
+      safe reads, idempotency mechanics or mechanically derived reversals.
 
   - id: phase8-verification-trust-review
     title: Adversarial review of identity verification and Trust core
@@ -363,7 +394,11 @@ tasks:
         - the ledger is append-only; concurrent duplicate occurrence has one
           effect; conflicting semantics fail; reversals are exact and unique;
           protected projections cannot be directly mutated through the app role
-        - verification creates zero arbitrary Trust bonus
+        - verification creates zero Trust event and zero Trust delta
+        - no new Event, Review, no-show or Moderation Trust producer was silently
+          introduced without an explicitly approved canonical scoring policy
+        - any Trust events used to exercise repository mechanics are explicit test
+          fixtures/inputs and cannot be mistaken for production scoring policy
         - Matching remains 0.40 I + 0.30 T + 0.20 S + 0.10 P with SQL/TypeScript
           parity and its existing Trust floor; Event minimum Trust, Explorer,
           account restrictions, blocks and Phase 7 Chat retain their semantics
