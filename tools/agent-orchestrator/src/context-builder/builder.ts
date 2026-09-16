@@ -185,6 +185,21 @@ function allMemoryEntries(input: ContextBuilderInput['relevantMemory']): readonl
   ].sort((left, right) => compareText(left.id, right.id));
 }
 
+function validateMemoryEntryScope(
+  entries: readonly MemoryEntry[],
+  subject: MemorySubject,
+  aggregateRunId: string | undefined,
+): void {
+  for (const entry of entries) {
+    if (!sameSubject(entry.subject, subject)) {
+      corrupt(`Memory entry ${entry.id} subject does not match requested scope`);
+    }
+    if (aggregateRunId !== undefined && entry.provenance.runId !== aggregateRunId) {
+      corrupt(`Memory entry ${entry.id} runId conflicts with relevant Memory scope`);
+    }
+  }
+}
+
 function cloneAndSortEdges(edges: readonly MemoryGraphEdge[]): readonly MemoryGraphEdge[] {
   const cloneNode = (node: MemoryNodeRef): MemoryNodeRef => node.kind === 'subject'
     ? { kind: 'subject', subject: cloneSubject(node.subject) }
@@ -218,6 +233,7 @@ export function buildContextBundle(input: ContextBuilderInput): ContextBuildResu
   const repositoryScoped = emptyFacts();
   const historical = new Map<string, MutableFacts>();
   const entries = allMemoryEntries(input.relevantMemory);
+  validateMemoryEntryScope(entries, input.subject, input.relevantMemory.runId);
   for (const entry of entries) {
     const runId = entry.provenance.runId;
     if (runId === undefined) addFact(repositoryScoped, entry);

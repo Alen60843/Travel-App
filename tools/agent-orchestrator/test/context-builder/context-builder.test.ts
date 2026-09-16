@@ -38,16 +38,18 @@ function diagnosis(
 function memoryProvenance(
   sourceKind: MemoryEntry['provenance']['sourceKind'],
   runId?: string,
+  entrySubject: MemorySubject = subject,
 ): MemoryEntry['provenance'] {
   return { sourceKind, producerVersion: 1, ...(runId === undefined ? {} : { runId }),
-    taskId: 'task-x', references: ['artifact:source'] };
+    ...(entrySubject.kind === 'task' ? { taskId: entrySubject.taskId } : {}),
+    references: ['artifact:source'] };
 }
 
-function failure(runId: string, classification: FailureClassification):
+function failure(runId: string, classification: FailureClassification, entrySubject: MemorySubject = subject):
 Extract<MemoryEntry, { readonly kind: 'FAILURE' }> {
-  return createMemoryEntry({ version: 1, kind: 'FAILURE', subject,
+  return createMemoryEntry({ version: 1, kind: 'FAILURE', subject: entrySubject,
     data: { diagnosisVersion: 1, classification },
-    provenance: memoryProvenance('failure_diagnosis', runId) }) as
+    provenance: memoryProvenance('failure_diagnosis', runId, entrySubject) }) as
     Extract<MemoryEntry, { readonly kind: 'FAILURE' }>;
 }
 
@@ -70,11 +72,11 @@ Extract<MemoryEntry, { readonly kind: 'OUTCOME' }> {
     Extract<MemoryEntry, { readonly kind: 'OUTCOME' }>;
 }
 
-function invariant(key = 'authorization-required'):
+function invariant(key = 'authorization-required', entrySubject: MemorySubject = subject):
 Extract<MemoryEntry, { readonly kind: 'INVARIANT' }> {
-  return createMemoryEntry({ version: 1, kind: 'INVARIANT', subject,
+  return createMemoryEntry({ version: 1, kind: 'INVARIANT', subject: entrySubject,
     data: { key, rule: { required: true }, rationale: 'Trusted repository rule.' },
-    provenance: memoryProvenance('trusted_invariant') }) as
+    provenance: memoryProvenance('trusted_invariant', undefined, entrySubject) }) as
     Extract<MemoryEntry, { readonly kind: 'INVARIANT' }>;
 }
 
@@ -194,11 +196,65 @@ test('conflicting relevant Memory runId fails closed', () => {
     (error) => isOrchestratorError(error, 'STATE_CORRUPT'));
 });
 
+test('aggregate subject cannot conceal a FAILURE for another task', () => {
+  const mismatched = failure('run-b', 'MALFORMED_REVIEW_OUTPUT', { kind: 'task', taskId: 'task-evil' });
+  assert.throws(() => buildContextBundle(input({ relevantMemory: relevantMemory([mismatched]) })),
+    (error) => isOrchestratorError(error, 'STATE_CORRUPT'));
+});
+
+test('aggregate subject cannot conceal a non-FAILURE fact for another task', () => {
+  const mismatched = invariant('other-task-rule', { kind: 'task', taskId: 'task-evil' });
+  assert.throws(() => buildContextBundle(input({ relevantMemory: relevantMemory([mismatched]) })),
+    (error) => isOrchestratorError(error, 'STATE_CORRUPT'));
+});
+
+test('run-scoped relevant Memory rejects an entry from a different physical run', () => {
+  const mismatched = failure('run-a', 'AGENT_EXECUTABLE_DRIFT');
+  assert.throws(() => buildContextBundle(input({
+    relevantMemory: relevantMemory([mismatched], { runId: 'run-b' }),
+  })), (error) => isOrchestratorError(error, 'STATE_CORRUPT'));
+});
+
+test('run-scoped relevant Memory rejects an entry without run provenance', () => {
+  assert.throws(() => buildContextBundle(input({
+    relevantMemory: relevantMemory([invariant()], { runId: 'run-b' }),
+  })), (error) => isOrchestratorError(error, 'STATE_CORRUPT'));
+});
+
+test('run-scoped relevant Memory accepts entries whose run provenance all matches', () => {
+  const currentFailure = failure('run-b', 'MALFORMED_REVIEW_OUTPUT');
+  const currentAction = action(currentFailure, 'RETRY_REVIEW_OUTPUT');
+  const bundle = ready(buildContextBundle(input({
+    relevantMemory: relevantMemory([decision('run-b'), currentAction, currentFailure], { runId: 'run-b' }),
+  })));
+  assert.equal(bundle.memory.currentRun.failures.length, 1);
+  assert.equal(bundle.memory.currentRun.actionCandidates.length, 1);
+  assert.equal(bundle.memory.currentRun.decisions.length, 1);
+  assert.deepEqual(bundle.memory.historicalRuns, []);
+  assert.deepEqual(bundle.memory.repositoryScoped, {
+    failures: [], actionCandidates: [], outcomes: [], decisions: [], invariants: [],
+  });
+});
+
 test('cross-run relevant Memory with no runId constraint is accepted', () => {
   const entries = fullHistory();
   const bundle = ready(buildContextBundle(input({ relevantMemory: relevantMemory(entries) })));
   assert.deepEqual(bundle.memory.historicalRuns.map((group) => group.runId), ['run-a']);
   assert.equal(bundle.memory.currentRun.failures.length, 1);
+  assert.equal(bundle.memory.repositoryScoped.invariants.length, 1);
+});
+
+test('wrong-subject facts fail before any current, historical, or repository partition can be returned', () => {
+  const other: MemorySubject = { kind: 'task', taskId: 'task-evil' };
+  const mismatches = [
+    failure('run-b', 'MALFORMED_REVIEW_OUTPUT', other),
+    failure('run-a', 'AGENT_EXECUTABLE_DRIFT', other),
+    invariant('other-task-rule', other),
+  ];
+  for (const mismatched of mismatches) {
+    assert.throws(() => buildContextBundle(input({ relevantMemory: relevantMemory([mismatched]) })),
+      (error) => isOrchestratorError(error, 'STATE_CORRUPT'));
+  }
 });
 
 test('repository hints remain ordered advisory structured data', () => {
