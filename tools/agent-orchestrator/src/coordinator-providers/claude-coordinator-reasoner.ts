@@ -158,7 +158,6 @@ export class ClaudeCoordinatorReasoner implements CoordinatorReasoner {
   private buildArgs(): readonly string[] {
     return [
       '-p',
-      '--safe-mode',
       '--no-session-persistence',
       '--output-format', 'json',
       '--effort', this.options.effort ?? 'high',

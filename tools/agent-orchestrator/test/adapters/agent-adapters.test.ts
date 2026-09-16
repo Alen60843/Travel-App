@@ -93,7 +93,7 @@ test('Codex review requests use the installed CLI read-only sandbox contract', a
   assert.match(record.stdin, /This is a read-only task/);
 });
 
-test('Claude adapter uses non-interactive safe mode, maps extra_high to xhigh, and restricts reviewer tools', async () => {
+test('Claude adapter uses verified non-interactive flags, maps extra_high to xhigh, and restricts reviewer tools', async () => {
   const fixture = await createFixture();
   const request = makeRequest(fixture, {
     role: 'final_review',
@@ -115,7 +115,7 @@ test('Claude adapter uses non-interactive safe mode, maps extra_high to xhigh, a
   const record = await readRecord(fixture.recordPath);
   assert.equal(record.cwd, await realpath(fixture.worktree));
   assert.ok(record.args.includes('-p'));
-  assert.ok(record.args.includes('--safe-mode'));
+  assert.equal(record.args.includes('--safe-mode'), false);
   assert.ok(record.args.includes('--no-session-persistence'));
   assert.equal(argumentValue(record.args, '--output-format'), 'json');
   const providerSchema = JSON.parse(argumentValue(record.args, '--json-schema')!) as unknown;

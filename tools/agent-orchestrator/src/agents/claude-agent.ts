@@ -39,7 +39,6 @@ export class ClaudeAgent extends ProcessAgent {
     // the explicit tool list supplies the read-only capability boundary.
     const args = [
       '-p',
-      '--safe-mode',
       '--no-session-persistence',
       '--output-format',
       structuredReview ? 'json' : 'text',

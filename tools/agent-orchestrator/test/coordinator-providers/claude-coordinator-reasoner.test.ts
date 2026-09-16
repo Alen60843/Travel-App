@@ -79,7 +79,8 @@ test('one propose call spawns once, sends the complete canonical context on stdi
     assertArgPair(record.args, '--permission-mode', 'dontAsk');
     assertArgPair(record.args, '--mcp-config', '{"mcpServers":{}}');
     assertArgPair(record.args, '--setting-sources', '');
-    for (const flag of ['-p', '--safe-mode', '--no-session-persistence', '--disable-slash-commands',
+    assert.equal(record.args.includes('--safe-mode'), false);
+    for (const flag of ['-p', '--no-session-persistence', '--disable-slash-commands',
       '--strict-mcp-config', '--no-chrome', '--json-schema']) assert.ok(record.args.includes(flag), flag);
   } finally { await fixture.dispose(); }
 });

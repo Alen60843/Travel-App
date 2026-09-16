@@ -21,7 +21,6 @@ Development verified Claude Code `2.1.71`. Its local help and argument parser
 accept the exact transport flags used here:
 
 - `-p` for one headless print-mode call;
-- `--safe-mode`;
 - `--no-session-persistence`;
 - `--output-format json`;
 - `--json-schema <schema>`;
