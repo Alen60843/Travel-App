@@ -24,7 +24,11 @@ This runtime directory is ignored by Git. Persistence is immutable: a completed 
 published with an exclusive filesystem link, identical repeated writes are idempotent, and an
 existing conflicting or corrupt entry fails closed. Reads reject invalid IDs, traversal, symlinks,
 non-regular files, oversized or malformed JSON, unsupported versions, noncanonical bytes, and
-directories exceeding the bounded scan limit. There is no update or delete API.
+canonical entry counts exceeding the bounded scan limit. Recognized stale publication temp files
+are streamed past, never interpreted as entries, and do not consume that canonical-entry budget.
+Arbitrary nested JSON remains supported for trusted decision/invariant payloads, but runtime values
+must be arrays, primitives, or plain data-property objects; class instances and accessors fail closed.
+There is no update or delete API.
 
 Retrieval is exact only: by ID or deterministic listing filtered by exact kind, subject, run ID,
 or task ID. There is no full-text search, fuzzy ranking, graph traversal, embedding, or semantic

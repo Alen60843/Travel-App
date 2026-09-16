@@ -10,6 +10,8 @@ import type { MemoryEntry, MemoryQuery } from './types';
 
 export const MAX_MEMORY_SCAN_ENTRIES = 256;
 const MEMORY_ID = /^[a-f0-9]{64}$/;
+const MEMORY_ENTRY_NAME = /^[a-f0-9]{64}\.json$/;
+const MEMORY_TEMP_NAME = /^\.[a-f0-9]{64}\.tmp-[1-9][0-9]*-[a-f0-9-]{36}$/;
 
 export interface PutMemoryResult {
   readonly status: 'created' | 'already_present';
@@ -108,16 +110,16 @@ export class MemoryStore {
     const directory = await opendir(this.entriesRoot);
     try {
       for await (const item of directory) {
+        if (MEMORY_TEMP_NAME.test(item.name)) continue;
+        if (!MEMORY_ENTRY_NAME.test(item.name)) corrupt('entry directory contains an unexpected path');
         if (names.length >= MAX_MEMORY_SCAN_ENTRIES) corrupt('entry directory exceeds bounded scan limit');
         names.push(item.name);
       }
     } finally {
       await directory.close().catch(() => undefined);
     }
-    const entryNames = names.filter((name) => !/^\.[a-f0-9]{64}\.tmp-/.test(name));
-    if (entryNames.some((name) => !/^[a-f0-9]{64}\.json$/.test(name))) corrupt('entry directory contains an unexpected path');
     const entries: MemoryEntry[] = [];
-    for (const name of entryNames.sort()) {
+    for (const name of names.sort()) {
       const entry = await this.getMemory(name.slice(0, -5));
       if (entry === undefined) corrupt(`entry ${name} disappeared during scan`);
       if (matches(entry, query)) entries.push(entry);

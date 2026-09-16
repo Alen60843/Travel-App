@@ -10,7 +10,8 @@ import { canonicalHash, canonicalJson } from '../../src/canonical-json';
 import { isOrchestratorError } from '../../src/errors';
 import type { FailureDiagnosis } from '../../src/failure-intelligence/types';
 import { createMemoryEntry, MAX_MEMORY_ENTRY_BYTES, MemoryStore, memoryEntryId,
-  projectDiagnosisToMemory, type FailureMemoryBody, type MemoryEntry } from '../../src/memory';
+  parseMemoryEntry, projectDiagnosisToMemory, type FailureMemoryBody, type JsonValue,
+  type MemoryEntry } from '../../src/memory';
 import { MAX_MEMORY_SCAN_ENTRIES } from '../../src/memory/store';
 import { createRunState, StateStore } from '../../src/state';
 import type { TaskSpec } from '../../src/tasks';
@@ -169,7 +170,7 @@ test('symlink entries and invalid or traversal IDs are rejected', async () => {
   } finally { await value.dispose(); }
 });
 
-test('oversized entries and bounded directory scans fail closed', async () => {
+test('oversized entries and canonical entry counts above the scan limit fail closed', async () => {
   const oversized = await temporaryStore();
   try {
     const entry = createMemoryEntry(failureBody());
@@ -182,10 +183,37 @@ test('oversized entries and bounded directory scans fail closed', async () => {
   try {
     await mkdir(bounded.store.entriesRoot, { recursive: true });
     for (let index = 0; index <= MAX_MEMORY_SCAN_ENTRIES; index += 1) {
-      await writeFile(join(bounded.store.entriesRoot, `unexpected-${index}`), '');
+      const id = index.toString(16).padStart(64, '0');
+      await writeFile(join(bounded.store.entriesRoot, `${id}.json`), '');
     }
     await assert.rejects(bounded.store.listMemory(), (error) => isOrchestratorError(error, 'STATE_CORRUPT'));
   } finally { await bounded.dispose(); }
+});
+
+test('many stale temp files consume no canonical scan budget and never appear in deterministic results', async () => {
+  const value = await temporaryStore();
+  try {
+    const entries = projectDiagnosisToMemory(diagnosis, mapFailureToActions(diagnosis));
+    for (const entry of [...entries].reverse()) await value.store.putMemory(entry);
+    for (let index = 0; index < MAX_MEMORY_SCAN_ENTRIES * 2; index += 1) {
+      const uuidTail = index.toString(16).padStart(12, '0');
+      const name = `.${entries[0]!.id}.tmp-999-00000000-0000-4000-8000-${uuidTail}`;
+      await writeFile(join(value.store.entriesRoot, name), '{orphaned-temp');
+    }
+    const listed = await value.store.listMemory();
+    assert.deepEqual(listed.map((entry) => entry.id), entries.map((entry) => entry.id).sort());
+    assert.equal(listed.some((entry) => entry.id.includes('.tmp-')), false);
+  } finally { await value.dispose(); }
+});
+
+test('malformed canonical entry filenames still fail closed', async () => {
+  const value = await temporaryStore();
+  try {
+    const entry = createMemoryEntry(failureBody());
+    await value.store.putMemory(entry);
+    await writeFile(join(value.store.entriesRoot, `${'f'.repeat(64)}.json`), '{partial');
+    await assert.rejects(value.store.listMemory(), (error) => isOrchestratorError(error, 'STATE_CORRUPT'));
+  } finally { await value.dispose(); }
 });
 
 test('listing is ID-ordered and supports exact kind, subject, run and task filters', async () => {
@@ -223,6 +251,39 @@ test('OUTCOME, DECISION, and INVARIANT have stable schemas but no automatic proj
     ['FAILURE', 'ACTION_CANDIDATE', 'OUTCOME', 'DECISION', 'INVARIANT']);
   assert.deepEqual(projectDiagnosisToMemory(diagnosis, mapFailureToActions(diagnosis)).map((entry) => entry.kind),
     ['FAILURE', 'ACTION_CANDIDATE']);
+});
+
+test('plain nested JSON objects and arrays remain valid with unchanged canonical semantics', () => {
+  const value = { nested: { enabled: true, values: [1, 'two', null, { deep: ['three'] }] } };
+  const entry = createMemoryEntry({ version: 1, kind: 'DECISION', subject: { kind: 'run' },
+    data: { key: 'nested-json', value, rationale: 'Trusted structured input.' },
+    provenance: { sourceKind: 'trusted_decision', producerVersion: 1, references: [] } });
+  assert.deepEqual(entry.data, { key: 'nested-json', value, rationale: 'Trusted structured input.' });
+  const { id: _id, ...body } = entry;
+  assert.equal(entry.id, canonicalHash(body));
+});
+
+test('Date, class instances, accessors, and unsupported nested values are rejected before creation', () => {
+  class CustomValue { readonly visible = 'not plain'; }
+  class CustomArray extends Array<JsonValue> {}
+  const accessor = Object.defineProperty({}, 'value', { enumerable: true, get: () => 'not data' });
+  const sparse = Array<JsonValue>(1);
+  for (const value of [new Date(0), new CustomValue(), new CustomArray('not plain'), sparse,
+    accessor, { unsupported: undefined }]) {
+    assert.throws(() => createMemoryEntry({ version: 1, kind: 'DECISION', subject: { kind: 'run' },
+      data: { key: 'unsupported', value: value as unknown as JsonValue, rationale: 'Rejected.' },
+      provenance: { sourceKind: 'trusted_decision', producerVersion: 1, references: [] } }),
+    (error) => isOrchestratorError(error, 'STATE_CORRUPT'));
+  }
+});
+
+test('fixed entry and kind-specific schemas still reject unknown fields', () => {
+  const body = { ...failureBody(), data: { ...failureBody().data, unexpected: true } };
+  assert.throws(() => parseMemoryEntry({ ...body, id: canonicalHash(body) }),
+    (error) => isOrchestratorError(error, 'STATE_CORRUPT'));
+  const topLevel = { ...failureBody(), unexpected: true };
+  assert.throws(() => parseMemoryEntry({ ...topLevel, id: canonicalHash(topLevel) }),
+    (error) => isOrchestratorError(error, 'STATE_CORRUPT'));
 });
 
 test('remember-diagnosis writes only Memory, is idempotent, and diagnose remains memory-read-only', async () => {

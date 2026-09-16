@@ -68,14 +68,32 @@ function jsonValue(value: unknown, path: string, depth = 0): JsonValue {
   if (typeof value === 'number' && Number.isFinite(value)) return value;
   if (Array.isArray(value)) {
     if (value.length > 256) corrupt(`${path} is too large`);
-    return value.map((child, index) => jsonValue(child, `${path}[${index}]`, depth + 1));
+    if (Object.getPrototypeOf(value) !== Array.prototype) corrupt(`${path} must be a plain JSON array`);
+    const ownKeys = Reflect.ownKeys(value);
+    if (ownKeys.length !== value.length + 1 || ownKeys.some((key) =>
+      key !== 'length' && (typeof key !== 'string' || !/^(0|[1-9][0-9]*)$/.test(key)
+        || Number(key) >= value.length))) corrupt(`${path} must be a dense plain JSON array`);
+    return Array.from({ length: value.length }, (_, index) => {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
+        corrupt(`${path}[${index}] must be an enumerable data property`);
+      }
+      return jsonValue(descriptor.value, `${path}[${index}]`, depth + 1);
+    });
   }
   if (typeof value !== 'object' || value === null) corrupt(`${path} is not JSON-compatible`);
-  const record = object(value, Object.keys(value), path);
-  if (Object.keys(record).length > 256) corrupt(`${path} is too large`);
-  return Object.fromEntries(Object.entries(record).map(([key, child]) => [
-    text(key, `${path} key`), jsonValue(child, `${path}.${key}`, depth + 1),
-  ]));
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) corrupt(`${path} must be a plain JSON object`);
+  const keys = Reflect.ownKeys(value);
+  if (keys.length > 256) corrupt(`${path} is too large`);
+  return Object.fromEntries(keys.map((key) => {
+    if (typeof key !== 'string') corrupt(`${path} must not contain symbol keys`);
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
+      corrupt(`${path}.${key} must be an enumerable data property`);
+    }
+    return [text(key, `${path} key`), jsonValue(descriptor.value, `${path}.${key}`, depth + 1)];
+  }));
 }
 
 function parseData(kind: MemoryEntryBody['kind'], value: unknown): MemoryEntryBody['data'] {
