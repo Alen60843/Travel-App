@@ -4,7 +4,7 @@
 >
 > Read this file first in any future session, but **always inspect live persisted run state/events/worktree state before mutating anything**.
 
-Last updated: 2026-09-13
+Last updated: 2026-09-17
 
 ## Project priority
 
@@ -382,25 +382,29 @@ Capability-aware policy should eventually know in advance when sandbox verificat
 
 ## Active roadmap
 
+The roadmap is evidence-gated rather than a fixed implementation promise. Do not add a subsystem merely because a reference project has one.
+
 ```text
-1. Finish Phase 7 dogfood
-2. Health / Capability Plane
-3. Failure Facts + Evidence Probe Layer
-4. Failure Intelligence
-5. Failure Memory / Failure Graph
-6. Event-Sourced Runtime
-7. Recovery Controller
-8. Bounded Repair Controller
-9. Provider Router
-10. Task / Dispatch separation
-11. Dynamic Plan IR / Graph
-12. Versioned Self-Repair Framework
-13. Context Triage / Long-term Operational Memory
-14. Adaptive Review Policy
-15. Control Plane / Visual UI
+Current: Phase 8 active-work dogfood
+  - existing implementation/review workflow stays authoritative
+  - Coordinator Shadow is manual, non-authoritative, non-executing, and non-persisting
+  - measure proposal quality, evidence quality, HUMAN_REQUIRED behavior,
+    context usefulness, false positives/negatives, and stale-context failures
+
+After Phase 8, only if evidence supports the next step:
+1. Spec Kit reference spike for specification/clarification/consistency/convergence ideas
+2. Context Selection only if context size/noise becomes a measured issue
+3. Agent/Model Router only after real multi-provider routing needs are measured
+4. Policy / Authorization layer before automatic Coordinator-selected execution
+5. Execution integration only after authority boundaries are proven
+6. MCP as a typed tool/knowledge boundary where useful; never orchestration authority
+7. Additional adapters/backends only when portability evidence requires them
+8. Dynamic Plan IR / Graph when static planning becomes a demonstrated constraint
+9. Versioned Self-Repair Framework only after replay/verification/promotion safety is mature
+10. Control Plane / Visual UI after runtime correctness and authority are mature
 ```
 
-Reliability, diagnosis, and safe repair come before UI polish.
+Reliability, diagnosis, and safe repair come before UI polish. Every roadmap item must earn its place through dogfood evidence.
 
 ---
 
@@ -609,6 +613,92 @@ progressive disclosure
 searchable cross-session history
 token-aware context retrieval
 ```
+
+### GitHub Spec Kit
+
+Reference: <https://github.com/github/spec-kit>
+
+Reviewed against the September 2026 Spec Kit v1.0.7 documentation.
+
+Decision: **ADAPT / research after Phase 8**. Do not integrate Spec Kit into the Phase 8 runtime or make it a second authority layer.
+
+The useful ideas are concentrated in a specification/planning plane:
+
+```text
+Constitution  -> project-wide invariants and engineering/product guardrails
+Specify       -> formalize WHAT and WHY before implementation
+Clarify       -> surface ambiguity instead of allowing agents to guess
+Checklist     -> "unit tests" for requirements quality before code
+Analyze       -> read-only consistency checks across spec / plan / tasks
+Converge      -> detect implementation gaps against approved artifacts
+Integrations  -> reference for portable Codex / Claude / Gemini / Copilot / generic agent invocation
+Workflows     -> conditions, loops, fan-out/fan-in, human gates, pause/resume
+Overlays      -> project-specific workflow adaptation without editing the base workflow
+Extensions / Presets / Bundles -> reference for future packaging and portability
+```
+
+Architectural split to preserve:
+
+```text
+Spec Kit-inspired Specification / Planning Plane
+  "What should we build, why, and is the plan coherent?"
+
+                ↓ approved, traceable artifacts
+
+Our Orchestrator Control Plane
+  "Who should do it, what may they do, what happened, what failed,
+   what should happen next, and may it execute safely?"
+```
+
+Spec Kit does **not** replace Coordinator Core, Failure Intelligence, Memory, deterministic recovery eligibility, task ownership, or authorization. It is also not automatically our future model router.
+
+The first research spike belongs **after Phase 8 active-work Coordinator Shadow dogfood**, tentatively on `orchestrator/spec-kit-reference-spike`, and should stay read-only/research-first:
+
+```text
+Experiment A — Constitution / Clarify
+Can structured invariants + explicit clarification reduce accidental product assumptions
+and improve HUMAN_REQUIRED boundaries?
+
+Experiment B — Analyze
+Can read-only spec ↔ plan ↔ task consistency analysis find real gaps we currently catch manually?
+
+Experiment C — Converge
+Can post-implementation convergence find missing work that existing review + Coordinator logic missed?
+```
+
+Do not initially install Spec Kit as an execution authority, replace phase YAML, give it mutation/execution authorization, or layer community Agent Orchestrator / Fleet / Multi-Model stacks on top of our own control plane. Measure useful signal first.
+
+Possible future portability boundary, only if the spike earns it:
+
+```text
+SpecificationArtifactProvider
+├── NativeTripWithSpecificationProvider
+└── SpecKitArtifactProvider
+
+artifact contract candidates:
+constitution
+specification
+clarifications
+plan
+tasks
+analysis / convergence evidence
+```
+
+This is a compatibility seam, not a commitment to Spec Kit or a new runtime dependency.
+
+### Anti-Frankenstein rule
+
+Never add two systems that solve the same authority problem.
+
+```text
+no Spec Kit workflow engine + our scheduler both owning execution
+no community agent orchestrator layered over Coordinator Core
+no second memory authority
+no graph database merely because a reference project uses one
+no model router until routing is a measured problem
+```
+
+Prefer one authority + small adapters + read-only/reference layers + deterministic validation.
 
 ---
 
